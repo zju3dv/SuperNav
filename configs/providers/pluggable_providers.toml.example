@@ -1,0 +1,200 @@
+# Copy to configs/local/pluggable_providers.toml and edit for your account.
+# Official API samples only; model settings are editable, not live-validated.
+# Provider catalog for the pluggable harness.
+# Separates harness kind, provider, cell,
+# model_properties, and secret-env declarations so later runners can generate
+# run-local config without touching global agent configuration.
+
+[cells.claude_code.kimi]
+enabled = true
+notes = "Second V1 matrix cell: Claude Code shell over the Kimi model; relay is declared but not implemented."
+provider = "kimi"
+relay_mode = "anthropic_messages_to_openai_chat"
+requires_relay = true
+
+[cells.claude_code.anthropic]
+enabled = true
+notes = "Claude Code runner using the official Anthropic API."
+provider = "anthropic"
+
+[cells.codex.openai_chat]
+enabled = true
+notes = "Codex shell over an OpenAI-compatible API; GPT model selection stays full gpt-5.4/high for matrix runs."
+provider = "openai_chat"
+
+[cells.codex.openai]
+enabled = true
+notes = "Official OpenAI Responses provider for Codex."
+provider = "openai"
+
+[cells.kimi_cli.kimi_code]
+enabled = true
+notes = "Kimi Code CLI harness; no catalog model selection."
+provider = "kimi_code"
+
+[harness_kinds.claude_code]
+agent_surface = "claude_code"
+config_surface = "claude-code"
+description = "Claude Code harness process using Anthropic Messages or a relay."
+runner_kind = "claude-code"
+
+[harness_kinds.codex]
+agent_surface = "codex"
+config_surface = "codex"
+description = "Codex harness process that requires OpenAI Responses wire API."
+required_wire_api = "responses"
+runner_kind = "codex"
+
+[harness_kinds.kimi_cli]
+agent_surface = "kimi_cli"
+config_surface = "kimi-cli"
+description = "External Kimi CLI harness process."
+runner_kind = "kimi-cli"
+
+[providers.openai_chat]
+account_route = "official"
+api_key_envs = ["OPENAI_API_KEY"]
+api_key_source_envs = ["NAV_LLM_API_KEY"]
+base_url = "https://api.openai.com/v1"
+default_model = "gpt-5.4"
+default_reasoning_effort = "high"
+description = "OpenAI-compatible endpoint for the Forward reference model."
+family = "openai_compatible"
+kind = "codex"
+probe_dialect = "openai_responses"
+profile = "default"
+quota = "abundant"
+requires_openai_auth = false
+supports_reasoning_effort = true
+transport = "responses"
+wire_api = "responses"
+
+[providers.openai_chat.model_properties."gpt-5.4"]
+context_window = 400000
+input_modalities = ["text", "image"]
+max_context_window = 400000
+max_output_tokens = 128000
+provenance = "Model specifications list 400k/128k; keeps a conservative 256k runtime window until provider probes confirm transit limits."
+runtime_auto_compact_token_limit = 120000
+runtime_context_window = 256000
+supports_parallel_tool_calls = true
+supports_reasoning_summaries = true
+
+[providers.anthropic]
+account_route = "official"
+api_key_envs = ["ANTHROPIC_API_KEY"]
+base_url = "https://api.anthropic.com"
+default_model = "claude-fable-5"
+description = "Official Anthropic API for Claude Code CLI."
+family = "anthropic"
+kind = "claude_code"
+profile = "default"
+quota = "scarce"
+requires_openai_auth = false
+supports_reasoning_effort = true
+transport = "anthropic"
+wire_api = "anthropic_messages"
+
+[providers.anthropic.model_properties."claude-fable-5"]
+context_window = 200000
+input_modalities = ["text", "image"]
+max_context_window = 200000
+max_output_tokens = 64000
+provenance = "Claude Code CLI help lists claude-fable-5 as a full model name; uses conservative runtime limits until provider-specific probes are added."
+runtime_auto_compact_token_limit = 180000
+runtime_context_window = 200000
+supports_parallel_tool_calls = true
+supports_reasoning_summaries = true
+
+[providers.openai]
+account_route = "official"
+api_key_envs = ["OPENAI_API_KEY"]
+base_url = "https://api.openai.com/v1"
+default_model = "gpt-5.4"
+default_reasoning_effort = "high"
+description = "Official OpenAI Responses API."
+family = "openai_compatible"
+kind = "codex"
+probe_dialect = "openai_responses"
+profile = "default"
+quota = "abundant"
+requires_openai_auth = false
+supports_reasoning_effort = true
+transport = "responses"
+wire_api = "responses"
+
+[providers.openai.model_properties."gpt-5.4"]
+context_window = 400000
+input_modalities = ["text", "image"]
+max_context_window = 400000
+max_output_tokens = 128000
+provenance = "Edit these runtime limits for your chosen model."
+runtime_auto_compact_token_limit = 120000
+runtime_context_window = 256000
+supports_parallel_tool_calls = true
+supports_reasoning_summaries = true
+
+[providers.kimi]
+account_route = "official"
+api_key_envs = ["MOONSHOT_API_KEY"]
+base_url = "https://api.moonshot.cn/v1"
+default_model = "kimi-k2.6"
+description = "Moonshot Kimi OpenAI-compatible endpoint; used by relay-backed shells."
+family = "kimi"
+kind = "openai_chat"
+probe_dialect = "openai_chat"
+profile = "default"
+quota = "scarce"
+requires_openai_auth = false
+supports_reasoning_effort = false
+transport = "openai_chat"
+wire_api = "chat"
+
+[providers.kimi.model_properties."kimi-k2.6"]
+context_window = 262144
+input_modalities = ["text", "image"]
+max_context_window = 262144
+provenance = "Provider model limits."
+runtime_auto_compact_token_limit = 235000
+runtime_context_window = 262144
+supports_parallel_tool_calls = true
+supports_reasoning_summaries = false
+
+[providers.kimi_code]
+account_route = "coding_plan"
+api_key_envs = ["KIMI_CODE_API_KEY"]
+base_url = "https://api.kimi.com/coding/v1"
+description = "Kimi Code CLI credential provider; KimiCliRunner does not select a model in catalog."
+family = "kimi"
+kind = "kimi_cli"
+profile = "default"
+quota = "scarce"
+requires_openai_auth = false
+supports_reasoning_effort = false
+transport = "cli"
+
+[providers.xiaomi_mimo]
+account_route = "official"
+api_key_envs = ["XIAOMI_MIMO_API_KEY"]
+base_url = "https://token-plan-cn.xiaomimimo.com/v1"
+default_model = "mimo-v2.5"
+description = "Xiaomi MiMo Token Plan China Chat Completions endpoint; OpenAI-compatible."
+family = "xiaomi_mimo"
+kind = "openai_chat"
+probe_dialect = "openai_chat"
+profile = "default"
+quota = "abundant"
+requires_openai_auth = false
+supports_reasoning_effort = false
+transport = "openai_chat"
+wire_api = "chat"
+
+[providers.xiaomi_mimo.model_properties."mimo-v2.5"]
+context_window = 1048576
+input_modalities = ["text", "image"]
+max_context_window = 1048576
+provenance = "Provider model limits; supports image input."
+runtime_auto_compact_token_limit = 180000
+runtime_context_window = 200000
+supports_parallel_tool_calls = true
+supports_reasoning_summaries = false

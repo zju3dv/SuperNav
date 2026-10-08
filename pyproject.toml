@@ -1,0 +1,100 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "supernav"
+version = "0.1.0"
+description = "An Agentic Navigation System for Any Task in Any Scene"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "LicenseRef-PRL-1.0 AND MIT AND OFL-1.1"
+license-files = [
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "src/supernav/web/static/fonts/SpaceGrotesk-OFL.txt",
+    "src/supernav/web/static/fonts/IBMPlexMono-OFL.txt",
+    "docs/release/assets/SpaceGrotesk-OFL.txt",
+]
+dependencies = ["PyYAML>=6", "Pillow>=10"]
+
+[project.optional-dependencies]
+agents = ["mcp>=1.27,<2", "openai>=1", "python-dotenv>=1", "numpy>=1.24"]
+evaluation = ["numpy>=1.24", "matplotlib>=3.7", "httpx>=0.27"]
+ai2thor = ["ai2thor==5.0.0", "numpy>=1.24,<2", "mcp>=1.27,<2"]
+viewer = ["rerun-sdk", "numpy>=1.24"]
+test = ["pytest>=8", "numpy>=1.24", "mcp>=1.27,<2", "openai>=1", "python-dotenv>=1", "setuptools>=77", "wheel"]
+
+[project.scripts]
+supernav = "supernav.cli:main"
+
+[project.urls]
+Repository = "https://github.com/zju3dv/SuperNav"
+Homepage = "https://zju3dv.github.io/SuperNav/"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+cache_dir = ".cache/pytest"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.cmdclass]
+egg_info = "scripts.release_build.SafeEggInfo"
+build_py = "scripts.release_build.SafeBuildPy"
+
+[tool.setuptools.package-dir]
+"" = "src"
+scripts = "scripts"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["supernav*", "habitat_contract*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+"supernav.methods.demand_driven" = ["*.md"]
+"supernav.web" = ["static/*.html", "static/*.css", "static/*.js", "static/*.svg", "static/fonts/*.ttf", "static/fonts/*.txt"]
+
+[tool.setuptools.data-files]
+"share/supernav/configs/agents" = ["configs/agents/codex-benchmark.json", "configs/agents/codex-user.json"]
+"share/supernav/configs/backends" = ["configs/backends/ai2thor.json", "configs/backends/habitat.json"]
+"share/supernav/configs/experiments" = ["configs/experiments/habitat-geo-based-executor.json", "configs/experiments/habitat-learned-executor.json", "configs/experiments/ai2thor-primitive.json"]
+"share/supernav/." = ["LICENSE", "THIRD_PARTY_NOTICES.md", "README.md", "README.zh-CN.md"]
+"share/supernav/configs/benchmarks/global_task" = ["configs/benchmarks/global_task/README.md", "configs/benchmarks/global_task/README.zh-CN.md"]
+"share/supernav/configs/benchmarks/global_task/prompts" = ["configs/benchmarks/global_task/prompts/common.md", "configs/benchmarks/global_task/prompts/common_localnav.md", "configs/benchmarks/global_task/prompts/end.md", "configs/benchmarks/global_task/prompts/movement_localnav.md"]
+"share/supernav/configs/benchmarks/main/prompts" = ["configs/benchmarks/main/prompts/common.md", "configs/benchmarks/main/prompts/default_context.md", "configs/benchmarks/main/prompts/depth_tools.md", "configs/benchmarks/main/prompts/end.md", "configs/benchmarks/main/prompts/movement_oracle.md", "configs/benchmarks/main/prompts/movement_primitive.md", "configs/benchmarks/main/prompts/movement_visual_combined.md", "configs/benchmarks/main/prompts/movement_visual_ground_preview.md", "configs/benchmarks/main/prompts/movement_visual_ground_preview_locate.md", "configs/benchmarks/main/prompts/movement_visual_overlay.md", "configs/benchmarks/main/prompts/movement_visual_point.md", "configs/benchmarks/main/prompts/safety_tools.md", "configs/benchmarks/main/prompts/visual_nav_context.md"]
+"share/supernav/configs/benchmarks/multi_global_task" = ["configs/benchmarks/multi_global_task/README.md", "configs/benchmarks/multi_global_task/README.zh-CN.md"]
+"share/supernav/configs/benchmarks/multi_global_task/prompts" = ["configs/benchmarks/multi_global_task/prompts/common_localnav.md", "configs/benchmarks/multi_global_task/prompts/end.md", "configs/benchmarks/multi_global_task/prompts/movement_localnav.md"]
+"share/supernav/configs/benchmarks/objectnav_hm3d/prompts" = ["configs/benchmarks/objectnav_hm3d/prompts/common.md", "configs/benchmarks/objectnav_hm3d/prompts/common_localnav.md", "configs/benchmarks/objectnav_hm3d/prompts/end.md", "configs/benchmarks/objectnav_hm3d/prompts/movement_localnav.md"]
+"share/supernav/configs/benchmarks/objectnav_hm3d_ovon/prompts" = ["configs/benchmarks/objectnav_hm3d_ovon/prompts/common.md", "configs/benchmarks/objectnav_hm3d_ovon/prompts/common_localnav.md", "configs/benchmarks/objectnav_hm3d_ovon/prompts/common_visual_point.md", "configs/benchmarks/objectnav_hm3d_ovon/prompts/end.md", "configs/benchmarks/objectnav_hm3d_ovon/prompts/movement_localnav.md", "configs/benchmarks/objectnav_hm3d_ovon/prompts/movement_visual_point.md"]
+"share/supernav/configs" = ["configs/README.md", "configs/README.zh-CN.md"]
+"share/supernav/configs/providers" = ["configs/providers/pluggable_provider_secrets.env.example", "configs/providers/pluggable_providers.toml.example", "configs/providers/provider_secrets.env.example"]
+"share/supernav/data/embodiments" = ["data/embodiments/habitat-default.json"]
+"share/supernav/data/test_assets/hbao_tests" = ["data/test_assets/hbao_tests/van-gogh-room.color.png"]
+"share/supernav/docs/release/en" = ["docs/release/en/README.md", "docs/release/en/configuration.md", "docs/release/en/assets-and-skills.md", "docs/release/en/habitat.md", "docs/release/en/ai2thor.md", "docs/release/en/web-viewer.md", "docs/release/en/architecture.md", "docs/release/en/layout.md", "docs/release/en/tool-authoring-guide.md"]
+"share/supernav/docs/release/zh" = ["docs/release/zh/README.md", "docs/release/zh/configuration.md", "docs/release/zh/assets-and-skills.md", "docs/release/zh/habitat.md", "docs/release/zh/ai2thor.md", "docs/release/zh/web-viewer.md", "docs/release/zh/architecture.md", "docs/release/zh/layout.md", "docs/release/zh/tool-authoring-guide.md"]
+"share/supernav/docs/release/assets" = ["docs/release/assets/supernav-wordmark.svg", "docs/release/assets/SpaceGrotesk-OFL.txt"]
+"share/supernav/scripts" = ["scripts/scan_run_degeneration.py", "scripts/check_installed_package.py", "scripts/export_release_source.py"]
+"share/supernav/skills/global-navigation" = ["skills/global-navigation/SKILL.md"]
+"share/supernav/skills/global-navigation-geo-based-executor" = ["skills/global-navigation-geo-based-executor/SKILL.md"]
+"share/supernav/skills/global-navigation-geo-based-executor-front" = ["skills/global-navigation-geo-based-executor-front/SKILL.md"]
+"share/supernav/skills/global-navigation-geo-based-executor-front/references" = ["skills/global-navigation-geo-based-executor-front/references/entrance-search.md", "skills/global-navigation-geo-based-executor-front/references/exploration-and-return.md", "skills/global-navigation-geo-based-executor-front/references/recovery-and-stop.md"]
+"share/supernav/skills/global-navigation-geo-based-executor/references" = ["skills/global-navigation-geo-based-executor/references/entrance-search.md", "skills/global-navigation-geo-based-executor/references/exploration-and-return.md", "skills/global-navigation-geo-based-executor/references/recovery-and-stop.md"]
+"share/supernav/skills/global-navigation-learned-executor" = ["skills/global-navigation-learned-executor/SKILL.md"]
+"share/supernav/skills/global-navigation-learned-executor/references" = ["skills/global-navigation-learned-executor/references/entrance-search.md", "skills/global-navigation-learned-executor/references/exploration-and-return.md", "skills/global-navigation-learned-executor/references/recovery-and-stop.md"]
+"share/supernav/skills/global-navigation/references" = ["skills/global-navigation/references/entrance-search.md", "skills/global-navigation/references/exploration-and-return.md", "skills/global-navigation/references/recovery-and-stop.md", "skills/global-navigation/references/spatial-memory.md"]
+"share/supernav/skills/localnav-pointnav" = ["skills/localnav-pointnav/SKILL.md"]
+"share/supernav/skills/localnav-pointnav-geo-based-executor" = ["skills/localnav-pointnav-geo-based-executor/SKILL.md"]
+"share/supernav/skills/localnav-pointnav-geo-based-executor-front" = ["skills/localnav-pointnav-geo-based-executor-front/SKILL.md"]
+"share/supernav/skills/localnav-pointnav-geo-based-executor-front/references" = ["skills/localnav-pointnav-geo-based-executor-front/references/failure-playbook.md"]
+"share/supernav/skills/localnav-pointnav-geo-based-executor/references" = ["skills/localnav-pointnav-geo-based-executor/references/failure-playbook.md"]
+"share/supernav/skills/localnav-pointnav/references" = ["skills/localnav-pointnav/references/failure-playbook.md"]
+"share/supernav/skills/locate-anything" = ["skills/locate-anything/SKILL.md"]
+"share/supernav/skills/locate-anything/agents" = ["skills/locate-anything/agents/openai.yaml"]
+"share/supernav/skills/multi-global-navigation-learned-executor" = ["skills/multi-global-navigation-learned-executor/SKILL.md"]
+"share/supernav/configs/models" = ["configs/models/gpt-6-astra-medium.json"]
+"share/supernav/configs/methods" = ["configs/methods/geo-based-executor.json", "configs/methods/learned-executor.json", "configs/methods/primitive.json"]
+"share/supernav/configs/viewers" = ["configs/viewers/rerun.yaml"]
+"share/supernav/configs/benchmarks" = ["configs/benchmarks/README.md", "configs/benchmarks/README.zh-CN.md"]

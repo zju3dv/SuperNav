@@ -1,0 +1,40 @@
+include LICENSE THIRD_PARTY_NOTICES.md README.md README.zh-CN.md
+exclude AGENTS.md
+recursive-include skills *.md *.yaml *.yml
+recursive-include configs *.json *.yaml *.yml *.toml *.md *.example
+recursive-include data/embodiments *.json
+recursive-include data/test_assets *.png
+recursive-include src/habitat_contract *.py
+recursive-include src/supernav/web/static *.html *.css *.js *.svg *.ttf *.txt
+recursive-include scripts *.py *.sh
+recursive-include docs/release *.md *.svg *.txt
+exclude docs/README.md
+global-exclude *.py[cod]
+prune configs/local
+prune data/nav_artifacts
+prune data/nav_artifacts_controller
+prune .cache
+prune docs/migration
+prune bench
+prune data/runs
+
+# SafeEggInfo also filters nested client directories and stale SOURCES entries.
+global-exclude .env .env.* *.env *.env.* auth.json auth.toml credentials credentials.*
+global-exclude secrets.json secrets.toml secrets.yaml secrets.yml *.pem *.key id_rsa* id_ed25519*
+global-exclude auth.yaml auth.yml .claude.json .mcp.json .codex.toml .kimi.toml opencode.json opencode.jsonc .netrc .npmrc .pypirc
+global-exclude settings.local.json
+global-include .env.example *.env.example
+prune configs/auth
+prune .codex
+prune .codex_home
+prune .kimi
+prune .claude
+prune .opencode
+prune .aws
+prune .ssh
+
+# Evaluation datasets are supplied separately.
+recursive-exclude configs/benchmarks *.json *.jsonl *.gz *.png *.jpg *.jpeg *.webp *.npy *.npz *.yaml *.yml
+recursive-exclude configs/tasks *.json *.jsonl *.gz *.yaml *.yml
+recursive-exclude tests/fixtures/test_suite *.json *.jsonl *.gz *.png *.jpg *.jpeg *.webp *.yaml *.yml *.lock
+recursive-include configs/benchmarks */prompts/*.yaml */prompts/*.yml

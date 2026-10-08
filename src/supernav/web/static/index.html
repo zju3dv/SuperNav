@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#e4e4e0">
+  <title>SuperNav · Live Observatory</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#workspace">Skip to viewer</a>
+  <header class="site-header">
+    <a class="wordmark" href="/" aria-label="SuperNav home"><span class="brand-tile">↗</span>Super<span>Nav</span><b>LIVE</b></a>
+    <nav aria-label="Main navigation"><a class="active" href="#workspace">Observatory</a><a href="https://zju3dv.github.io/SuperNav/" target="_blank" rel="noreferrer">Project page <span aria-hidden="true">↗</span></a><button id="help-button" class="help-button" aria-label="Connection guide">?</button></nav>
+  </header>
+  <main class="wrap" id="workspace">
+    <section class="intro">
+      <div><p class="eyebrow"><i class="orange-dot"></i> AGENTIC EMBODIED NAVIGATION</p><h1>A front-row seat to <span>navigation.</span></h1><p class="lede">See what the agent sees. Follow every move, as it happens.</p></div>
+      <div class="connection"><span id="connection-dot" class="status-dot"></span><span id="connection" role="status">Connecting…</span><span class="connection-note">LOCAL OBSERVATORY</span></div>
+    </section>
+    <section class="session-bar" aria-label="Session selection">
+      <div class="session-select"><label for="session">SESSION</label><select id="session"><option value="">Waiting for a session</option></select></div>
+      <div class="session-detail"><span class="tiny-label">SCENE</span><strong id="scene">—</strong></div>
+      <div class="session-detail agent-detail"><span class="tiny-label">AGENT</span><strong id="agent">—</strong></div>
+      <span id="source-badge" class="badge">NO SESSION</span>
+    </section>
+    <div id="notice" class="notice" hidden role="status"></div>
+    <div class="workspace-grid">
+      <section class="window camera-window" aria-labelledby="camera-heading">
+        <header class="window-bar"><span class="window-dots" aria-hidden="true"><i></i><i></i><i></i></span><h2 id="camera-heading">AGENT’S VIEW</h2><button id="fullscreen" class="icon-button" aria-label="Expand agent view" title="Expand agent view"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></svg></button></header>
+        <div id="camera-stage" class="camera-stage">
+          <img id="camera" alt="Latest first-person observation from the navigation agent" hidden>
+          <canvas id="demo-canvas" aria-label="Procedural room illustration for the demo; not simulator output" hidden></canvas>
+          <div id="empty-camera" class="empty-camera"><div class="empty-icon" aria-hidden="true">↗</div><h3>Ready when your agent is.</h3><p>Start a session with live capture enabled.<br>Its first view will appear here automatically.</p><button id="empty-guide" class="button-light">Connect an agent <span aria-hidden="true">↗</span></button></div>
+          <div id="camera-overlay" class="camera-overlay" hidden><span id="view-label">FIRST PERSON · RGB</span><span id="frame-age">Awaiting frame</span></div>
+          <div id="paused-label" class="paused-label" hidden>VIEW PAUSED</div>
+        </div>
+        <div class="transport"><button id="pause" class="transport-button" disabled aria-label="Pause view"><span id="pause-icon" aria-hidden="true">Ⅱ</span><span id="pause-text">Pause view</span></button><span id="frame-info" class="mono muted">Waiting for observations</span><button id="follow" class="follow" disabled><i class="status-dot"></i><span>Follow live</span></button></div>
+        <div id="replay-controls" class="replay-controls" hidden><label for="replay">RECORDED FRAME</label><input id="replay" type="range" min="0" max="0" value="0"><output id="replay-count" for="replay">0 / 0</output></div>
+        <div id="latest-thought" class="thinking-strip" hidden><div><span id="latest-thought-label" class="tiny-label">LATEST AGENT NOTE</span><a href="#trace-heading">Full trace ↘</a></div><p id="latest-thought-text"></p></div>
+      </section>
+      <section class="window map-window" aria-labelledby="map-heading">
+        <header class="window-bar"><span class="panel-number">02</span><h2 id="map-heading">TRAJECTORY</h2><span class="mini-tag">X / Z</span></header>
+        <div class="map-stage"><canvas id="map" aria-label="Top-down agent trajectory in Habitat world coordinates"></canvas><p id="map-empty">The path starts with the first move.</p><div class="map-controls"><button id="zoom-in" aria-label="Zoom into trajectory">+</button><button id="zoom-out" aria-label="Zoom out of trajectory">−</button><button id="fit-map" aria-label="Fit trajectory" title="Fit trajectory">⌖</button></div><span id="map-scale" class="map-scale">WORLD · METRES</span></div>
+        <div class="map-legend"><span><i class="legend-start"></i>Start</span><span><i class="legend-path"></i>Path</span><span><i class="legend-agent"></i>Agent</span><span id="map-mode">Live trail</span></div>
+        <div class="pose-row"><span>X <b id="pose-x">—</b></span><span>Y <b id="pose-y">—</b></span><span>Z <b id="pose-z">—</b></span><span>θ <b id="pose-heading">—</b></span></div>
+      </section>
+    </div>
+    <div class="perception-grid">
+      <section class="window surround-window" aria-labelledby="surround-heading"><header class="window-bar"><span class="panel-number">03</span><h2 id="surround-heading">FOUR-DIRECTION OBSERVATION</h2><button id="latest-observation" class="text-button">Latest ↗</button></header><div class="perception-meta"><span id="surround-meta">Waiting for the agent’s panorama</span><span>CLICK TO EXPAND</span></div><div id="surround" class="surround-grid"></div></section>
+      <section class="window overlay-window" aria-labelledby="overlay-heading"><header class="window-bar"><span class="panel-number">04</span><h2 id="overlay-heading">AGENT’S POINT OVERLAY</h2><span class="orange-dot"></span></header><label class="overlay-select"><span class="tiny-label">TARGET</span><select id="overlay-select"><option value="">Waiting for a point</option></select></label><button id="overlay-image-button" class="overlay-stage" aria-label="Expand the selected point overlay"><img id="point-overlay" alt="Original agent point-selection overlay" hidden><span id="overlay-empty">The agent’s marked target will appear here.</span></button><p id="overlay-meta" class="perception-meta">Overlay and source view stay linked to the same capture.</p></section>
+    </div>
+    <section class="stats" aria-label="Session statistics"><div><span class="tiny-label">SIMULATOR STEPS</span><strong id="steps">—</strong><span class="stat-note">Movement & turns</span></div><div><span class="tiny-label">DISTANCE TRAVELLED</span><strong id="distance">— <small>m</small></strong><span class="stat-note">World-space path length</span></div><div><span class="tiny-label">ELAPSED TIME</span><strong id="elapsed">—</strong><span class="stat-note">Session wall time</span></div><div><span class="tiny-label">SESSION STATE</span><strong id="session-state" class="state-stat">Waiting</strong><span id="state-note" class="stat-note">No session selected</span></div></section>
+    <div class="details-grid">
+      <section class="window task-window" aria-labelledby="task-heading"><header class="window-bar"><span class="panel-number">05</span><h2 id="task-heading">THE TASK</h2><span aria-hidden="true">↗</span></header><div class="task-body"><span class="tiny-label">NAVIGATION INSTRUCTION</span><p id="instruction">Your next exploration starts here.</p><div class="current-action"><span class="orange-dot"></span><span id="action">Waiting for agent activity</span></div><div class="evaluation"><div><span class="tiny-label">AGENT CLAIM</span><b id="claim">—</b></div><div><span class="tiny-label">OFFLINE SR / SPL</span><b>Not evaluated here</b></div></div><p class="evaluation-note">Completion claims are separate from offline navigation evaluation.</p></div></section>
+      <section class="window activity-window" aria-labelledby="activity-heading"><header class="window-bar"><span class="panel-number">06</span><h2 id="activity-heading">ACTIVITY</h2><span id="event-count" class="mini-tag">0 EVENTS</span></header><ol id="activity"><li class="activity-empty">Observations and actions will appear as the agent explores.</li></ol></section>
+    </div>
+    <section class="window trace-window" aria-labelledby="trace-heading"><header class="window-bar"><span class="panel-number">07</span><h2 id="trace-heading">AGENT REASONING & TOOL TRACE</h2><label class="trace-filter"><span class="sr-only">Filter agent trace</span><select id="trace-filter"><option value="all">All events</option><option value="thought">Thinking & messages</option><option value="tool">Tool calls</option></select></label></header><div class="trace-note"><span id="trace-status">Waiting for the agent run</span><span>OBSERVE → REASON → ACT</span></div><div id="trace" class="trace-list"><p class="trace-empty">The agent’s messages, recorded reasoning and tool calls will appear here.</p></div></section>
+    <footer><span><b>SuperNav</b> · An agentic navigation system for any task in any scene.</span><span>OBSERVE · REASON · MOVE <i class="orange-dot"></i></span></footer>
+  </main>
+  <dialog id="help"><form method="dialog"><button class="dialog-close" aria-label="Close connection guide">×</button></form><p class="eyebrow">GET CONNECTED</p><h2>Bring your agent into view.</h2><p>Use the same live directory for the viewer and the Habitat bridge. Set it before starting your usual experiment.</p><pre>export SUPERNAV_LIVE_DIR="$PWD/data/nav_artifacts/live"
+supernav-web</pre><p>In the terminal that starts your bridge or experiment, export that same absolute path. Then run your usual <code>supernav-run</code> command. New sessions appear automatically.</p><p>For a tour without a simulator:</p><pre>supernav-web --demo</pre><p class="muted">Pause freezes this browser view. The agent keeps running. A remote server can be viewed through SSH port forwarding on port 8765.</p><a href="https://zju3dv.github.io/SuperNav/" target="_blank" rel="noreferrer">Explore the research ↗</a></dialog>
+  <dialog id="image-dialog"><form method="dialog"><button class="dialog-close" aria-label="Close image">×</button></form><p id="image-dialog-label" class="eyebrow"></p><img id="expanded-image" alt="Expanded agent observation"></dialog>
+</body>
+</html>

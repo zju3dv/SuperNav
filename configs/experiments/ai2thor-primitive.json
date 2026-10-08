@@ -1,0 +1,12 @@
+{
+  "extends": [
+    "../agents/codex-user.json",
+    "../models/gpt-6-astra-medium.json",
+    "../backends/ai2thor.json",
+    "../methods/primitive.json"
+  ],
+  "workspace_root": ".",
+  "output_dir": "data/runs/ai2thor-primitive",
+  "instructions_file": null,
+  "prompts_dir": "configs/benchmarks/main/prompts"
+}

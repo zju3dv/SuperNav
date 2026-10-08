@@ -1,0 +1,43 @@
+{
+  "benchmark_profile": "global_task",
+  "skill_runtime": {
+    "root": "skills",
+    "skill_set_id": "habitat-gs-native-v1",
+    "visibility_gate": "required",
+    "visibility_timeout_s": 120
+  },
+  "mcp": {
+    "environment": {
+      "HAB_ENABLE_ORACLE_LOCAL_NAV": "1",
+      "HAB_MCP_GATE_ENABLED": "0",
+      "HAB_SENSOR_WIDTH": "640",
+      "HAB_SENSOR_HEIGHT": "480",
+      "HAB_DEFAULT_AGENT_NAVMESH": "0",
+      "HAB_MCP_SPATIAL_MEMORY": "0",
+      "HAB_MCP_VISIBLE_TARGET_OVERLAYS": "0",
+      "HAB_MCP_MINIMAL_TASK": "0",
+      "HAB_VISUAL_POINT_POINT_ONLY": "1",
+      "HAB_VISUAL_POINT_GEO_BASED_EXECUTOR": "1"
+    }
+  },
+  "arms": {
+    "default": {
+      "movement": "visual_point",
+      "skill_mode": "native",
+      "tool_whitelist": [
+        "hab_init_scene",
+        "hab_turn",
+        "hab_visual_point_navigate",
+        "hab_close_session"
+      ],
+      "environment": {
+        "HAB_MCP_OBSERVATION_MODE": "surround"
+      },
+      "skill_name": "global-navigation-geo-based-executor",
+      "skill_names": [
+        "global-navigation-geo-based-executor",
+        "localnav-pointnav-geo-based-executor"
+      ]
+    }
+  }
+}

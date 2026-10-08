@@ -1,0 +1,13 @@
+{
+  "model": {
+    "name": "gpt-6-astra"
+  },
+  "agents": {
+    "codex": {
+      "extra_args": [
+        "-c",
+        "model_reasoning_effort=\"medium\""
+      ]
+    }
+  }
+}

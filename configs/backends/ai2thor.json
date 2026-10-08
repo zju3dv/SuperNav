@@ -1,0 +1,12 @@
+{
+  "environment": {
+    "backend": "ai2thor",
+    "views": "four",
+    "gpu": 0
+  },
+  "bridge": {
+    "host": "127.0.0.1",
+    "port": 0,
+    "startup_timeout_s": 120
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "sensors": [
+    "color_sensor",
+    "depth_sensor"
+  ],
+  "resolution": {
+    "forward_executor_default": {
+      "width": 640,
+      "height": 480,
+      "source": "src_python/habitat_sim/utils/settings.py"
+    },
+    "init_scene_tool_default": {
+      "width": 512,
+      "height": 512,
+      "source": "src/supernav/methods/navigation/tools/session.py"
+    },
+    "hfov": 90,
+    "sensor_height": 1.5,
+    "agent_radius": 0.1,
+    "depth_default": true,
+    "semantic_default": false,
+    "third_person_default": false
+  },
+  "action_space": {
+    "move_forward": {
+      "amount": 0.25,
+      "unit": "meters"
+    },
+    "turn_left": {
+      "amount": 10.0,
+      "unit": "degrees"
+    },
+    "turn_right": {
+      "amount": 10.0,
+      "unit": "degrees"
+    }
+  },
+  "context_budget_ref": "configs/runtime/context_budget.yaml"
+}

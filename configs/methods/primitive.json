@@ -1,0 +1,8 @@
+{
+  "arms": {
+    "default": {
+      "movement": "primitive",
+      "skill_mode": "none"
+    }
+  }
+}

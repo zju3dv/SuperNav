@@ -1,0 +1,2 @@
+- hab_depth_analyze() and hab_depth_grid() - inspect nearby depth before committing to movement. Use them as safety checks, not as a map.
+- hab_passability_check(direction, distance_m) - conservative passability check before forward movement.

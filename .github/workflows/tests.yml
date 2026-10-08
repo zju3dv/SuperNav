@@ -1,0 +1,30 @@
+name: Python tests
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e '.[test]'
+      - run: python -m pytest -q
+
+  installed-wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build wheel
+        run: python -m pip wheel --no-deps --wheel-dir "$RUNNER_TEMP/supernav-wheel" .
+      - name: Install wheel with base dependencies in a clean environment
+        run: |
+          python -m venv "$RUNNER_TEMP/supernav-installed"
+          "$RUNNER_TEMP/supernav-installed/bin/python" -m pip install "$RUNNER_TEMP"/supernav-wheel/supernav-*.whl
+      - name: Verify installed operation without simulator SDKs
+        working-directory: ${{ runner.temp }}
+        run: '"$RUNNER_TEMP/supernav-installed/bin/python" "$GITHUB_WORKSPACE/scripts/check_installed_package.py"'

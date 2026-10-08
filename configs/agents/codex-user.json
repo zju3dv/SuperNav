@@ -1,0 +1,17 @@
+{
+  "agent": "codex",
+  "model": {},
+  "agents": {
+    "codex": {
+      "command": "codex",
+      "provider_mode": "user",
+      "timeout_s": 3600,
+      "sandbox": "workspace-write",
+      "approval": "never",
+      "mcp_tools_approval": "approve",
+      "mcp_startup_timeout_s": 30,
+      "mcp_tool_timeout_s": 300,
+      "skip_git_repo_check": true
+    }
+  }
+}
