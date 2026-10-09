@@ -7,6 +7,7 @@
 
 <p>
   <a href="https://arxiv.org/abs/2610.12126v1"><img src="https://img.shields.io/badge/arXiv-2610.12126-b31b1b" alt="arXiv: 2610.12126"></a>
+  <a href="https://huggingface.co/papers/2610.12126"><img src="https://img.shields.io/badge/Hugging_Face-Paper-FFD21E?logo=huggingface&amp;logoColor=FFD21E" alt="Hugging Face Paper"></a>
   <a href="https://zju3dv.github.io/SuperNav/"><img src="https://img.shields.io/badge/Project_Page-SuperNav-orange" alt="Project Page"></a>
 </p>
 
