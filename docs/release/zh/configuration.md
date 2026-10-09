@@ -32,7 +32,7 @@ supernav config show --experiment habitat-geo-based-executor
 | 配方 | 用途 |
 | --- | --- |
 | `habitat-geo-based-executor` | 使用几何执行器和原生 Skills 的 Habitat 导航 |
-| `habitat-learned-executor` | 使用学习型局部策略和原生 Skills 的 Habitat 导航；权重尚未发布 |
+| `habitat-learned-executor` | 使用学习型局部策略和原生 Skills 的 Habitat 导航 |
 | `ai2thor-primitive` | 使用原子动作的 AI2-THOR 需求驱动导航 |
 
 公开配方将 `instructions_file` 设为 `null`。通过 `--instructions /path/to/tasks.json`
@@ -40,8 +40,9 @@ supernav config show --experiment habitat-geo-based-executor
 按任务准备匹配的场景资产和外部数据集。每个配方只有一个 `default` arm，
 可省略 `--arms` 或使用 `--arms default`。Habitat 配方加载原生 Skills。
 几何执行器使用 oracle 深度和 NavMesh 路径；学习型执行器需要策略服务及其权重。
-学习型执行器的权重尚未发布，目前没有下载地址。选择该配方进行真实运行前，
-请先阅读[策略服务要求](habitat.md#learned-executor-weights)。
+从 [Hugging Face](https://huggingface.co/the0xka1/SuperNav-Learned-Executor)
+下载权重，并在选择该配方进行真实运行前完成
+[策略服务部署](habitat.md#learned-executor-weights)。
 
 ## 模型与凭证
 

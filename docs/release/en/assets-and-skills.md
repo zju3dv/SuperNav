@@ -35,9 +35,10 @@ local navigation, recovery, and stopping. The two Habitat recipes use these nati
 - `habitat-learned-executor`:
   [`global-navigation-learned-executor`](../../../skills/global-navigation-learned-executor/SKILL.md)
   and [`localnav-pointnav`](../../../skills/localnav-pointnav/SKILL.md).
-  Its weights are not yet released, and no download is available. Real execution
-  requires your own compatible checkpoint and running policy service; see
-  [policy service requirements](habitat.md#learned-executor-weights).
+  Download its checkpoint from
+  [Hugging Face](https://huggingface.co/the0xka1/SuperNav-Learned-Executor)
+  and follow the [policy service setup](habitat.md#learned-executor-weights)
+  before running an experiment.
 
 Native-Skill runs save a frozen Skill snapshot and verify its visibility to the
 selected client. See [tool authoring](tool-authoring-guide.md) to add or change tools.

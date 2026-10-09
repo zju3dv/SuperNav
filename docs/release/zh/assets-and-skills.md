@@ -35,8 +35,9 @@ AI2-THOR 使用接入指南中说明的冻结需求驱动数据集。本机路�
 - `habitat-learned-executor`：
   [`global-navigation-learned-executor`](../../../skills/global-navigation-learned-executor/SKILL.md)
   与 [`localnav-pointnav`](../../../skills/localnav-pointnav/SKILL.md)。
-  权重尚未发布，目前没有下载地址。真实运行需自备兼容 checkpoint 和已启动的策略服务，
-  详见[策略服务要求](habitat.md#learned-executor-weights)。
+  从 [Hugging Face](https://huggingface.co/the0xka1/SuperNav-Learned-Executor)
+  下载 checkpoint，并在运行实验前完成
+  [策略服务部署](habitat.md#learned-executor-weights)。
 
 原生 Skill 模式会保存冻结的 Skill 快照，并验证其对所选客户端的可见性。
 新增或修改工具见[工具编写指南](tool-authoring-guide.md)。

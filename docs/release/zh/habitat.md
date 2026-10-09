@@ -142,12 +142,51 @@ Habitat 后端为每个 episode 启动并回收 bridge，启动超时为 120 秒
 
 ## Learned Executor 权重与策略服务
 
-**Learned Executor 权重尚未发布，目前没有下载链接，也没有随包提供 checkpoint。**
-仅有配方和 Skills 无法运行训练好的策略。除非已持有兼容 checkpoint 并能部署策略服务，
-请先使用 `habitat-geo-based-executor`。权重发布后会在
-[README](../../../README.zh-CN.md#roadmap) 补充下载与部署说明。
+已发布的 checkpoint 位于
+[the0xka1/SuperNav-Learned-Executor](https://huggingface.co/the0xka1/SuperNav-Learned-Executor)。
+它包含学习型局部策略；高层 Agent、Habitat-GS、场景资产和任务清单仍需单独准备。
 
-已持有兼容 checkpoint 时，当前策略服务使用以下配置：
+```bash
+python -m pip install -U huggingface_hub
+hf download the0xka1/SuperNav-Learned-Executor \
+  ckpt_latest125.pt CHECKSUMS.sha256 --local-dir /path/to/checkpoints
+(cd /path/to/checkpoints && sha256sum -c CHECKSUMS.sha256)
+```
+
+策略服务环境使用 Python 3.12，并安装适合设备的 PyTorch、torchvision，以及 NumPy 和 Pillow。
+在仓库根目录执行 `python -m pip install -e '.[agents,evaluation]'` 安装 SuperNav。
+SuperNav 的 `nomad` 后端会从 checkpoint 读取模型架构设置。
+
+已验证的 CUDA 12.1 环境使用 PyTorch `2.5.1+cu121` 和 torchvision `0.20.1+cu121`。
+可通过 [PyTorch 官方 wheel](https://pytorch.org/get-started/previous-versions/#v251) 安装这组版本：
+
+```bash
+python -m pip install torch==2.5.1 torchvision==0.20.1 \
+  --index-url https://download.pytorch.org/whl/cu121
+```
+
+使用下载文件的绝对路径启动服务：
+
+```bash
+export TORCH_HOME=/path/to/torch-cache
+export NAV_LOCALNAV_CKPT=/path/to/checkpoints/ckpt_latest125.pt
+python -m supernav.methods.localnav.server \
+  --backend nomad --checkpoint "$NAV_LOCALNAV_CKPT" \
+  --host 127.0.0.1 --port 18914 --device cuda
+```
+
+将占位路径替换为本机可写目录。DINOv2 加载器在首次启动时通过 Torch Hub 下载上游代码和
+初始骨干网络权重，因此需要访问 GitHub 和 `dl.fbaipublicfiles.com`，或提前在 `TORCH_HOME`
+下准备缓存。该推理路径不要求安装 xFormers。CPU 推理可使用 `--device cpu`。
+
+保持服务运行，在启动 Agent 的终端中设置 URL 并检查服务：
+
+```bash
+export NAV_LOCALNAV_URL=http://127.0.0.1:18914
+curl --fail "$NAV_LOCALNAV_URL/healthz"
+```
+
+策略服务也可通过以下环境变量配置：
 
 | 设置 | 要求 |
 | --- | --- |
@@ -156,10 +195,13 @@ Habitat 后端为每个 episode 启动并回收 bridge，启动超时为 120 秒
 | `NAV_LOCALNAV_URL` | Habitat bridge 可访问的策略服务 URL；默认 `http://127.0.0.1:18914` |
 
 服务的 `GET /healthz` 响应会报告 `backend` 和 `ckpt`。运行实验前，确认其分别为
-`nomad` 和自备 checkpoint。服务默认使用 `debug` 后端，仅用于检验通信协议；
+`nomad` 和下载的 checkpoint。如果 Habitat bridge 位于另一台机器，需将 `NAV_LOCALNAV_URL`
+设为它能访问的服务地址，并调整服务的 `--host` 监听地址。使用本机 HTTP 代理时，在
+`NO_PROXY` 和 `no_proxy` 中加入 `127.0.0.1,localhost`。
+服务默认使用 `debug` 后端，仅用于检验通信协议；
 未加载学习型权重的服务不能提供训练好的执行器。
-保持策略服务运行，并在本机配置中继承 `habitat-learned-executor.json`。
-`--dry-run` 只准备运行输入，不会验证策略服务或 checkpoint 是否可用。
+在本机配置中继承 `habitat-learned-executor.json`，准备场景资产和外部任务清单，
+再按上文的 episode 命令运行任务。`--dry-run` 只准备运行输入，不会验证权重加载或任务执行。
 
 ## 导航设置
 

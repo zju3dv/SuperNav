@@ -160,13 +160,57 @@ external task paths to your local data; see the [configuration guide](configurat
 
 ## Learned Executor weights and policy service
 
-**The Learned Executor weights are not yet released. There is no download link
-or bundled checkpoint.** The recipe and Skills alone cannot run the trained
-policy. Use `habitat-geo-based-executor` unless you already have a compatible
-checkpoint and can deploy its policy service. Download and setup instructions
-will be added to the [README](../../../README.md#roadmap) when weights are released.
+The released checkpoint is hosted at
+[the0xka1/SuperNav-Learned-Executor](https://huggingface.co/the0xka1/SuperNav-Learned-Executor).
+It contains the learned local policy; the high-level agent, Habitat-GS, scene
+assets, and task manifests remain separate requirements.
 
-For an existing compatible checkpoint, the current service configuration is:
+```bash
+python -m pip install -U huggingface_hub
+hf download the0xka1/SuperNav-Learned-Executor \
+  ckpt_latest125.pt CHECKSUMS.sha256 --local-dir /path/to/checkpoints
+(cd /path/to/checkpoints && sha256sum -c CHECKSUMS.sha256)
+```
+
+In the policy-service environment, use Python 3.12 and install compatible
+PyTorch and torchvision builds for your device, plus NumPy and Pillow. Install
+SuperNav with `python -m pip install -e '.[agents,evaluation]'` from the repository
+root. SuperNav's `nomad` backend reads the architecture settings from the checkpoint.
+
+The verified CUDA 12.1 environment used PyTorch `2.5.1+cu121` and torchvision
+`0.20.1+cu121`. To install this pair, use the
+[official PyTorch wheels](https://pytorch.org/get-started/previous-versions/#v251):
+
+```bash
+python -m pip install torch==2.5.1 torchvision==0.20.1 \
+  --index-url https://download.pytorch.org/whl/cu121
+```
+
+Start the service with the downloaded checkpoint's absolute path:
+
+```bash
+export TORCH_HOME=/path/to/torch-cache
+export NAV_LOCALNAV_CKPT=/path/to/checkpoints/ckpt_latest125.pt
+python -m supernav.methods.localnav.server \
+  --backend nomad --checkpoint "$NAV_LOCALNAV_CKPT" \
+  --host 127.0.0.1 --port 18914 --device cuda
+```
+
+Replace the placeholder paths with writable directories on your machine. On
+first startup, the DINOv2 loader downloads its upstream code and initial backbone
+weights through Torch Hub, so allow access to GitHub and `dl.fbaipublicfiles.com`,
+or prepare the cache under `TORCH_HOME` in advance. xFormers is optional for this
+inference path. Use `--device cpu` for CPU inference.
+
+Keep the service running. In the terminal used to launch the agent, configure
+the URL and check the service:
+
+```bash
+export NAV_LOCALNAV_URL=http://127.0.0.1:18914
+curl --fail "$NAV_LOCALNAV_URL/healthz"
+```
+
+The service configuration can also be supplied through environment variables:
 
 | Setting | Requirement |
 | --- | --- |
@@ -175,12 +219,16 @@ For an existing compatible checkpoint, the current service configuration is:
 | `NAV_LOCALNAV_URL` | Policy service URL reachable from the Habitat bridge; defaults to `http://127.0.0.1:18914` |
 
 The service's `GET /healthz` response reports its `backend` and `ckpt`; verify
-that it reports `nomad` and your checkpoint before running an experiment.
+that it reports `nomad` and the downloaded checkpoint before running an experiment.
+If the Habitat bridge runs on another host, set `NAV_LOCALNAV_URL` to a reachable
+service address and adjust the service's `--host` binding. When using an HTTP
+proxy locally, include `127.0.0.1,localhost` in `NO_PROXY` and `no_proxy`.
 The service defaults to the `debug` backend, which exercises the protocol only.
 Starting it without learned weights does not provide a trained executor.
-Keep the service running and extend `habitat-learned-executor.json` in your local
-configuration. `--dry-run` only prepares run inputs and does not verify that the
-policy service or checkpoint is available.
+Extend `habitat-learned-executor.json` in your local configuration and run a task
+with your scene assets and external manifest, following the episode commands
+above. `--dry-run` only prepares run inputs and does not verify policy loading
+or task execution.
 
 ## Navigation settings
 

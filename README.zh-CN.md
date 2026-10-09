@@ -187,15 +187,24 @@ SuperNav 会为每个 episode 启动并关闭 Habitat bridge。
 | 实验 | 用途 |
 | --- | --- |
 | `habitat-geo-based-executor` | 使用几何执行器和原生 Skills 的 Habitat 导航 |
-| `habitat-learned-executor` | 使用学习型局部策略和原生 Skills 的 Habitat 导航；权重尚未发布 |
+| `habitat-learned-executor` | 使用学习型局部策略和原生 Skills 的 Habitat 导航 |
 | `ai2thor-primitive` | 使用原子动作的 AI2-THOR 需求驱动导航 |
 
-**Learned Executor 权重尚未发布，目前没有可用的下载地址。**
-`habitat-learned-executor` 配方需要兼容的训练权重和已启动的策略服务，
-仅安装 SuperNav 不能直接运行。已持有兼容权重的用户可参考
-[策略服务要求](docs/release/zh/habitat.md#learned-executor-weights)；
-其他用户请先使用 `habitat-geo-based-executor`。
-权重发布后会在此补充下载与部署说明。
+**Learned Executor 权重已发布到
+[Hugging Face](https://huggingface.co/the0xka1/SuperNav-Learned-Executor)。**
+下载 checkpoint 并校验文件：
+
+```bash
+python -m pip install -U huggingface_hub
+hf download the0xka1/SuperNav-Learned-Executor \
+  ckpt_latest125.pt CHECKSUMS.sha256 --local-dir /path/to/checkpoints
+(cd /path/to/checkpoints && sha256sum -c CHECKSUMS.sha256)
+```
+
+将 `/path/to/checkpoints` 替换为下载目录。运行 `habitat-learned-executor` 前，
+按照[策略服务部署说明](docs/release/zh/habitat.md#learned-executor-weights)
+使用 `nomad` 后端加载 checkpoint，并设置 `NAV_LOCALNAV_URL`。
+场景资产和任务指令仍需单独准备。
 
 每个配方只有一个 `default` arm，可省略 `--arms` 或使用 `--arms default`。
 通过 `--task-ids` 和 `--reps` 选择任务与重复次数。几何执行器使用深度和 NavMesh
@@ -307,7 +316,6 @@ CI 会构建 wheel，并在仅安装基础依赖的独立环境中检查 CLI、�
 
 SuperNav 工作中尚未在本仓库发布的部分：
 
-- **Learned Executor 权重**：`habitat-learned-executor` 所需的训练 checkpoint，以及下载与部署说明。
 - **真机部署**：论文中的 Unitree Go2 部署（四路 RGB，基于 LiDAR 的几何执行）。
 - **Benchmark 任务数据**：论文使用的 InteriorGS 单目标、多目标实例导航任务，以及 AI2-THOR 需求驱动任务。
 

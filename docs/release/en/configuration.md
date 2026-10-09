@@ -34,7 +34,7 @@ supernav config show --experiment habitat-geo-based-executor
 | Recipe | Purpose |
 | --- | --- |
 | `habitat-geo-based-executor` | Habitat navigation with a geometry-based executor and native Skills |
-| `habitat-learned-executor` | Habitat navigation with a learned local policy and native Skills; weights not yet released |
+| `habitat-learned-executor` | Habitat navigation with a learned local policy and native Skills |
 | `ai2thor-primitive` | AI2-THOR demand-driven navigation with primitive actions |
 
 Public recipes set `instructions_file` to `null`. Supply a task manifest through
@@ -43,10 +43,10 @@ The paper's task lists and ground truth are excluded from the release. Prepare
 the matching scene assets and external datasets. Each recipe has one `default`
 arm; omit `--arms` or use `--arms default`. Habitat recipes load native Skills.
 The geometry-based executor uses oracle depth and NavMesh paths. The learned
-executor requires a policy service and its checkpoint. Its weights are not yet
-released, and no download is currently available. See the
-[policy service requirements](habitat.md#learned-executor-weights) before selecting
-this recipe for a real run.
+executor requires a policy service and its checkpoint. Download the weights from
+[Hugging Face](https://huggingface.co/the0xka1/SuperNav-Learned-Executor)
+and follow the [policy service setup](habitat.md#learned-executor-weights) before
+selecting this recipe for a real run.
 
 ## Models and credentials
 

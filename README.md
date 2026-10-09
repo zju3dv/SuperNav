@@ -204,16 +204,25 @@ supply your own data and instructions:
 | Experiment | Purpose |
 | --- | --- |
 | `habitat-geo-based-executor` | Habitat navigation with a geometry-based executor and native Skills |
-| `habitat-learned-executor` | Habitat navigation with a learned local policy and native Skills; weights not yet released |
+| `habitat-learned-executor` | Habitat navigation with a learned local policy and native Skills |
 | `ai2thor-primitive` | AI2-THOR demand-driven navigation with primitive actions |
 
-**Learned Executor weights are not yet released, and no download is available.**
-The `habitat-learned-executor` recipe requires compatible trained weights and a
-running policy service; installing SuperNav alone does not make it ready to run.
-If you already have compatible weights, see the
-[policy service requirements](docs/release/en/habitat.md#learned-executor-weights).
-Otherwise, use `habitat-geo-based-executor` while the weight release is pending.
-Download and setup instructions will be added here when the weights are released.
+**Learned Executor weights are available on
+[Hugging Face](https://huggingface.co/the0xka1/SuperNav-Learned-Executor).**
+Download the checkpoint and verify its checksum:
+
+```bash
+python -m pip install -U huggingface_hub
+hf download the0xka1/SuperNav-Learned-Executor \
+  ckpt_latest125.pt CHECKSUMS.sha256 --local-dir /path/to/checkpoints
+(cd /path/to/checkpoints && sha256sum -c CHECKSUMS.sha256)
+```
+
+Replace `/path/to/checkpoints` with your download directory. Before running
+`habitat-learned-executor`, follow the
+[policy service setup](docs/release/en/habitat.md#learned-executor-weights)
+to load the checkpoint with the `nomad` backend and set `NAV_LOCALNAV_URL`.
+Scene assets and task instructions are separate requirements.
 
 Each recipe has one `default` arm; omit `--arms` or use `--arms default`.
 Use `--task-ids` and `--reps` to select tasks and repetitions. The geometry-based
@@ -333,8 +342,6 @@ in a clean environment with only the base dependencies.
 
 Parts of the SuperNav work that are not yet released in this repository:
 
-- **Learned Executor weights:** trained checkpoints and their download and setup
-  instructions for `habitat-learned-executor`.
 - **Real-robot deployment:** the Unitree Go2 deployment used in the paper
   (four-view RGB with LiDAR-based geometric execution).
 - **Benchmark task data:** the InteriorGS single- and multi-object instance
