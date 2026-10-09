@@ -63,14 +63,24 @@ videos, the method overview, and research results.
 Real-world robot demonstrations are on the project page; this repository currently
 contains no real-robot drivers.
 
+<a id="release-status"></a>
+
+## 📦 Release Status
+
+- [x] Agent runtime, navigation tools and Skills, experiment recipes, and evaluation
+- [x] Learned Executor weights ([Hugging Face](https://huggingface.co/the0xka1/SuperNav-Learned-Executor))
+- [ ] InteriorGS single/multi-object navigation benchmark
+- [ ] AI2-THOR demand-driven navigation benchmark
+- [ ] Real-robot deployment (Unitree Go2): four-view RGB with LiDAR-based geometric execution
+
 ## 📖 Table of Contents
 
+- [Release Status](#release-status)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Run Navigation Experiments](#run-navigation-experiments)
 - [Visualization and Evaluation](#visualization-and-evaluation)
 - [Documentation and Development](#documentation-and-development)
-- [Roadmap](#roadmap)
 - [Citation](#citation)
 - [Acknowledgements and License](#acknowledgements-and-license)
 
@@ -335,17 +345,6 @@ python -m pytest -q
 
 CI builds a wheel and checks its CLI, configuration, prompt, and Skill resources
 in a clean environment with only the base dependencies.
-
-<a id="roadmap"></a>
-
-## 🗺️ Roadmap
-
-Parts of the SuperNav work that are not yet released in this repository:
-
-- **Real-robot deployment:** the Unitree Go2 deployment used in the paper
-  (four-view RGB with LiDAR-based geometric execution).
-- **Benchmark task data:** the InteriorGS single- and multi-object instance
-  navigation tasks and the AI2-THOR demand-driven tasks used in the paper.
 
 <a id="citation"></a>
 

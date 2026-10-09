@@ -57,14 +57,24 @@
 [项目主页](https://zju3dv.github.io/SuperNav/) 提供仿真视频、方法介绍和研究结果。
 真机演示见项目主页；当前仓库不包含真机驱动。
 
+<a id="release-status"></a>
+
+## 📦 发布状态
+
+- [x] 智能体运行时、导航工具与 Skills、实验配方及评测
+- [x] Learned Executor 权重（[Hugging Face](https://huggingface.co/the0xka1/SuperNav-Learned-Executor)）
+- [ ] InteriorGS 单目标/多目标导航 benchmark
+- [ ] AI2-THOR 需求驱动导航 benchmark
+- [ ] 真机部署（Unitree Go2）：四路 RGB，基于 LiDAR 的几何执行
+
 ## 📖 目录
 
+- [发布状态](#release-status)
 - [安装](#installation)
 - [快速开始](#quick-start)
 - [运行导航实验](#run-navigation-experiments)
 - [可视化与评测](#visualization-and-evaluation)
 - [文档与开发](#documentation-and-development)
-- [Roadmap](#roadmap)
 - [引用](#citation)
 - [致谢与许可证](#acknowledgements-and-license)
 
@@ -309,15 +319,6 @@ python -m pytest -q
 ```
 
 CI 会构建 wheel，并在仅安装基础依赖的独立环境中检查 CLI、配置、提示与 Skill 资源。
-
-<a id="roadmap"></a>
-
-## 🗺️ Roadmap
-
-SuperNav 工作中尚未在本仓库发布的部分：
-
-- **真机部署**：论文中的 Unitree Go2 部署（四路 RGB，基于 LiDAR 的几何执行）。
-- **Benchmark 任务数据**：论文使用的 InteriorGS 单目标、多目标实例导航任务，以及 AI2-THOR 需求驱动任务。
 
 <a id="citation"></a>
 
