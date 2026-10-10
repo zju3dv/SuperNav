@@ -119,9 +119,9 @@ the fresh front RGB observation with NM-OBS-003.
   matching context MUST all be verifiable from that final close-range
   front RGB observation. Once that gate is met, close promptly — do not keep hunting for
   an even better angle; over-searching after the gate is met risks losing
-  the target entirely. The first `outcome="achieved"` close returns
-  `achieved_close_audit_required` with a token: immediately retry with that
-  `close_audit_token` and an `arrival_confirmation` whose
+  the target entirely. The first `outcome="achieved"` close may return
+  `achieved_close_audit_required` with a token. If it does, immediately retry
+  with that `close_audit_token` and an `arrival_confirmation` whose
   `final_approach_done` / `target_base_cut` are true and
   `estimated_distance_m` ≤ 1.0 — any tool call in between invalidates the
   token, and confirmation values that admit the criteria are not met reject
