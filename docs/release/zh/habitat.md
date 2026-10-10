@@ -157,8 +157,8 @@ hf download the0xka1/SuperNav-Learned-Executor \
 在仓库根目录执行 `python -m pip install -e '.[agents,evaluation]'` 安装 SuperNav。
 SuperNav 的 `nomad` 后端会从 checkpoint 读取模型架构设置。
 
-已验证的 CUDA 12.1 环境使用 PyTorch `2.5.1+cu121` 和 torchvision `0.20.1+cu121`。
-可通过 [PyTorch 官方 wheel](https://pytorch.org/get-started/previous-versions/#v251) 安装这组版本：
+对于 CUDA 12.1，以下示例通过 [PyTorch 官方 wheel](https://pytorch.org/get-started/previous-versions/#v251)
+安装 PyTorch `2.5.1` 和 torchvision `0.20.1`：
 
 ```bash
 python -m pip install torch==2.5.1 torchvision==0.20.1 \

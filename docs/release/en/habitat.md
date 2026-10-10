@@ -177,8 +177,8 @@ PyTorch and torchvision builds for your device, plus NumPy and Pillow. Install
 SuperNav with `python -m pip install -e '.[agents,evaluation]'` from the repository
 root. SuperNav's `nomad` backend reads the architecture settings from the checkpoint.
 
-The verified CUDA 12.1 environment used PyTorch `2.5.1+cu121` and torchvision
-`0.20.1+cu121`. To install this pair, use the
+For CUDA 12.1, this example installs PyTorch `2.5.1` and torchvision
+`0.20.1` from the
 [official PyTorch wheels](https://pytorch.org/get-started/previous-versions/#v251):
 
 ```bash
