@@ -137,6 +137,8 @@ Habitat 后端为每个 episode 启动并回收 bridge，启动超时为 120 秒
 
 外部 OVON 任务需要匹配的 HM3D/OVON 资产。设置 `deployment.scene_dataset_config_file`
 和 `deployment.path_prefixes`，将外部任务中的路径映射到本机数据，详见[配置指南](configuration.md)。
+HM3D v2 ObjectNav 和 OVON 的数据准备、任务转换、运行与评分步骤见
+[HM3D v2 与 OVON 指南](hm3d-and-ovon.md)。
 
 <a id="learned-executor-weights"></a>
 

@@ -155,6 +155,8 @@ Both Habitat examples have one `default` arm; omit `--arms` or use `--arms defau
 External OVON tasks require matching HM3D/OVON assets. Use
 `deployment.scene_dataset_config_file` and `deployment.path_prefixes` to map
 external task paths to your local data; see the [configuration guide](configuration.md).
+For dataset preparation, task conversion, navigation, and scoring, follow the
+[HM3D v2 and OVON guide](hm3d-and-ovon.md).
 
 <a id="learned-executor-weights"></a>
 

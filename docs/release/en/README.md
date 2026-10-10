@@ -11,6 +11,7 @@ execution requirements.
 | [Configuration](configuration.md) | Recipes, agents, models, local deployment, task composition, and overrides |
 | [Assets and Skills](assets-and-skills.md) | Simulator resources, datasets, policy services, and navigation Skills |
 | [Habitat-GS](habitat.md) | SDK installation, scene assets, bridge setup, and navigation |
+| [HM3D v2 and OVON](hm3d-and-ovon.md) | Scene and episode data, task preparation, navigation, and offline scoring |
 | [AI2-THOR](ai2thor.md) | Frozen dataset and Unity build requirements, observations, actions, and evidence |
 | [Web viewer](web-viewer.md) | Demo, live monitoring, remote access, and existing recordings |
 | [Architecture](architecture.md) | Runtime, method, backend, experiment, and evaluation responsibilities |

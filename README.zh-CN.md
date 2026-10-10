@@ -306,6 +306,7 @@ supernav video --help
 | [配置](docs/release/zh/configuration.md) | 实验、模型、本机设置和任务 manifest |
 | [场景资产与 Skills](docs/release/zh/assets-and-skills.md) | 后端要求、外部资产和导航 Skills |
 | [Habitat-GS](docs/release/zh/habitat.md) | 仿真器安装与场景接入 |
+| [HM3D v2 与 OVON](docs/release/zh/hm3d-and-ovon.md) | 场景与任务数据、任务转换、导航运行和离线评分 |
 | [AI2-THOR](docs/release/zh/ai2thor.md) | 数据集、Unity 构建、观测和执行 |
 | [Web 查看器](docs/release/zh/web-viewer.md) | 实时观察与已有记录 |
 | [架构](docs/release/zh/architecture.md) | 运行时、方法、后端、实验与评测 |

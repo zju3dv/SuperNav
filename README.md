@@ -331,6 +331,7 @@ All release guides are available in [English](docs/release/en/README.md) and
 | [Configuration](docs/release/en/configuration.md) | Experiments, models, local settings, and task manifests |
 | [Scene assets and Skills](docs/release/en/assets-and-skills.md) | Backend requirements, external assets, and navigation Skills |
 | [Habitat-GS](docs/release/en/habitat.md) | Simulator installation and scene integration |
+| [HM3D v2 and OVON](docs/release/en/hm3d-and-ovon.md) | Scene and episode data, task preparation, navigation, and offline scoring |
 | [AI2-THOR](docs/release/en/ai2thor.md) | Dataset, Unity build, observations, and execution |
 | [Web viewer](docs/release/en/web-viewer.md) | Live observation and recorded runs |
 | [Architecture](docs/release/en/architecture.md) | Runtime, methods, backends, experiments, and evaluation |
