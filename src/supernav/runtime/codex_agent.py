@@ -17,6 +17,7 @@ from supernav.runtime.agents import AgentResult, model_name
 from supernav.runtime.mcp import resolve_mcp_spec
 from supernav.runtime.instructions import agent_instructions as default_agent_instructions, agent_policy
 from supernav.runtime.config import write_json
+from supernav.runtime.codex_direct import direct_mcp_overrides, validate_direct_mcp_session
 from supernav.runtime.providers import configured_provider
 from supernav.runtime.streams import (
     _clean_tool_name,
@@ -727,8 +728,6 @@ class CodexAgent:
                 )
             )
         )
-        command.append(prompt)
-
         env = dict(os.environ)
         env["CODEX_HOME"] = str(codex_home)
         env.update(getattr(self, "_benchmark_process_environment", {}))
@@ -740,6 +739,15 @@ class CodexAgent:
             ),
             env,
         )
+        command.extend(
+            direct_mcp_overrides(
+                command[0], project_dir, env, selected_model,
+                _provider_cli_overrides(
+                    getattr(self, "_provider", _codex_provider_metadata(_codex_provider_mode(agent_cfg), agent_cfg))
+                ),
+            )
+        )
+        command.append(prompt)
         start = time.monotonic()
         with (
             raw_path.open("w", encoding="utf-8") as out,
@@ -761,6 +769,8 @@ class CodexAgent:
         latest_session = _latest_session_dump(codex_home)
         if latest_session is not None:
             shutil.copy2(latest_session, session_path)
+        if proc.returncode == 0:
+            validate_direct_mcp_session(session_path)
         return AgentResult(
             proc.returncode,
             duration_s,
@@ -803,7 +813,8 @@ class CodexAgentProfile(CodexAgent):
             command.extend(["--ask-for-approval", str(approval)])
         command.extend(
             [
-                "-c features.runtime_metrics=true",
+                "-c",
+                "features.runtime_metrics=true",
                 "exec",
                 "--json",
                 "-C",
@@ -830,8 +841,6 @@ class CodexAgentProfile(CodexAgent):
                 )
             )
         )
-        command.append(prompt)
-
         env = dict(os.environ)
         env["CODEX_HOME"] = str(codex_home)
         env["CODEX_ROLLOUT_TRACE_ROOT"] = str(trace_path)
@@ -845,6 +854,15 @@ class CodexAgentProfile(CodexAgent):
             ),
             env,
         )
+        command.extend(
+            direct_mcp_overrides(
+                command[0], project_dir, env, selected_model,
+                _provider_cli_overrides(
+                    getattr(self, "_provider", _codex_provider_metadata(_codex_provider_mode(agent_cfg), agent_cfg))
+                ),
+            )
+        )
+        command.append(prompt)
         start = time.monotonic()
         with (
             raw_path.open("w", encoding="utf-8") as out,
@@ -866,6 +884,8 @@ class CodexAgentProfile(CodexAgent):
         latest_session = _latest_session_dump(codex_home)
         if latest_session is not None:
             shutil.copy2(latest_session, session_path)
+        if proc.returncode == 0:
+            validate_direct_mcp_session(session_path)
         return AgentResult(
             proc.returncode,
             duration_s,
