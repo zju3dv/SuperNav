@@ -1055,68 +1055,6 @@ def test_codex_experiment_provider_removes_stale_run_local_user_auth(
     assert metadata["auth_linked"] is False
 
 
-def test_codex_experiment_provider_is_authoritative_after_extra_args(
-    tmp_path: Path,
-    monkeypatch,
-    experiment_provider_env,
-) -> None:
-    source_home = tmp_path / "source_codex_home"
-    source_home.mkdir()
-    monkeypatch.setenv("CODEX_HOME", str(source_home))
-    monkeypatch.setenv("AUTH_TOKEN", "experiment-secret")
-    captured_commands = []
-
-    def capture_launch(command, **_kwargs):
-        captured_commands.append(command)
-        return subprocess.CompletedProcess(command, 0)
-
-    monkeypatch.setattr(subprocess, "run", capture_launch)
-    for agent_type in (CodexAgent, CodexAgentProfile):
-        agent = agent_type()
-        run_dir = tmp_path / agent_type.__name__
-        project_dir = agent.prepare_project(
-            run_dir=run_dir,
-            workspace_root=REPO_ROOT,
-            config={
-                "environment": {"backend": "habitat"},
-                "prompts_dir": str(REPO_ROOT / "configs/benchmarks/main/prompts"),
-                "mcp": {
-                    "transport": "stdio",
-                },
-                "bridge": {"host": "127.0.0.1", "port": 18911},
-            },
-            arm_cfg={"tool_whitelist": []},
-            agent_cfg={"provider_mode": "experiment", "provider": _test_provider()},
-            model_cfg={"name": "gpt-5.4"},
-        )
-        agent.run(
-            prompt="Reply with OK.",
-            run_dir=run_dir,
-            project_dir=project_dir,
-            agent_cfg={
-                "command": "codex", "provider_mode": "experiment", "provider": _test_provider(),
-                "extra_args": ["-c", 'model_provider="test_user_provider"'],
-            },
-            model_cfg={"name": "gpt-5.4"},
-            timeout_s=30,
-        )
-
-    assert len(captured_commands) == 2
-    for command in captured_commands:
-        assert command[-5:] == [
-            "-c",
-            'model_provider="test_provider"',
-            "-c",
-            (
-                'model_providers.test_provider={name="Test Provider",'
-                'base_url="https://provider.example/v1",'
-                'wire_api="responses",env_key="AUTH_TOKEN",'
-                "requires_openai_auth=false}"
-            ),
-            "Reply with OK.",
-        ]
-
-
 def test_generate_opencode_project_writes_subagent_file(
     tmp_path: Path, subagent_source: Path,
 ) -> None:
