@@ -36,6 +36,7 @@ from supernav.backends.habitat.memory_slam.occupancy_navigation import (
     compile_slam_occupancy_route,
     load_slam_occupancy_map,
     plan_slam_occupancy_path,
+    render_slam_occupancy_plan_overlay,
     snap_to_traversable,
 )
 from supernav.backends.habitat.simulator.types import HabitatAdapterError, _Session
@@ -132,6 +133,39 @@ class HabitatMemorySlamMixin:
         if stream is None or "depth_sensor" not in observation:
             return
         try:
+            capture_surround = (
+                os.environ.get("HAB_CARTOGRAPHER_SURROUND_SCAN", "0").strip()
+                == "1"
+            )
+            depth_views: list[Any] = [observation["depth_sensor"]]
+            if capture_surround:
+                # Match the research implementation: capture right, back, and
+                # left without advancing simulation time, then restore the
+                # authoritative agent state before submitting the scan.
+                import habitat_sim
+
+                agent = session.simulator.get_agent(session.agent_id)
+                saved_state = agent.get_state()
+                try:
+                    base_w, base_x, base_y, base_z = self._current_rotation(session)
+                    for turn_right_deg in (90.0, 180.0, 270.0):
+                        half_angle = -math.radians(turn_right_deg) / 2.0
+                        delta_y = math.sin(half_angle)
+                        delta_w = math.cos(half_angle)
+                        view_state = habitat_sim.AgentState()
+                        view_state.position = saved_state.position
+                        view_state.rotation = [
+                            base_x * delta_w - base_z * delta_y,
+                            base_w * delta_y + base_y * delta_w,
+                            base_x * delta_y + base_z * delta_w,
+                            base_w * delta_w - base_y * delta_y,
+                        ]
+                        agent.set_state(view_state, infer_sensor_states=True)
+                        capture = self._capture_sensor_observations(session)
+                        depth_views.append(capture["depth_sensor"])
+                finally:
+                    agent.set_state(saved_state, infer_sensor_states=True)
+
             sequence = session.cartographer_sequence + 1
             timestamp_s = max(
                 timestamp_for_step(session.step_count, dt_s),
@@ -153,13 +187,41 @@ class HabitatMemorySlamMixin:
                         "min_obstacle_height_m": source_stream.min_obstacle_height_m,
                         "max_obstacle_height_m": source_stream.max_obstacle_height_m,
                     }
-                return converter(
-                    observation["depth_sensor"], sequence=sequence,
-                    timestamp_s=timestamp_s, beam_count=source_stream.beam_count,
-                    range_min_m=source_stream.range_min_m,
-                    range_max_m=source_stream.range_max_m,
-                    hfov_deg=source_stream.hfov_deg, **kwargs,
-                )
+                def _convert_view(depth: Any, beam_count: int) -> Any:
+                    return converter(
+                        depth,
+                        sequence=sequence,
+                        timestamp_s=timestamp_s,
+                        beam_count=beam_count,
+                        range_min_m=source_stream.range_min_m,
+                        range_max_m=source_stream.range_max_m,
+                        hfov_deg=source_stream.hfov_deg,
+                        **kwargs,
+                    )
+
+                scan = _convert_view(depth_views[0], source_stream.beam_count)
+                if len(depth_views) > 1:
+                    scans = [
+                        _convert_view(
+                            depth,
+                            max(2, source_stream.beam_count // 4),
+                        )
+                        for depth in depth_views
+                    ]
+                    # Cartographer X is forward and Y is left. Preserve the
+                    # source angular order: right, front, left, back.
+                    ordered_scans = (scans[1], scans[0], scans[3], scans[2])
+                    scan = dataclasses.replace(
+                        scan,
+                        ranges_m=[
+                            value
+                            for view in ordered_scans
+                            for value in view.ranges_m
+                        ],
+                        hfov_deg=360.0,
+                        camera_hfov_deg=source_stream.hfov_deg,
+                    )
+                return scan
 
             scan = _convert(stream)
             planning_scan = _convert(session.cartographer_occ_stream) if session.cartographer_occ_stream is not None else None
@@ -354,6 +416,8 @@ class HabitatMemorySlamMixin:
             timeout_s = 0.5
         stream.wait_for_rendered_sequence(requested, timeout_s)
         artifact_dir = Path(stream.artifact_dir)
+        map_artifact_dir = artifact_dir
+        prior_static = False
         source = artifact_dir / f"occupancy_step{requested}.png"
         if not source.is_file():
             try:
@@ -370,6 +434,17 @@ class HabitatMemorySlamMixin:
             except (OSError, ValueError, json.JSONDecodeError):
                 pass
         if not source.is_file() or not source.stat().st_size:
+            prior_dir_value = os.environ.get(
+                "HAB_CARTOGRAPHER_PRIOR_VISUAL_ARTIFACT_DIR", ""
+            ).strip()
+            if prior_dir_value:
+                prior_dir = Path(prior_dir_value)
+                candidate = prior_dir / "occupancy_step0.png"
+                if candidate.is_file() and candidate.stat().st_size:
+                    map_artifact_dir = prior_dir
+                    source = candidate
+                    prior_static = True
+        if not source.is_file() or not source.stat().st_size:
             response["2d_slam_map"] = {
                 "available": False,
                 "status": "pending",
@@ -385,13 +460,13 @@ class HabitatMemorySlamMixin:
             status = self._memory_slam_status(session)
         except Exception:
             status = stream.status()
-        memory_nodes = self._memory_nodes_for_map(artifact_dir, source)
+        memory_nodes = self._memory_nodes_for_map(map_artifact_dir, source)
         slam_area_nodes: list[dict[str, Any]] = []
         destination_root = Path(output_dir) if output_dir else artifact_dir
         destination_root.mkdir(parents=True, exist_ok=True)
         destination = destination_root / f"slam_2d_step{session.step_count}_occupancy.png"
         temporary = destination.with_suffix(".tmp.png")
-        segmentation_overlay = artifact_dir / f".agent_segmentation_{snapshot_sequence}.png"
+        segmentation_overlay = destination_root / f".agent_segmentation_{snapshot_sequence}.png"
         segmentation: dict[str, Any] = {"enabled": False, "source": None}
         pose_projected = False
         try:
@@ -404,39 +479,45 @@ class HabitatMemorySlamMixin:
                     segmentation_source, segmentation_overlay
                 )
                 rendered = self._segmentation_display_image(
-                    segmentation_overlay, artifact_dir, source
+                    segmentation_overlay, map_artifact_dir, source
                 )
-                planning_artifact_dir = None
-                if session.cartographer_occ_stream is not None:
-                    candidate = getattr(
-                        session.cartographer_occ_stream, "artifact_dir", None
-                    )
-                    if isinstance(candidate, (str, os.PathLike)):
-                        planning_artifact_dir = Path(candidate)
-                slam_area_nodes, slam_area_payload = self._publish_slam_area_nodes(
-                    artifact_dir=artifact_dir,
-                    source=source,
-                    segmentation_source=segmentation_source,
-                    segmentation_result=segmentation_result,
-                    memory_nodes=memory_nodes,
-                    planning_artifact_dir=planning_artifact_dir,
-                )
-                if session.settings.get("slam_area_caption_enabled") is not False:
-                    slam_area_nodes = enrich_slam_area_nodes_with_captions(
-                        artifact_dir=artifact_dir,
-                        inherited_sources=session.settings.get(
-                            "slam_area_caption_sources", []
-                        ),
+                if prior_static:
+                    # The pair snapshot is immutable.  Its semantic areas were
+                    # finalized during exploration, so read them without
+                    # publishing sidecars back into the snapshot.
+                    slam_area_nodes = self._read_slam_area_nodes(map_artifact_dir)
+                else:
+                    planning_artifact_dir = None
+                    if session.cartographer_occ_stream is not None:
+                        candidate = getattr(
+                            session.cartographer_occ_stream, "artifact_dir", None
+                        )
+                        if isinstance(candidate, (str, os.PathLike)):
+                            planning_artifact_dir = Path(candidate)
+                    slam_area_nodes, slam_area_payload = self._publish_slam_area_nodes(
+                        artifact_dir=map_artifact_dir,
+                        source=source,
                         segmentation_source=segmentation_source,
                         segmentation_result=segmentation_result,
-                        class_grid=class_grid,
-                        area_grid=area_grid,
-                        nodes=slam_area_nodes,
+                        memory_nodes=memory_nodes,
+                        planning_artifact_dir=planning_artifact_dir,
                     )
-                slam_area_payload["nodes"] = slam_area_nodes
-                self._write_slam_area_nodes_sidecar(
-                    artifact_dir, slam_area_payload
-                )
+                    if session.settings.get("slam_area_caption_enabled") is not False:
+                        slam_area_nodes = enrich_slam_area_nodes_with_captions(
+                            artifact_dir=map_artifact_dir,
+                            inherited_sources=session.settings.get(
+                                "slam_area_caption_sources", []
+                            ),
+                            segmentation_source=segmentation_source,
+                            segmentation_result=segmentation_result,
+                            class_grid=class_grid,
+                            area_grid=area_grid,
+                            nodes=slam_area_nodes,
+                        )
+                    slam_area_payload["nodes"] = slam_area_nodes
+                    self._write_slam_area_nodes_sidecar(
+                        map_artifact_dir, slam_area_payload
+                    )
                 segmentation = {
                     "enabled": True,
                     "source": "raw_amcl_pgm",
@@ -447,16 +528,17 @@ class HabitatMemorySlamMixin:
                 with Image.open(source) as image:
                     rendered = image.convert("RGB")
             memory_nodes = self._map_nodes_in_rendered_crop(
-                artifact_dir, source, memory_nodes, "memory"
+                map_artifact_dir, source, memory_nodes, "memory"
             )
             slam_area_nodes = self._map_nodes_in_rendered_crop(
-                artifact_dir, source, slam_area_nodes, "area"
+                map_artifact_dir, source, slam_area_nodes, "area"
             )
-            self._draw_map_labels(rendered, artifact_dir, source, memory_nodes, "memory")
-            self._draw_map_labels(rendered, artifact_dir, source, slam_area_nodes, "area")
-            pose_projected = self._draw_current_pose_marker(
-                rendered, artifact_dir, source, status
-            )
+            self._draw_map_labels(rendered, map_artifact_dir, source, memory_nodes, "memory")
+            self._draw_map_labels(rendered, map_artifact_dir, source, slam_area_nodes, "area")
+            if not prior_static:
+                pose_projected = self._draw_current_pose_marker(
+                    rendered, map_artifact_dir, source, status
+                )
             rendered.resize((256, 256), Image.Resampling.LANCZOS).save(
                 temporary, format="PNG", optimize=True
             )
@@ -487,7 +569,12 @@ class HabitatMemorySlamMixin:
                 "Latest colored SLAM area segmentation with memory-node labels "
                 "and the current odometry-projected pose."
                 if pose_projected
-                else "Latest colored SLAM area segmentation without a verified current pose marker."
+                else (
+                    "Prior-session static colored SLAM area segmentation; relocalization "
+                    "has not yet produced a verified current pose marker."
+                    if prior_static
+                    else "Latest colored SLAM area segmentation without a verified current pose marker."
+                )
             ),
         }
 
@@ -1028,62 +1115,429 @@ class HabitatMemorySlamMixin:
         self, session_id: Optional[str], payload: Mapping[str, Any]
     ) -> Dict[str, Any]:
         session = self._require_session(session_id)
-        goal = payload.get("goal")
-        if not isinstance(goal, Mapping):
-            raise HabitatAdapterError('Field "payload.goal" must be a SLAM pose object')
-        executed: list[dict[str, Any]] = []
-        last_status = "unreachable"
-        for attempt in range(3):
-            status = self._memory_slam_status(session)
-            start = status.get("slam_pose")
-            artifact_dir = status.get("planning_artifact_dir") or status.get("artifact_dir")
-            if not isinstance(start, Mapping) or not isinstance(artifact_dir, str):
-                raise HabitatAdapterError("spatial memory has no current pose or occupancy map")
+        goal_payload = payload.get("goal_slam_pose")
+        if not isinstance(goal_payload, Mapping):
+            raise HabitatAdapterError(
+                'Field "payload.goal_slam_pose" must be an object with x, y, yaw_rad'
+            )
+        try:
+            goal_pose = {
+                "x": float(goal_payload["x"]),
+                "y": float(goal_payload["y"]),
+                "yaw_rad": float(goal_payload.get("yaw_rad", 0.0)),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HabitatAdapterError(
+                'Field "payload.goal_slam_pose" must contain numeric x and y'
+            ) from exc
+        stream = session.cartographer_occ_stream or session.cartographer_stream
+        artifact_dir_value = getattr(stream, "artifact_dir", None)
+        if artifact_dir_value is None:
+            return {
+                "session_id": session.session_id,
+                "ok": False,
+                "status": "slam_unavailable",
+                "error": "navigate_slam_occupancy requires an active Cartographer stream.",
+            }
+        artifact_dir = Path(artifact_dir_value)
+        def coerce_int(value: Any, field_name: str) -> int:
+            if isinstance(value, bool):
+                raise HabitatAdapterError(f'Field "{field_name}" must be int')
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError) as exc:
+                raise HabitatAdapterError(f'Field "{field_name}" must be int') from exc
+            if isinstance(value, float) and not value.is_integer():
+                raise HabitatAdapterError(f'Field "{field_name}" must be int')
+            return parsed
+
+        preview_only = self._coerce_bool(
+            payload.get("preview_only", False), field_name="payload.preview_only"
+        )
+        max_steps = coerce_int(payload.get("max_steps", 40), "payload.max_steps")
+        if max_steps < 1:
+            raise HabitatAdapterError('Field "payload.max_steps" must be >= 1')
+        goal_radius_m = self._coerce_float(
+            payload.get("goal_radius_m", 0.45), field_name="payload.goal_radius_m"
+        )
+        replan_attempts = coerce_int(
+            payload.get("replan_attempts", 2), "payload.replan_attempts"
+        )
+        inflation_radius_m = self._coerce_float(
+            payload.get(
+                "inflation_radius_m",
+                self._env_float("HAB_SLAM_OCC_INFLATION_RADIUS_M", 0.15),
+            ),
+            field_name="payload.inflation_radius_m",
+        )
+        unknown_cost = self._coerce_float(
+            payload.get("unknown_cost", 80.0), field_name="payload.unknown_cost"
+        )
+        allow_unknown = self._coerce_bool(
+            payload.get("allow_unknown", False), field_name="payload.allow_unknown"
+        )
+        heading_tolerance_deg = max(
+            0.0, self._env_float("HAB_SLAM_OCC_HEADING_TOLERANCE_DEG", 2.0)
+        )
+        turn_quantum_deg = max(
+            1e-6, self._env_float("HAB_SLAM_OCC_TURN_QUANTUM_DEG", 10.0)
+        )
+        forward_step_m = max(
+            1e-6, self._env_float("HAB_SLAM_OCC_FORWARD_STEP_M", 0.25)
+        )
+        start_clear_radius_m = max(
+            0.0, self._env_float("HAB_SLAM_OCC_START_CLEAR_RADIUS_M", 0.20)
+        )
+        include_map = self._coerce_bool(
+            payload.get("include_cartographer_map", False),
+            field_name="payload.include_cartographer_map",
+        )
+        output_dir = payload.get("output_dir", "data/nav_artifacts")
+        if not isinstance(output_dir, str) or not output_dir:
+            raise HabitatAdapterError('Field "payload.output_dir" must be a non-empty str')
+        nav_session_dir = Path(self._session_output_dir(output_dir, session.session_id))
+        nav_session_dir.mkdir(parents=True, exist_ok=True)
+        pose_wait_timeout_s = max(
+            0.0,
+            self._env_float(
+                "HAB_SLAM_OCC_PLAN_RENDER_TIMEOUT_S",
+                self._env_float("HAB_CARTOGRAPHER_POSE_WAIT_TIMEOUT_S", 30.0),
+            ),
+        )
+        lag_tolerance = max(
+            0, int(self._env_float("HAB_SLAM_OCC_POSE_SEQUENCE_LAG_TOLERANCE", 1.0))
+        )
+        pose_syncs: list[dict[str, Any]] = []
+
+        def latest_pose() -> dict[str, Any] | None:
+            try:
+                lines = (artifact_dir / "occupancy.png.poses.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            except OSError:
+                return None
+            for line in reversed(lines):
+                try:
+                    pose = json.loads(line)
+                    return {
+                        "sequence": int(pose["sequence"]),
+                        "x": float(pose["x"]),
+                        "y": float(pose["y"]),
+                        "yaw_rad": float(pose["yaw_rad"]),
+                    }
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    continue
+            return None
+
+        def latest_submitted_sequence() -> int | None:
+            sequence = getattr(stream, "_latest_odometry_sequence", None)
+            if isinstance(sequence, int) and not isinstance(sequence, bool):
+                return sequence
+            try:
+                stream_status = stream.status()
+            except Exception:
+                return None
+            sequence = stream_status.get("latest_odometry_sequence")
+            return sequence if isinstance(sequence, int) and not isinstance(sequence, bool) else None
+
+        def pose_after_render(
+            *, min_sequence: int | None, reason: str
+        ) -> dict[str, Any] | None:
+            # One configured timeout covers both the worker render wait and
+            # pose-file catch-up.  Starting a second full deadline after the
+            # render wait can exceed BridgeClient's 60 s request timeout and
+            # turn a useful slam_map_pending result into a transport timeout.
+            deadline = time.monotonic() + pose_wait_timeout_s
+            target = (
+                max(0, min_sequence - lag_tolerance)
+                if isinstance(min_sequence, int) and not isinstance(min_sequence, bool)
+                else None
+            )
+            rendered = None
+            if target is not None and hasattr(stream, "wait_for_rendered_sequence"):
+                try:
+                    rendered = bool(
+                        stream.wait_for_rendered_sequence(
+                            target, max(0.0, deadline - time.monotonic())
+                        )
+                    )
+                except Exception:
+                    rendered = False
+            pose = latest_pose()
+            while (
+                target is not None
+                and (pose is None or int(pose.get("sequence", -1)) < target)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+                pose = latest_pose()
+            pose_syncs.append(
+                {
+                    "reason": reason,
+                    "target_sequence": target,
+                    "submitted_sequence": min_sequence,
+                    "sequence_lag_tolerance": lag_tolerance,
+                    "pose_sequence": int(pose["sequence"]) if pose is not None else None,
+                    "rendered_target_sequence": rendered,
+                    "timeout_s": pose_wait_timeout_s,
+                }
+            )
+            return pose
+
+        def make_plan(start_pose: Mapping[str, Any]):
             slam_map = load_slam_occupancy_map(artifact_dir)
             plan, costmap = plan_slam_occupancy_path(
-                slam_map, start=start, goal=goal, start_clear_radius_m=0.3
+                slam_map,
+                start=start_pose,
+                goal=goal_pose,
+                inflation_radius_m=inflation_radius_m,
+                unknown_cost=unknown_cost,
+                allow_unknown=allow_unknown,
+                start_clear_radius_m=start_clear_radius_m,
             )
-            route = compile_slam_occupancy_route(
-                slam_map, plan, costmap, start_pose=start, goal=goal
-            )
-            last_status = route.status
-            if route.status == "already_reached":
-                break
-            if route.status != "compiled":
-                if attempt == 2:
-                    raise HabitatAdapterError(
-                        f"occupancy navigation failed: {route.failure_reason or route.status}"
-                    )
-                continue
-            for action in route.actions[:64]:
-                result = self._step_action(
-                    session.session_id,
-                    action.payload(),
-                )
-                executed.append({"action": action.action, "collided": result.get("collided", False)})
-                if result.get("collided"):
-                    break
-            if not route.actions or (executed and not executed[-1]["collided"] and len(route.actions) <= 64):
-                last_status = "reached"
-                break
-        panorama: dict[str, Any] = {}
+            return slam_map, plan, costmap
+
+        start_pose = pose_after_render(
+            min_sequence=latest_submitted_sequence(), reason="initial_plan"
+        )
+        if start_pose is None:
+            return {
+                "session_id": session.session_id,
+                "ok": False,
+                "status": "missing_slam_pose",
+                "error": "No current Cartographer pose is available.",
+            }
+        expected_sequence = latest_submitted_sequence()
+        if (
+            expected_sequence is not None
+            and int(start_pose.get("sequence", -1)) + lag_tolerance < expected_sequence
+        ):
+            return {
+                "session_id": session.session_id,
+                "ok": False,
+                "status": "slam_map_pending",
+                "error": "Planning pose has not caught up to the latest Cartographer scan.",
+                "executor": {"pose_syncs": pose_syncs},
+            }
         try:
-            panorama = self._get_panorama(
-                session.session_id,
-                {"output_dir": str(payload.get("output_dir") or "")},
+            slam_map, plan, costmap = make_plan(start_pose)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            return {
+                "session_id": session.session_id,
+                "ok": False,
+                "status": "slam_map_unavailable",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        compiled_route = None
+        if plan.reachable:
+            compiled_route = compile_slam_occupancy_route(
+                slam_map,
+                plan,
+                costmap,
+                start_pose=start_pose,
+                goal=goal_pose,
+                goal_radius_m=goal_radius_m,
+                turn_quantum_deg=turn_quantum_deg,
+                forward_step_m=forward_step_m,
+                heading_tolerance_deg=heading_tolerance_deg,
+                max_actions=4096,
             )
-        except Exception:
-            pass
-        return {
-            **panorama,
-            "session_id": session.session_id,
-            "node_id": payload.get("node_id"),
-            "status": last_status,
-            "attempts": attempt + 1,
-            "actions_executed": len(executed),
-            "actions": executed,
-            "spatial_memory": self._memory_slam_status(session),
+        if preview_only or not plan.reachable:
+            executable = bool(
+                plan.reachable and compiled_route is not None and compiled_route.executable
+            )
+            response: Dict[str, Any] = {
+                "session_id": session.session_id,
+                "ok": executable,
+                "status": (
+                    "preview_ready"
+                    if executable
+                    else ("unexecutable" if plan.reachable else plan.status)
+                ),
+                "backend": "slam_occupancy",
+                "allow_unknown": allow_unknown,
+                "plan": plan.summary(),
+                "executor": (
+                    {**compiled_route.summary(), "pose_syncs": pose_syncs}
+                    if compiled_route is not None
+                    else {
+                        "compile_status": "not_compiled",
+                        "compile_failure_reason": plan.status,
+                        "pose_syncs": pose_syncs,
+                    }
+                ),
+            }
+            if preview_only:
+                preview_path = nav_session_dir / "slam_occupancy_preview.png"
+                try:
+                    render_slam_occupancy_plan_overlay(
+                        slam_map,
+                        preview_path,
+                        plan=plan,
+                        compiled_route=compiled_route,
+                        display_frame=True,
+                    )
+                    response["2d_slam_map"] = {
+                        "available": True,
+                        "status": "preview_ready",
+                        "path": str(preview_path),
+                        "image": str(preview_path),
+                        "step_count": plan.map_sequence,
+                        "description": "Preview of the SLAM occupancy plan and compiled executor trace.",
+                    }
+                except (OSError, ValueError) as exc:
+                    response["2d_slam_map"] = {
+                        "available": False,
+                        "status": "error",
+                        "step_count": plan.map_sequence,
+                        "description": "SLAM occupancy plan preview could not be rendered.",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+            return response
+
+        actions_taken: list[str] = []
+        plans: list[dict[str, Any]] = [plan.summary()]
+        attempts = 0
+        collided = False
+        status = "en_route"
+        response: Dict[str, Any] = {}
+        executed_action_index = -1
+        executor: dict[str, Any] = {
+            "heading_tolerance_deg": heading_tolerance_deg,
+            "turn_quantum_deg": turn_quantum_deg,
+            "forward_step_m": forward_step_m,
+            "start_clear_radius_m": start_clear_radius_m,
+            "pose_syncs": pose_syncs,
         }
+        while len(actions_taken) < max_steps:
+            if compiled_route is None:
+                status = "blocked"
+                break
+            executor.update(compiled_route.summary())
+            if compiled_route.status == "already_reached":
+                status = "reached"
+                break
+            if not compiled_route.executable:
+                status = "blocked"
+                response["error"] = compiled_route.failure_reason
+                break
+            if not compiled_route.actions:
+                status = "en_route"
+                break
+            collision_replan = False
+            for compiled_action in compiled_route.actions:
+                if len(actions_taken) >= max_steps:
+                    status = "en_route"
+                    break
+                step_result = self._step_action(
+                    session.session_id, compiled_action.payload()
+                )
+                actions_taken.append(str(compiled_action.action))
+                executed_action_index += 1
+                response = dict(step_result)
+                collided = bool(step_result.get("collided"))
+                executor.update(
+                    {
+                        "executed_action_index": executed_action_index,
+                        "last_compiled_action": compiled_action.summary(),
+                    }
+                )
+                if collided:
+                    attempts += 1
+                    collision_replan = True
+                    break
+            if not collision_replan:
+                if len(actions_taken) >= max_steps:
+                    status = "en_route"
+                    break
+                expected_sequence = latest_submitted_sequence()
+                current_pose = pose_after_render(
+                    min_sequence=expected_sequence, reason="final_status"
+                )
+                if current_pose is None:
+                    status = "missing_slam_pose"
+                    break
+                if (
+                    expected_sequence is not None
+                    and int(current_pose.get("sequence", -1)) + lag_tolerance
+                    < expected_sequence
+                ):
+                    status = "slam_map_pending"
+                    response["error"] = "Planning pose has not caught up after route execution."
+                    break
+                distance = math.hypot(
+                    float(current_pose["x"]) - goal_pose["x"],
+                    float(current_pose["y"]) - goal_pose["y"],
+                )
+                status = "reached" if distance <= goal_radius_m else "en_route"
+                break
+            if attempts > max(0, replan_attempts):
+                status = "blocked"
+                break
+            expected_sequence = latest_submitted_sequence()
+            current_pose = pose_after_render(
+                min_sequence=expected_sequence, reason="collision_replan"
+            )
+            if current_pose is None:
+                status = "missing_slam_pose"
+                break
+            if (
+                expected_sequence is not None
+                and int(current_pose.get("sequence", -1)) + lag_tolerance
+                < expected_sequence
+            ):
+                status = "slam_map_pending"
+                response["error"] = (
+                    "Planning pose has not caught up after collision; refusing to replan "
+                    "from a stale pose."
+                )
+                break
+            try:
+                slam_map, plan, costmap = make_plan(current_pose)
+            except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                status = "slam_map_unavailable"
+                response["error"] = f"{type(exc).__name__}: {exc}"
+                break
+            plans.append(plan.summary())
+            if not plan.reachable:
+                status = plan.status
+                break
+            compiled_route = compile_slam_occupancy_route(
+                slam_map,
+                plan,
+                costmap,
+                start_pose=current_pose,
+                goal=goal_pose,
+                goal_radius_m=goal_radius_m,
+                turn_quantum_deg=turn_quantum_deg,
+                forward_step_m=forward_step_m,
+                heading_tolerance_deg=heading_tolerance_deg,
+                max_actions=4096,
+            )
+            collided = False
+
+        response.update(
+            {
+                "session_id": session.session_id,
+                "ok": status in {"reached", "en_route"},
+                "status": status,
+                "nav_status": status,
+                "backend": "slam_occupancy",
+                "allow_unknown": allow_unknown,
+                "actions_taken": actions_taken,
+                "steps_executed": len(actions_taken),
+                "replans_attempted": attempts,
+                "plans": plans,
+                "collided": collided,
+                "step_count": session.step_count,
+                "executor": executor,
+            }
+        )
+        if include_map:
+            self._attach_memory_slam_map_context(
+                session, response, str(nav_session_dir)
+            )
+        return response
 
 
 __all__ = ["HabitatMemorySlamMixin"]

@@ -115,6 +115,18 @@ def build_mcp_spec(
     host = str(bridge.get("host", "127.0.0.1"))
     no_proxy = ",".join(dict.fromkeys([host, "127.0.0.1", "localhost", "::1"]))
     env = process_environment(config)
+    # Keep MCP-side trajectory and image writers on the same externally
+    # selected artifact root as the per-episode bridge.  The MCP environment
+    # is intentionally allowlisted, so these documented output variables must
+    # be forwarded explicitly instead of relying on ambient inheritance.
+    for key in (
+        "NAV_VISUAL_OUTPUT_DIR",
+        "HAB_VISUAL_OUTPUT_DIR",
+        "NAV_ARTIFACTS_DIR",
+    ):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
     env.update({
         "NAV_BRIDGE_HOST": host,
         "NAV_BRIDGE_PORT": str(bridge.get("port", 18911)),

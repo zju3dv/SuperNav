@@ -16,6 +16,7 @@ criteria. Neither command implements the public GS contract.
 
 ## 1. Install and download
 
+Download the original scene data from [InteriorGS](https://huggingface.co/datasets/spatialverse/InteriorGS).
 Complete the [Habitat-GS setup](habitat.md) and [agent configuration](configuration.md).
 Install this updated SuperNav version in both agent and simulator environments:
 the primitive-action recorder runs in the simulator process. From the checkout:

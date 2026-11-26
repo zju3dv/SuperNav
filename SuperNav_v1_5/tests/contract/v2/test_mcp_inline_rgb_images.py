@@ -71,7 +71,9 @@ def mcp_module(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     mod._bridge.session_id = "s1"
     calls: list[tuple[str, Any]] = []
 
-    def fake_call(action: str, payload: Any = None) -> dict[str, Any]:
+    def fake_call(
+        action: str, payload: Any = None, **kwargs: Any
+    ) -> dict[str, Any]:
         calls.append((action, payload))
         return {"loop_id": "fake_loop", "pid": 1, "status": "started"}
 
@@ -284,7 +286,9 @@ def test_mcp_oracle_local_navigate_keeps_movement_frames_for_replay(
     colors = _make_panorama_images(tmp_path)
     calls: list[tuple[str, Any]] = []
 
-    def fake_call(action: str, payload: Any = None) -> dict[str, Any]:
+    def fake_call(
+        action: str, payload: Any = None, **kwargs: Any
+    ) -> dict[str, Any]:
         calls.append((action, payload))
         if action == "navigate_oracle_local":
             assert payload["output_dir"] == str(tmp_path)
@@ -352,7 +356,9 @@ def test_mcp_visual_point_preview_does_not_capture_panorama(
     _tiny_png(overlay, marker=b"OVERLAY")
     calls: list[tuple[str, Any]] = []
 
-    def fake_call(action: str, payload: Any = None) -> dict[str, Any]:
+    def fake_call(
+        action: str, payload: Any = None, **kwargs: Any
+    ) -> dict[str, Any]:
         calls.append((action, payload))
         assert action == "navigate_visual_point"
         return {
@@ -1176,6 +1182,8 @@ def test_mcp_init_scene_returns_initial_surround_paths_and_inline_images(
     tmp_path: Path,
 ) -> None:
     colors = _make_panorama_images(tmp_path)
+    slam_map = tmp_path / "initial_annotated_occupancy.png"
+    _tiny_png(slam_map, marker=b"MAP")
     calls: list[tuple[str, Any]] = []
 
     def fake_call(action: str, payload: Any = None) -> dict[str, Any]:
@@ -1185,6 +1193,11 @@ def test_mcp_init_scene_returns_initial_surround_paths_and_inline_images(
                 "session_id": "s-init",
                 "is_gaussian": True,
                 "scene": payload["scene"],
+                "2d_slam_map": {
+                    "available": True,
+                    "status": "static",
+                    "path": str(slam_map),
+                },
             }
         assert action == "get_panorama"
         return {
@@ -1218,11 +1231,124 @@ def test_mcp_init_scene_returns_initial_surround_paths_and_inline_images(
         str(colors[direction]) for direction in ("front", "right", "back", "left")
     ]
     assert [action for action, _ in calls] == ["init_scene", "get_panorama"]
-    assert len(images) == 4
+    assert calls[0][1]["output_dir"] == str(tmp_path)
+    assert len(images) == 5
     assert [img.data for img in images] == [
         base64.b64encode(colors[direction].read_bytes()).decode("ascii")
         for direction in ("front", "right", "back", "left")
+    ] + [base64.b64encode(slam_map.read_bytes()).decode("ascii")]
+
+
+def test_memory_node_occ_preview_then_execute_returns_top_level_views_and_map(
+    mcp_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    memory = tmp_path / "memory_nodes.json"
+    memory.write_text(
+        json.dumps(
+            {
+                "version": 7,
+                "next_order_id": 2,
+                "nodes": {
+                    "area-1": {
+                        "id": "area-1",
+                        "order_id": 1,
+                        "kind": "area",
+                        "name": "kitchen",
+                        "description": "target",
+                        "records": [],
+                        "pano_images": {},
+                        "slam_pose": {
+                            "sequence": 1,
+                            "x": 1.0,
+                            "y": 2.0,
+                            "yaw_rad": 0.0,
+                        },
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("SUPERNAV_MEMORY_NODES_PATH", str(memory))
+    colors = _make_panorama_images(tmp_path)
+    slam_map = tmp_path / "annotated_occupancy.png"
+    _tiny_png(slam_map, marker=b"MAP")
+    calls: list[tuple[str, Any]] = []
+
+    def fake_call(
+        action: str, payload: Any = None, **kwargs: Any
+    ) -> dict[str, Any]:
+        calls.append((action, payload))
+        if action == "navigate_slam_occupancy":
+            if payload["preview_only"]:
+                return {
+                    "session_id": "s1",
+                    "ok": True,
+                    "status": "preview_ready",
+                    "plan": {"reachable": True},
+                    "2d_slam_map": {
+                        "available": True,
+                        "status": "preview_ready",
+                        "path": str(slam_map),
+                    },
+                }
+            return {
+                "session_id": "s1",
+                "ok": True,
+                "status": "reached",
+                "2d_slam_map": {
+                    "available": True,
+                    "status": "current",
+                    "path": str(slam_map),
+                },
+            }
+        if action == "get_panorama":
+            return {
+                "images": [
+                    {"path": str(colors[direction]), "direction": direction}
+                    for direction in ("front", "right", "back", "left")
+                ]
+            }
+        raise AssertionError(action)
+
+    monkeypatch.setattr(mcp_module._bridge, "call", fake_call)
+    preview_content = _converted_tool_content(
+        mcp_module,
+        "hab_navigate_to_memory_node_occ",
+        {"node_id": "area-1"},
+    )
+    preview = _text_payload(preview_content)
+    assert preview["status"] == "preview_ready"
+    assert len(_image_blocks(preview_content)) == 1
+    assert [action for action, _ in calls] == ["navigate_slam_occupancy"]
+
+    execute_content = _converted_tool_content(
+        mcp_module,
+        "hab_navigate_to_memory_node_occ",
+        {
+            "node_id": "area-1",
+            "confirm_token": preview["confirm_token"],
+        },
+    )
+    execute = _text_payload(execute_content)
+    assert execute["status"] == "reached"
+    assert [item["direction"] for item in execute["panorama_images"]] == [
+        "front",
+        "right",
+        "back",
+        "left",
     ]
+    # This specifically rejects the observed nested-CallToolResult failure:
+    # all four views and the annotated occupancy map are MCP image blocks.
+    assert len(_image_blocks(execute_content)) == 5
+    execute_payload = next(
+        payload
+        for action, payload in calls
+        if action == "navigate_slam_occupancy" and not payload["preview_only"]
+    )
+    assert execute_payload["goal_slam_pose"]["x"] == 1.0
+    assert execute_payload["include_cartographer_map"] is True
 
 
 def test_mcp_init_scene_surround_failure_does_not_fail_init(

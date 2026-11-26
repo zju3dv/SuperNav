@@ -259,12 +259,25 @@ supernav stack run-paired \
 1. **Exploration** starts at `spawn` and writes memory nodes plus visual and
    planning Cartographer state.
 2. The runner creates an immutable, hash-audited snapshot containing
-   `memory_nodes.json`, both `.pbstream` files, and available caption evidence.
+   `memory_nodes.json`, both `.pbstream` files, the final visual occupancy
+   raster with its AMCL/render/node sidecars, and available caption evidence.
 3. **Retrieval** starts at the row's optional `retrieval_spawn` (falling back to
    `spawn`), receives a separate writable copy of the memory nodes, and loads
    both frozen maps in `delayed_fpfh_relocalization` mode. Agent calls to
    `hab_report_memory_pos` provide node priors to the source-faithful
    relocalizer while background accumulated-scan matching remains active.
+
+Before retrieval has a verified localized pose, map-bearing tool responses show
+the immutable prior-session map with `2d_slam_map.status="static"` and no pose
+marker. After relocalization and a synchronized render, they switch to the
+current map and pose marker. `hab_navigate_to_memory_node_occ` first returns a
+map-only route preview and confirmation token; execution then returns the
+latest front/right/back/left RGB views plus the final annotated occupancy map.
+On collision, the executor does not assume the requested forward primitive was
+completed. Habitat may still apply a partial sliding displacement when sliding
+is enabled, so the executor waits for the actual post-collision Cartographer
+pose before replanning and returns `blocked` when its configured replan budget
+is exhausted.
 
 The instruction, policy templates, model, arm, and native Skill snapshot are
 shared by the two sessions; only the benchmark-owned start pose and persisted

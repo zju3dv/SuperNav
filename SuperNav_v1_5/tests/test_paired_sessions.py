@@ -91,6 +91,14 @@ def test_pair_snapshots_dual_slam_and_uses_writable_retrieval_copy(
                     f"{stream}-state".encode()
                 )
             visual = root / "visual"
+            (visual / "occupancy_step1.png").write_bytes(b"rendered-map")
+            (visual / "occupancy_step1.amcl.pgm").write_bytes(b"P5\n1 1\n255\n\xff")
+            (visual / "occupancy_step1.png.nodes.json").write_text(
+                '{"sequence":1,"nodes":[]}'
+            )
+            (visual / "occupancy_step1.png.render.json").write_text(
+                '{"resolution":0.05}'
+            )
             (visual / "slam_area_keyframes.jsonl").write_text(
                 '{"keyframe_id":"k1"}\n'
             )
@@ -112,6 +120,13 @@ def test_pair_snapshots_dual_slam_and_uses_writable_retrieval_copy(
             assert Path(
                 environment["HAB_CARTOGRAPHER_PLANNING_LOAD_STATE"]
             ).is_file()
+            prior_static = Path(
+                environment["HAB_CARTOGRAPHER_PRIOR_VISUAL_ARTIFACT_DIR"]
+            )
+            assert (prior_static / "occupancy_step0.png").read_bytes() == b"rendered-map"
+            assert (prior_static / "occupancy_step0.amcl.pgm").is_file()
+            assert (prior_static / "occupancy_step0.png.nodes.json").is_file()
+            assert (prior_static / "occupancy_step0.png.render.json").is_file()
             assert runtime_overrides.init_defaults[
                 "_slam_area_caption_sources"
             ][0]["evidence_origin"] == "exploration"

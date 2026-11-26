@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import shlex
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,7 +44,10 @@ from supernav.experiments.config import load_experiment_config
 from supernav.methods.navigation.graph_memory import GraphMemoryStore
 from supernav.methods.navigation.prompts import build_prompt, global_task_agent_policy
 from supernav.methods.navigation.tools.base import ToolContext, ToolRegistry
-from supernav.methods.navigation.tools.graph_memory import ReportMemoryPosTool
+from supernav.methods.navigation.tools.graph_memory import (
+    NavigateMemoryNodeOccTool,
+    ReportMemoryPosTool,
+)
 from supernav.methods.navigation.tools.graph_memory import _store as memory_node_store
 from supernav.methods.navigation.tools.session import InitSceneTool
 from supernav.runtime.config import merged_arm
@@ -122,6 +126,145 @@ def test_graph_memory_registry_exports_only_occupancy_navigation() -> None:
     assert "navigate_to_memory_node" not in names
 
 
+def test_occupancy_navigation_accepts_latest_slam_area_node(tmp_path: Path) -> None:
+    class Bridge:
+        session_id = "session-a"
+
+        def __init__(self) -> None:
+            self.navigation_payload = None
+
+        def call(self, method, payload):
+            if method == "get_memory_slam_status":
+                return {
+                    "slam_areas": [
+                        {
+                            "id": "slam_area_4",
+                            "kind": "slam_area",
+                            "slam_pose": {
+                                "sequence": 12,
+                                "x": 1.5,
+                                "y": -2.0,
+                                "yaw_rad": 0.0,
+                            },
+                        }
+                    ]
+                }
+            if method == "navigate_slam_occupancy":
+                self.navigation_payload = payload
+                return {
+                    "ok": True,
+                    "status": "preview_ready",
+                    "plan": {"reachable": True},
+                }
+            raise AssertionError(method)
+
+    bridge = Bridge()
+    context = ToolContext(
+        bridge=bridge,
+        session_id="session-a",
+        output_dir=str(tmp_path),
+        nav_mode="navmesh",
+        task_type="chat",
+    )
+    result = NavigateMemoryNodeOccTool().execute(
+        {"node_id": "slam_area_4"}, context
+    )
+
+    assert result.ok is True
+    assert result.body["node_id"] == "slam_area_4"
+    assert result.body["status"] == "preview_ready"
+    assert bridge.navigation_payload["goal_slam_pose"] == {
+        "sequence": 12,
+        "x": 1.5,
+        "y": -2.0,
+        "yaw_rad": 0.0,
+    }
+    assert bridge.navigation_payload["preview_only"] is True
+
+
+def test_memory_slam_surround_scan_matches_source_capture_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class AgentState:
+        position = None
+        rotation = None
+
+    monkeypatch.setitem(sys.modules, "habitat_sim", SimpleNamespace(AgentState=AgentState))
+    monkeypatch.setenv("HAB_CARTOGRAPHER_SURROUND_SCAN", "1")
+
+    saved_state = SimpleNamespace(position=[0.0, 1.2, 0.0], rotation=[0, 0, 0, 1])
+
+    class Agent:
+        def __init__(self) -> None:
+            self.state = saved_state
+            self.set_states = []
+
+        def get_state(self):
+            return self.state
+
+        def set_state(self, state, infer_sensor_states=False):
+            assert infer_sensor_states is True
+            self.state = state
+            self.set_states.append(state)
+
+    class Stream:
+        beam_count = 8
+        range_min_m = 0.15
+        range_max_m = 8.0
+        hfov_deg = 90.0
+        sensor_height_m = 1.2
+        project_row_start_fraction = 0.5
+        project_pixel_stride = 2
+        min_obstacle_height_m = 0.15
+        max_obstacle_height_m = 1.25
+        scan_source = "center_band"
+        use_odometry = False
+
+        def __init__(self) -> None:
+            self.scans = []
+
+        def submit(self, scan):
+            self.scans.append(scan)
+
+    agent = Agent()
+    stream = Stream()
+    session = SimpleNamespace(
+        session_id="session-a",
+        simulator=SimpleNamespace(get_agent=lambda _agent_id: agent),
+        agent_id=0,
+        cartographer_stream=stream,
+        cartographer_occ_stream=None,
+        cartographer_sequence=0,
+        cartographer_last_timestamp_s=None,
+        step_count=1,
+        slam_area_caption_worker=None,
+    )
+
+    class Runtime(HabitatMemorySlamMixin):
+        _logger = SimpleNamespace(warning=lambda *args, **kwargs: None)
+
+        @staticmethod
+        def _current_rotation(_session):
+            return [1.0, 0.0, 0.0, 0.0]
+
+        def _capture_sensor_observations(self, _session):
+            value = float(len(agent.set_states) + 1)
+            return {"depth_sensor": np.full((4, 4), value, dtype=np.float32)}
+
+    Runtime()._submit_memory_slam_scan(
+        session,
+        {"depth_sensor": np.ones((4, 4), dtype=np.float32)},
+        1.0 / 60.0,
+    )
+
+    assert len(stream.scans) == 1
+    assert stream.scans[0].hfov_deg == 360.0
+    assert stream.scans[0].camera_hfov_deg == 90.0
+    assert len(stream.scans[0].ranges_m) == 8
+    assert agent.state is saved_state
+    assert len(agent.set_states) == 4
+
+
 def test_spatial_memory_recipe_uses_release_terms_and_explicit_gpu() -> None:
     root = Path(__file__).resolve().parents[2]
     config = load_experiment_config(
@@ -134,6 +277,12 @@ def test_spatial_memory_recipe_uses_release_terms_and_explicit_gpu() -> None:
         "supernav-1.5-structured-spatial-memory"
     )
     assert environment["HAB_GPU_DEVICE_ID"] == "0"
+    assert environment["HAB_CARTOGRAPHER_SURROUND_SCAN"] == "1"
+    assert environment["HAB_CARTOGRAPHER_BEAMS"] == "720"
+    assert environment["HAB_CARTOGRAPHER_OCC_BEAMS"] == "720"
+    assert environment["HAB_SENSOR_WIDTH"] == "640"
+    assert environment["HAB_SENSOR_HEIGHT"] == "480"
+    assert environment["HAB_SENSOR_HFOV"] == "70"
     assert environment["HAB_STRUCTURED_SPATIAL_MEMORY_ENABLED"] == "1"
     assert environment["HAB_MCP_SPATIAL_MEMORY"] == "0"
     assert "hab_apply_memory_node_mutations" in arm["tool_whitelist"]
@@ -278,6 +427,221 @@ def test_map_labels_skip_slam_poses_outside_rendered_crop(tmp_path: Path) -> Non
         "memory",
     )
     assert [node["order_id"] for node in visible] == [1]
+
+
+def test_retrieval_attaches_immutable_prior_static_map_before_relocalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prior = tmp_path / "snapshot" / "visual_static"
+    current = tmp_path / "retrieval" / "visual"
+    output = tmp_path / "agent"
+    prior.mkdir(parents=True)
+    current.mkdir(parents=True)
+    source = prior / "occupancy_step0.png"
+    Image.new("RGB", (100, 100), "white").save(source)
+    Image.fromarray(np.full((10, 10), 254, dtype=np.uint8)).save(
+        prior / "occupancy_step0.amcl.pgm"
+    )
+    (prior / "occupancy_step0.png.nodes.json").write_text(
+        '{"sequence":0,"nodes":[]}'
+    )
+    (prior / "occupancy_step0.png.render.json").write_text(
+        json.dumps(
+            {
+                "resolution": 0.05,
+                "mosaic_origin_x": 0,
+                "mosaic_origin_y": 9,
+                "source_width": 10,
+                "source_height": 10,
+                "display_width": 10,
+                "display_height": 10,
+                "left_padding": 0,
+                "top_padding": 0,
+                "scale": 10.0,
+                "offset_x": 0,
+                "offset_y": 0,
+                "output_size": 100,
+            }
+        )
+    )
+    (prior / "slam_area_nodes.json").write_text('{"nodes":[]}')
+    before = {path.name: path.read_bytes() for path in prior.iterdir()}
+    monkeypatch.setenv("HAB_CARTOGRAPHER_PRIOR_VISUAL_ARTIFACT_DIR", str(prior))
+
+    stream = SimpleNamespace(
+        artifact_dir=current,
+        _latest_odometry_sequence=1,
+        wait_for_rendered_sequence=lambda sequence, timeout: False,
+        status=lambda: {},
+    )
+    session = SimpleNamespace(
+        settings={
+            "cartographer_return_occupancy_image": True,
+            "slam_area_caption_enabled": False,
+        },
+        cartographer_stream=stream,
+        cartographer_occ_stream=None,
+        cartographer_sequence=1,
+        step_count=1,
+    )
+
+    class Runtime(HabitatMemorySlamMixin):
+        @staticmethod
+        def _memory_slam_status(_session):
+            return {"latest_odometry": None}
+
+    response: dict[str, object] = {}
+    Runtime()._attach_memory_slam_map_context(session, response, str(output))
+
+    slam_map = response["2d_slam_map"]
+    assert isinstance(slam_map, dict)
+    assert slam_map["available"] is True
+    assert slam_map["status"] == "static"
+    assert Path(str(slam_map["path"])).is_file()
+    assert "Prior-session static" in str(slam_map["description"])
+    assert {path.name: path.read_bytes() for path in prior.iterdir()} == before
+
+
+def test_occupancy_collision_replans_only_after_fresh_pose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import supernav.backends.habitat.memory_slam.runtime as runtime_module
+
+    artifact_dir = tmp_path / "planning"
+    artifact_dir.mkdir()
+    poses = artifact_dir / "occupancy.png.poses.jsonl"
+    poses.write_text(
+        json.dumps({"sequence": 1, "x": 0.0, "y": 0.0, "yaw_rad": 0.0})
+        + "\n"
+    )
+
+    class Stream:
+        def __init__(self) -> None:
+            self.artifact_dir = artifact_dir
+            self._latest_odometry_sequence = 1
+
+        @staticmethod
+        def wait_for_rendered_sequence(sequence, timeout):
+            return True
+
+        def status(self):
+            return {"latest_odometry_sequence": self._latest_odometry_sequence}
+
+    stream = Stream()
+    session = SimpleNamespace(
+        session_id="session-a",
+        cartographer_occ_stream=stream,
+        cartographer_stream=stream,
+        step_count=1,
+    )
+    planned_from: list[int] = []
+
+    class Plan:
+        reachable = True
+        status = "planned"
+        map_sequence = 1
+
+        def summary(self):
+            return {"reachable": True}
+
+    class Action:
+        action = "move_forward"
+
+        @staticmethod
+        def payload():
+            return {"action": "move_forward"}
+
+        @staticmethod
+        def summary():
+            return {"action": "move_forward"}
+
+    class Route:
+        status = "compiled"
+        executable = True
+        failure_reason = None
+        actions = [Action()]
+
+        @staticmethod
+        def summary():
+            return {"compile_status": "compiled"}
+
+    def fake_plan(_slam_map, *, start, **kwargs):
+        del kwargs
+        planned_from.append(int(start["sequence"]))
+        return Plan(), object()
+
+    monkeypatch.setattr(runtime_module, "load_slam_occupancy_map", lambda path: object())
+    monkeypatch.setattr(runtime_module, "plan_slam_occupancy_path", fake_plan)
+    monkeypatch.setattr(
+        runtime_module,
+        "compile_slam_occupancy_route",
+        lambda *args, **kwargs: Route(),
+    )
+
+    class Runtime(HabitatMemorySlamMixin):
+        @staticmethod
+        def _coerce_bool(value, field_name):
+            del field_name
+            return bool(value)
+
+        @staticmethod
+        def _coerce_float(value, field_name):
+            del field_name
+            return float(value)
+
+        @staticmethod
+        def _env_float(name, default):
+            del name
+            return float(default)
+
+        @staticmethod
+        def _session_output_dir(output_dir, session_id):
+            return str(Path(output_dir) / session_id)
+
+        @staticmethod
+        def _require_session(session_id):
+            assert session_id == "session-a"
+            return session
+
+        @staticmethod
+        def _step_action(session_id, payload):
+            assert session_id == "session-a"
+            assert payload["action"] == "move_forward"
+            # Exercise the no-displacement collision case. With Habitat
+            # sliding enabled, another valid case is partial displacement; the
+            # executor must use the fresh pose in either case.
+            stream._latest_odometry_sequence += 1
+            session.step_count += 1
+            with poses.open("a") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "sequence": stream._latest_odometry_sequence,
+                            "x": 0.0,
+                            "y": 0.0,
+                            "yaw_rad": 0.0,
+                        }
+                    )
+                    + "\n"
+                )
+            return {"collided": True}
+
+    result = Runtime()._navigate_slam_occupancy(
+        "session-a",
+        {
+            "goal_slam_pose": {"x": 3.0, "y": 0.0, "yaw_rad": 0.0},
+            "replan_attempts": 1,
+            "max_steps": 10,
+            "output_dir": str(tmp_path / "agent"),
+        },
+    )
+
+    assert result["status"] == "blocked"
+    assert result["replans_attempted"] == 2
+    assert result["actions_taken"] == ["move_forward", "move_forward"]
+    # The second plan is synchronized to the post-collision scan (sequence 2),
+    # not recomputed immediately from the stale sequence-1 pose.
+    assert planned_from == [1, 2]
 
 
 def test_memory_slam_status_uses_scan_matched_pose_not_odometry(

@@ -90,6 +90,19 @@ def test_canonical_geometry_recipe_binds_task_profile_without_manual_flag(tmp_pa
     assert "Call hab_init_scene exactly once" in global_task_agent_policy(config, arm_cfg=arm)
 
 
+def test_mcp_spec_forwards_external_artifact_roots(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    arm = merged_arm(config, "visual_point_skill")
+    external = tmp_path / "external-artifacts"
+    monkeypatch.setenv("NAV_ARTIFACTS_DIR", str(external))
+    monkeypatch.setenv("NAV_VISUAL_OUTPUT_DIR", str(external))
+
+    spec = build_mcp_spec(workspace_root=ROOT, config=config, arm_cfg=arm)
+
+    assert spec.environment["NAV_ARTIFACTS_DIR"] == str(external)
+    assert spec.environment["NAV_VISUAL_OUTPUT_DIR"] == str(external)
+
+
 def test_manifest_scene_expands_environment_variable(tmp_path, monkeypatch):
     scene_root = tmp_path / "hm3d"
     monkeypatch.setenv("TEST_HM3D_ROOT", str(scene_root))

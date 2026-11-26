@@ -146,7 +146,10 @@ class InitSceneTool:
     )
 
     def execute(self, args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
-        payload: Dict[str, Any] = {}
+        # The bridge uses this path when attaching the initial SLAM map.  It
+        # must be inside the MCP artifact root or the image transport correctly
+        # refuses to inline it as an out-of-scope file.
+        payload: Dict[str, Any] = {"output_dir": ctx.output_dir}
 
         scene = args.get("scene") or os.environ.get("HAB_DEFAULT_SCENE")
         if not scene:

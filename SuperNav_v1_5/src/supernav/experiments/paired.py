@@ -301,6 +301,45 @@ def _create_snapshot(
         _artifact(path, role=role, root=snapshot_dir)
         for role, path in destinations.items()
     ]
+    # A pbstream is sufficient for Cartographer to localize eventually, but it
+    # is not an agent-visible map.  Preserve the last immutable visual render
+    # and all coordinate sidecars so retrieval can show the exploration map
+    # before its first localized pose is available.
+    visual_dir = visual.parent
+    rendered = sorted(
+        visual_dir.glob("occupancy_step*.png"),
+        key=lambda path: int(path.stem.removeprefix("occupancy_step")),
+    )
+    if not rendered:
+        raise RuntimeError(
+            f"exploration did not produce a rendered visual occupancy map: {visual_dir}"
+        )
+    latest = rendered[-1]
+    static_dir = snapshot_dir / "visual_static"
+    static_dir.mkdir()
+    static_sources = {
+        latest: static_dir / "occupancy_step0.png",
+        latest.with_suffix(".amcl.pgm"): static_dir / "occupancy_step0.amcl.pgm",
+        visual_dir / f"{latest.name}.nodes.json": static_dir / "occupancy_step0.png.nodes.json",
+        visual_dir / f"{latest.name}.render.json": static_dir / "occupancy_step0.png.render.json",
+    }
+    for optional_name in ("slam_area_nodes.json", "metadata.json"):
+        optional = visual_dir / optional_name
+        if optional.is_file():
+            static_sources[optional] = static_dir / optional_name
+    for source, destination in static_sources.items():
+        if not source.is_file() or source.stat().st_size <= 0:
+            raise RuntimeError(
+                f"exploration visual map bundle is incomplete: {source}"
+            )
+        _atomic_copy(source, destination)
+        artifacts.append(
+            _artifact(
+                destination,
+                role=f"cartographer_visual_static:{destination.name}",
+                root=snapshot_dir,
+            )
+        )
     caption_sources, caption_manifest, caption_artifacts = _snapshot_caption_evidence(
         source_dir=visual.parent,
         snapshot_dir=snapshot_dir,
@@ -430,7 +469,16 @@ def _run_pair(
         caption_sources = []
         exploration = None
 
-    _atomic_json(pair_path, {**common, "status": "planned"})
+    planned: dict[str, Any] = {**common, "status": "planned"}
+    # Keep the validated exploration record durable while a resumed retrieval
+    # is being prepared.  Otherwise an unrelated stashing/startup failure can
+    # overwrite pair.json with a state that can no longer be resumed even
+    # though the immutable snapshot is still valid.
+    if isinstance(exploration, Mapping):
+        planned["exploration"] = dict(exploration)
+    if isinstance(snapshot_manifest, Mapping):
+        planned["snapshot"] = dict(snapshot_manifest)
+    _atomic_json(pair_path, planned)
     relationship_common = {
         "type": "paired_session_snapshot",
         "pair_id": pair_id,
@@ -569,6 +617,9 @@ def _run_pair(
                     ),
                     "HAB_CARTOGRAPHER_PLANNING_LOAD_STATE": str(
                         snapshot_dir / "cartographer_planning.pbstream"
+                    ),
+                    "HAB_CARTOGRAPHER_PRIOR_VISUAL_ARTIFACT_DIR": str(
+                        snapshot_dir / "visual_static"
                     ),
                     "HAB_CARTOGRAPHER_LOCALIZATION_MODE": (
                         "delayed_fpfh_relocalization"

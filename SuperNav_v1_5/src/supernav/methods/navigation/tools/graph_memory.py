@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
 from typing import Any, Dict
@@ -15,6 +17,9 @@ from supernav.methods.navigation.tools.base import (
     ToolRegistry,
     ToolResult,
 )
+
+
+_memory_node_occ_nav_previews: dict[str, dict[str, Any]] = {}
 
 
 def _store(ctx: ToolContext) -> GraphMemoryStore:
@@ -38,6 +43,25 @@ def _current_slam_pose(ctx: ToolContext) -> dict[str, Any] | None:
         return None
     pose = result.get("slam_pose") if isinstance(result, dict) else None
     return pose if isinstance(pose, dict) else None
+
+
+def _slam_area_node(ctx: ToolContext, node_id: str) -> dict[str, Any] | None:
+    """Resolve an ephemeral A<N> target from the latest rendered SLAM map."""
+    try:
+        result = ctx.bridge.call("get_memory_slam_status", {})
+    except Exception:
+        return None
+    nodes = result.get("slam_areas") if isinstance(result, dict) else None
+    if not isinstance(nodes, list):
+        return None
+    return next(
+        (
+            dict(node)
+            for node in nodes
+            if isinstance(node, dict) and node.get("id") == node_id
+        ),
+        None,
+    )
 
 
 def _refresh_memory_nodes(ctx: ToolContext, store: GraphMemoryStore) -> None:
@@ -204,24 +228,139 @@ class NavigateMemoryNodeOccTool:
     metadata = ToolMetadata(
         name="navigate_to_memory_node_occ", category=ToolCategory.NAVIGATION,
         description="Navigate to a memory node using only its SLAM pose and the occupancy map.",
-        parameters_schema={"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string"},
+                "confirm_token": {"type": "string", "default": ""},
+                "max_steps": {"type": "integer", "default": 80},
+                "goal_radius_m": {"type": "number", "default": 0.45},
+                "replan_attempts": {"type": "integer", "default": 2},
+                "include_images": {"type": "boolean", "default": True},
+            },
+            "required": ["node_id"],
+        },
         permission=PermissionLevel.MUTATING,
     )
     def execute(self, args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
-        node = _store(ctx).inspect_node(args.get("id"), return_images=False)
+        node_id = str(args.get("node_id") or "").strip()
+        if not node_id:
+            raise GraphMemoryError("navigate_to_memory_node_occ requires node_id")
+        try:
+            node = _store(ctx).inspect_node(node_id, return_images=False)
+        except GraphMemoryError:
+            node = _slam_area_node(ctx, node_id)
+            if node is None:
+                raise
         pose = node.get("slam_pose")
         if not isinstance(pose, dict):
-            raise GraphMemoryError(f"node has no SLAM pose: {args.get('id')}")
-        return _ok(
-            ctx.bridge.call(
+            raise GraphMemoryError(f"node has no SLAM pose: {node_id}")
+        confirm_token = str(args.get("confirm_token") or "").strip()
+        if not confirm_token:
+            plan = ctx.bridge.call(
                 "navigate_slam_occupancy",
                 {
-                    "goal": pose,
-                    "node_id": args.get("id"),
+                    "goal_slam_pose": pose,
+                    "preview_only": True,
                     "output_dir": ctx.output_dir,
                 },
             )
+            if plan.get("ok") is False:
+                return _ok(
+                    {
+                        "ok": False,
+                        "status": str(plan.get("status") or "unreachable"),
+                        "node_id": node_id,
+                        "node": {
+                            key: node[key]
+                            for key in ("id", "kind", "name", "description")
+                            if key in node
+                        },
+                        "plan": plan.get("plan", {}),
+                        "2d_slam_map": plan.get("2d_slam_map"),
+                        "error": plan.get("error"),
+                    }
+                )
+            material = json.dumps(
+                {
+                    "session_id": str(ctx.bridge.session_id or ctx.session_id or ""),
+                    "node_id": node_id,
+                    "slam_pose": pose,
+                    "tool_seq": ctx.tool_seq,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            token = hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+            _memory_node_occ_nav_previews[token] = {
+                "session_id": str(ctx.bridge.session_id or ctx.session_id or ""),
+                "node_id": node_id,
+                "slam_pose": dict(pose),
+                "tool_seq": ctx.tool_seq,
+            }
+            return _ok(
+                {
+                    "ok": True,
+                    "status": "preview_ready",
+                    "node_id": node_id,
+                    "node": {
+                        key: node[key]
+                        for key in ("id", "kind", "name", "description")
+                        if key in node
+                    },
+                    "confirm_token": token,
+                    "plan": plan.get("plan", {}),
+                    "2d_slam_map": plan.get("2d_slam_map"),
+                }
+            )
+        preview = _memory_node_occ_nav_previews.get(confirm_token)
+        session_id = str(ctx.bridge.session_id or ctx.session_id or "")
+        if not isinstance(preview, dict) or any(
+            (
+                preview.get("session_id") != session_id,
+                preview.get("node_id") != node_id,
+                preview.get("slam_pose") != dict(pose),
+            )
+        ):
+            return _ok(
+                {
+                    "ok": False,
+                    "status": "invalid_confirm_token",
+                    "node_id": node_id,
+                    "error": "confirm_token does not match the latest occupancy preview for this memory node.",
+                }
+            )
+        _memory_node_occ_nav_previews.pop(confirm_token, None)
+        max_steps = max(1, int(args.get("max_steps", 80)))
+        timeout_s = max(
+            60.0,
+            float(
+                os.environ.get(
+                    "HAB_MCP_MEMORY_NODE_OCC_NAV_TIMEOUT_S",
+                    str(30.0 + 2.0 * max_steps),
+                )
+            ),
         )
+        result = ctx.bridge.call(
+            "navigate_slam_occupancy",
+            {
+                "goal_slam_pose": pose,
+                "preview_only": False,
+                "max_steps": max_steps,
+                "goal_radius_m": float(args.get("goal_radius_m", 0.45)),
+                "replan_attempts": max(0, int(args.get("replan_attempts", 2))),
+                "include_cartographer_map": True,
+                "output_dir": ctx.output_dir,
+            },
+            timeout=timeout_s,
+        )
+        result["node_id"] = node_id
+        result["node"] = {
+            key: node[key]
+            for key in ("id", "kind", "name", "description")
+            if key in node
+        }
+        return _ok(result)
 
 
 for _tool in (

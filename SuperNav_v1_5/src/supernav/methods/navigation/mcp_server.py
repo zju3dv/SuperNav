@@ -855,6 +855,7 @@ _MOTION_TOOLS_WITH_SURROUND_VIEW = frozenset(
         "visual_overlay_navigate",
         "visual_point_navigate",
         "oracle_local_navigate",
+        "navigate_to_memory_node_occ",
     }
 )
 
@@ -1743,7 +1744,10 @@ def _make_typed_wrapper(tool: Tool, mcp_name: str, *, inline_images: bool):
                 step_count=close_step_count,
                 diagnostic=close_reason,
             )
-        if inline_images:
+        if inline_images and not (
+            tool_name == "navigate_to_memory_node_occ"
+            and body.get("status") == "preview_ready"
+        ):
             body = _attach_mcp_surround_view(tool_name, body)
         if tool_name != "close_session":
             # Capture after all tool-owned visual work so the endpoint and

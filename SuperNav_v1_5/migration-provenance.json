@@ -47,6 +47,42 @@
       "deviations": ["SuperNav-1.5 spatial-memory naming", "simulator_evaluator only", "authoritative default", "worker capability probe", "SuperNav protocol names"]
     },
     {
+      "source": "src_python/habitat_sim/habitat_adapter_internal/mixins_navigation.py",
+      "sha256": "35611b89c7293ac9d54048a1488ab69376e5aabb97bdc44bee8dcda09d139a30",
+      "destination": "src/supernav/backends/habitat/memory_slam/runtime.py",
+      "source_symbols": ["_navigate_slam_occupancy"],
+      "destination_symbols": ["HabitatMemorySlamMixin._navigate_slam_occupancy"],
+      "behavioral_invariants": ["render-synchronized initial pose", "render-synchronized collision replan", "bounded primitive execution", "terminal distance check", "preview overlay"],
+      "deviations": ["spatial-memory runtime extraction", "simulator_evaluator only", "timing telemetry omitted"]
+    },
+    {
+      "source": "tools/habitat_agent/interfaces/mcp_server.py",
+      "sha256": "3978be2b807247cfe257c85bff81c545b269fef3c28ae6ca314b19c8ea088a77",
+      "destination": "src/supernav/methods/navigation/tools/graph_memory.py",
+      "source_symbols": ["hab_navigate_to_memory_node_occ", "_execute_memory_node_occ_navigation"],
+      "destination_symbols": ["NavigateMemoryNodeOccTool.execute"],
+      "behavioral_invariants": ["preview-confirm token", "slam_area_<N> targets", "four final RGB views", "annotated occupancy map"],
+      "deviations": ["release tool registry", "memory-node terminology", "GT/NavMesh routing excluded"]
+    },
+    {
+      "source": "tools/habitat_agent/interfaces/mcp_server.py",
+      "sha256": "3978be2b807247cfe257c85bff81c545b269fef3c28ae6ca314b19c8ea088a77",
+      "destination": "src/supernav/methods/navigation/mcp_server.py",
+      "source_symbols": ["hab_navigate_to_memory_node_occ", "_finalize_mcp_response", "_attach_mcp_surround_view"],
+      "destination_symbols": ["_make_typed_wrapper", "_finalize_mcp_response", "_attach_mcp_surround_view"],
+      "behavioral_invariants": ["MCP images are top-level content blocks", "preview returns map only", "execution returns latest four views plus final map"],
+      "deviations": ["dynamic release tool registration"]
+    },
+    {
+      "source": "tools/habitat_agent/interfaces/mcp_server.py",
+      "sha256": "3978be2b807247cfe257c85bff81c545b269fef3c28ae6ca314b19c8ea088a77",
+      "destination": "src/supernav/methods/navigation/tools/session.py",
+      "source_symbols": ["hab_init_scene"],
+      "destination_symbols": ["InitSceneTool.execute"],
+      "behavioral_invariants": ["initial static SLAM map is written inside the MCP artifact allowlist and inlined with four initial RGB views"],
+      "deviations": ["release tool registry"]
+    },
+    {
       "source": "tools/cartographer/worker.cpp",
       "sha256": "8db4b0f3acbe2791baf1f25b0505f0206dc55d2dd42b369c46638542b6affed8",
       "destination": "native/cartographer/worker.cpp",
@@ -69,6 +105,13 @@
       "sha256": "9b8ebb36314b47075fdb06400e725922fcf3223402d7ffce548893c785dac817",
       "destination": "native/cartographer/patches/authoritative_odometry.patch",
       "deviations": []
+    }
+  ],
+  "release_components": [
+    {
+      "path": "src/supernav/experiments/paired.py",
+      "purpose": "immutable paired-session orchestration",
+      "behavioral_invariants": ["pbstream snapshot", "static visual-map bundle snapshot", "writable retrieval memory copy", "snapshot hash verification"]
     }
   ],
   "excluded": [
