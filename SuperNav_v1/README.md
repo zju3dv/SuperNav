@@ -1,0 +1,489 @@
+<div align="center">
+
+<h1>
+  <img src="docs/release/assets/supernav-wordmark.svg" alt="SuperNav" width="460"><br>
+  <sub>An Agentic Navigation System for Any Task in Any Scene</sub>
+</h1>
+
+<p>
+  <a href="https://arxiv.org/abs/2610.12126v1"><img src="https://img.shields.io/badge/arXiv-2610.12126-b31b1b" alt="arXiv: 2610.12126"></a>
+  <a href="https://huggingface.co/papers/2610.12126"><img src="https://img.shields.io/badge/Hugging_Face-Paper-FFD21E?logo=huggingface&amp;logoColor=FFD21E" alt="Hugging Face Paper"></a>
+  <a href="https://zju3dv.github.io/SuperNav/"><img src="https://img.shields.io/badge/Project_Page-SuperNav-orange" alt="Project Page"></a>
+  <a href="docs/release/assets/wechat.png">
+    <img src="https://img.shields.io/badge/微信-WeChat-green?logo=wechat&logoColor=green">
+  </a>
+</p>
+
+<p><strong>English</strong> | <a href="README.zh-CN.md">简体中文</a></p>
+
+<p>
+  <a href="https://the0xka1.cc/">Jinkai Zhang</a><sup>1</sup> ·
+  <a href="https://echo636.github.io/">Jingyi Xu</a><sup>1</sup> ·
+  <a href="https://yuanhongyu.xyz/">Yuanhong Yu</a><sup>1</sup> ·
+  Jiarui Guo<sup>1</sup> ·
+  <a href="https://csse.szu.edu.cn/pages/user/index?id=531">Ruizhen Hu</a><sup>2</sup> ·<br>
+  <a href="https://person.zju.edu.cn/0093140">Hujun Bao</a><sup>1</sup> ·
+  <a href="https://xzhou.me/">Xiaowei Zhou</a><sup>1</sup> ·
+  <a href="https://pengsida.net/">Sida Peng</a><sup>1,3†</sup>
+</p>
+
+<p>
+  <sup>1</sup> Zhejiang University &nbsp;&nbsp; <sup>2</sup> Shenzhen University &nbsp;&nbsp; <sup>3</sup> Causa Robotics<br>
+  <sup>†</sup> Corresponding author
+</p>
+
+<h3>Overview Video</h3>
+
+<video src="https://github.com/user-attachments/assets/d415a2ec-89de-4f6d-a2e5-eeec8993d05d" controls width="800"></video>
+
+<p>
+  <a href="https://zju3dv.github.io/SuperNav/">Watch on the project page</a> ·
+  <a href="https://github.com/user-attachments/assets/d415a2ec-89de-4f6d-a2e5-eeec8993d05d">Open MP4</a>
+</p>
+
+</div>
+
+## 📢 News
+
+> **[2026-10-21]** 🤖 The **Unitree Go2 deployment** is released, with four-view RGB and LiDAR-based map-backed PixelGoal navigation. See the [deployment guide](docs/release/en/go2.md) for Jetson installation and operation.
+
+> **[2026-10-13]** 🎉 The InteriorGS **ObjectNav and Multi-ObjectNav test episodes** (150 each, with reference trajectories) are released in [HabitatGS-Benchmark](https://huggingface.co/datasets/yyh929/HabitatGS-Benchmark). See the [benchmark guide](https://github.com/zju3dv/habitat-gs/blob/main/docs/benchmark/README.md) for data and evaluation.
+
+Download the original scene data from [InteriorGS](https://huggingface.co/datasets/spatialverse/InteriorGS).
+
+The public `habitat_gs/objectnav/v1` files need conversion before `supernav run`.
+See the [SuperNav GS workflow](docs/release/en/habitatgs-benchmark.md) for conversion,
+running, primitive-trace export and SR/SPL plus SR1–SR5 scoring.
+
+## 🧭 What Is SuperNav?
+
+**SuperNav** is an agentic navigation system that uses a pretrained multimodal
+model to solve diverse navigation tasks through tool use, task-progress tracking,
+and context management, without navigation-specific fine-tuning of the model.
+Tasks range from finding a single object and visiting multiple targets to
+fulfilling high-level requests.
+
+This repository provides the agent runtime, navigation tools and Skills,
+experiment recipes, and evaluation utilities for **Habitat-GS** and **AI2-THOR**.
+With SuperNav, you can:
+
+- **Run navigation agents** with Codex, OpenCode, or Kimi.
+- **Compose tasks, tools, and Skills** through explicit experiment configurations.
+- **Watch execution live**, including RGB observations, trajectories, and tool calls.
+- **Inspect and evaluate runs** using saved prompts, tool results, native logs,
+  and independent task metrics.
+
+See the [project page](https://zju3dv.github.io/SuperNav/) for simulation
+videos, the method overview, and research results.
+The [Unitree Go2 deployment source](docs/release/en/go2.md) provides four-view RGB
+and LiDAR-based map-backed PixelGoal navigation through a pinned public DimOS
+submodule. Real-world demonstrations are on the project page.
+
+<a id="release-status"></a>
+
+## 📦 Release Status
+
+- [x] Agent runtime, navigation tools and Skills, experiment recipes, and evaluation
+- [x] Learned Executor weights ([Hugging Face](https://huggingface.co/the0xka1/SuperNav-Learned-Executor))
+- [x] InteriorGS single/multi-object navigation benchmark ([HabitatGS-Benchmark](https://huggingface.co/datasets/yyh929/HabitatGS-Benchmark))
+- [ ] AI2-THOR demand-driven navigation benchmark
+- [x] [Unitree Go2 real-robot deployment](docs/release/en/go2.md) released: map-backed PixelGoal with four-view RGB and LiDAR
+
+## 📖 Table of Contents
+
+- [Release Status](#release-status)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Run Navigation Experiments](#run-navigation-experiments)
+- [Visualization and Evaluation](#visualization-and-evaluation)
+- [Documentation and Development](#documentation-and-development)
+- [Citation](#citation)
+- [Acknowledgements and License](#acknowledgements-and-license)
+
+<a id="installation"></a>
+
+## 🛠️ Installation
+
+For Unitree Go2, follow the [deployment guide](docs/release/en/go2.md) to
+initialize the public DimOS submodule and install its locked dependencies in a
+dedicated environment under `robots/go2/`. The commands below install the simulation runtime.
+
+Use **Python 3.12**. Start with an independent environment for SuperNav:
+
+```bash
+git clone https://github.com/zju3dv/SuperNav.git
+cd SuperNav
+
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
+
+The base installation supports configuration inspection, Habitat dry-runs, and
+the browser demo. Install the extras needed for your workflow:
+
+| Workflow | Install command |
+| --- | --- |
+| Agents and evaluation | `python -m pip install -e '.[agents,evaluation]'` |
+| AI2-THOR experiments | `python -m pip install -e '.[ai2thor,agents,evaluation]'` |
+| Rerun viewer | `python -m pip install -e '.[viewer]'` |
+
+For Codex, OpenCode, or Kimi runs, install and authenticate the selected CLI
+separately. Shared Codex recipes use the client's configured provider and login;
+all bundled recipes use `gpt-6-astra` with `medium` reasoning from
+[`configs/models/gpt-6-astra-medium.json`](configs/models/gpt-6-astra-medium.json).
+Keep credentials in environment variables or local client configuration.
+
+API clients select a provider through `agents.<client>.provider` in a local
+experiment configuration. Credentials use the environment variable named by
+`env_key`; see the [configuration guide](docs/release/en/configuration.md).
+
+For Habitat, use the [Habitat setup guide](docs/release/en/habitat.md#install-in-a-dedicated-venv)
+to install the public CUDA-enabled SDK in a dedicated environment.
+A bridge health response confirms server startup; RGB/depth, motion, session close,
+and independent GT scoring require a real episode.
+
+<a id="quick-start"></a>
+
+## ⚡ Quick Start
+
+Start the built-in browser demo:
+
+```bash
+supernav web --demo
+```
+
+Open **http://127.0.0.1:8765** to explore a generated room and sample trajectory.
+The demo is included in the base installation. Press **Ctrl+C** to stop it before
+continuing, or use another terminal.
+
+**Before running an experiment, prepare these three inputs yourself:**
+
+- **Data:** scene assets and datasets for the selected simulator.
+- **Configuration:** local data paths, simulator environment, model access, and
+  any services required by the selected method. Adapt the example recipes in
+  `configs/experiments/` to your setup.
+- **Instructions:** a task manifest containing your requests and matching scene,
+  spawn, and goal information.
+
+SuperNav provides the code, general prompts, and configuration templates. Supply
+matching ground truth when required for scoring or by the selected method.
+Task lists and ground truth are distributed separately from the source package;
+the public GS release and its adapter are described in the [GS benchmark guide](docs/release/en/habitatgs-benchmark.md).
+
+Inspect the example experiment configurations:
+
+```bash
+supernav --help
+supernav config list
+supernav config show --experiment habitat-geo-based-executor
+```
+
+After preparing your configuration and task manifest, replace `example-task`
+below with a `task_id` from your manifest, then prepare a dry-run:
+
+```bash
+supernav run --experiment habitat-geo-based-executor \
+  --instructions /path/to/tasks/habitat.json \
+  --task-ids example-task \
+  --arms default --dry-run \
+  --output-dir data/runs/quickstart-dry
+```
+
+`supernav` and `python -m supernav` expose the same command tree. Runs require
+an explicit `--experiment` or `--config` selection.
+
+<a id="run-navigation-experiments"></a>
+
+## 🚀 Run Navigation Experiments
+
+### Run a Habitat-GS episode
+
+Install the agent dependencies, then follow the [Habitat setup guide](docs/release/en/habitat.md)
+to install Habitat-GS and the same SuperNav version in the simulator environment.
+The agent and simulator may use separate Python environments.
+
+```bash
+python -m pip install -e '.[agents,evaluation]'
+
+export SUPERNAV_HABITAT_PYTHON=/path/to/habitat-env/bin/python
+export SUPERNAV_SCENE_DATASET_CONFIG=/path/to/global_navigation.scene_dataset_config.json
+
+supernav run --experiment habitat-geo-based-executor \
+  --instructions /path/to/tasks/habitat.json \
+  --task-ids example-task \
+  --arms default --model gpt-6-astra \
+  --output-dir data/runs/quickstart
+```
+
+Replace the paths with your installation. The recipe supplies `medium` reasoning
+for `gpt-6-astra`. The task manifest supplies the scene and spawn. The selected
+method uses visual-point navigation with native global and local navigation Skills.
+SuperNav starts and stops the Habitat bridge for each episode.
+
+**Use separate output directories for dry-runs and real runs.** Existing episode
+directories are skipped by default; choose a new directory or `--run-tag` for
+another run.
+
+### Choose an experiment
+
+Example recipes in [`configs/experiments`](configs/experiments) combine reusable
+agent, model, backend, and method settings. Adapt a recipe to your setup and
+supply your own data and instructions:
+
+| Experiment | Purpose |
+| --- | --- |
+| `habitat-geo-based-executor` | Habitat navigation with a geometry-based executor and native Skills |
+| `habitat-learned-executor` | Habitat navigation with a learned local policy and native Skills |
+| `ai2thor-primitive` | AI2-THOR demand-driven navigation with primitive actions |
+
+**Learned Executor weights are available on
+[Hugging Face](https://huggingface.co/the0xka1/SuperNav-Learned-Executor).**
+Download the checkpoint and verify its checksum:
+
+```bash
+python -m pip install -U huggingface_hub
+hf download the0xka1/SuperNav-Learned-Executor \
+  ckpt_latest125.pt CHECKSUMS.sha256 --local-dir /path/to/checkpoints
+(cd /path/to/checkpoints && sha256sum -c CHECKSUMS.sha256)
+```
+
+Replace `/path/to/checkpoints` with your download directory. Before running
+`habitat-learned-executor`, follow the
+[policy service setup](docs/release/en/habitat.md#learned-executor-weights)
+to load the checkpoint with the `nomad` backend and set `NAV_LOCALNAV_URL`.
+Scene assets and task instructions are separate requirements.
+
+Each recipe has one `default` arm; omit `--arms` or use `--arms default`.
+Use `--task-ids` and `--reps` to select tasks and repetitions. The geometry-based
+executor uses oracle geometry, including depth and NavMesh paths; account for
+this information when comparing methods.
+
+Keep machine-specific settings in ignored `configs/local/` files. For example,
+create `configs/local/habitat.json` to select your task manifest and customize a recipe:
+
+```json
+{
+  "extends": "../experiments/habitat-geo-based-executor.json",
+  "instructions_file": "/path/to/tasks/habitat.json",
+  "model": {"name": "gpt-6-astra"},
+  "deployment": {
+    "scene_dataset_config_file": "${SUPERNAV_SCENE_DATASET_CONFIG}"
+  },
+  "output_dir": "data/runs/habitat"
+}
+```
+
+```bash
+supernav config show --config configs/local/habitat.json
+supernav run --config configs/local/habitat.json \
+  --task-ids example-task --arms default
+```
+
+See the [configuration guide](docs/release/en/configuration.md) for composition rules, model
+selection, and external dataset path mappings. Each recipe declares its prompt
+directory explicitly.
+
+<a id="run-hm3d-objectnav"></a>
+
+### Run an HM3D ObjectNav episode
+
+HM3D uses the same Habitat executor recipes. First complete the
+[HM3D v2 / OVON setup guide](docs/release/en/hm3d-and-ovon.md) to install the
+agent and simulator environments and obtain the **v0.2 scene assets and
+ObjectNav v2 episodes**. Scenes and episodes are separate downloads. Run the
+following commands from the repository root with your own absolute paths:
+
+```bash
+export SUPERNAV_HABITAT_PYTHON=/path/to/habitat-env/bin/python
+export SUPERNAV_HM3D_SCENES_ROOT=/path/to/scene_datasets/hm3d
+export SUPERNAV_SCENE_DATASET_CONFIG="$SUPERNAV_HM3D_SCENES_ROOT/hm3d_annotated_basis.scene_dataset_config.json"
+export SUPERNAV_EPISODES_ROOT=/path/to/objectnav_hm3d_v2
+export SUPERNAV_WORK_DIR=/path/to/storage/supernav-hm3d-quickstart
+
+supernav prepare objectnav \
+  --episodes-root "$SUPERNAV_EPISODES_ROOT" --split val \
+  --scene-dataset-config "$SUPERNAV_SCENE_DATASET_CONFIG" \
+  --sensor-height 1.25 --max-episodes 1 \
+  --template-config configs/experiments/habitat-geo-based-executor.json \
+  --instructions-dir "$SUPERNAV_WORK_DIR/tasks" \
+  --config-dir "$SUPERNAV_WORK_DIR/configs"
+
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+work = Path(os.environ["SUPERNAV_WORK_DIR"])
+config = {
+    "extends": str(work / "configs/hm3d-val-localnav.json"),
+    "output_dir": str(work / "runs"),
+    "visuals_root": str(work / "visuals"),
+}
+(work / "configs/run.json").write_text(json.dumps(config, indent=2) + "\n")
+PY
+
+supernav run --config "$SUPERNAV_WORK_DIR/configs/run.json" \
+  --sweep-id quickstart-dry --dry-run \
+  --output-dir "$SUPERNAV_WORK_DIR/dry-run"
+supernav run --config "$SUPERNAV_WORK_DIR/configs/run.json" \
+  --sweep-id quickstart --arms default
+```
+
+This prepares and runs one episode. If only some scenes are installed, add
+`--scenes <scene-hash>` to preparation. To prepare the full split, remove
+`--max-episodes 1` and use a new work directory. Preparation retains the dataset
+NavMesh; keep the original episode files available for offline scoring.
+
+After the real run, calculate **SR and SPL** from its saved task snapshot and
+trajectory. This example requires STOP and a viewpoint geodesic distance strictly
+below **0.2 m**; set the threshold explicitly for the evaluation protocol you use:
+
+```bash
+"$SUPERNAV_HABITAT_PYTHON" -m supernav score-objectnav \
+  --runs-root "$SUPERNAV_WORK_DIR/runs" \
+  --instructions "$SUPERNAV_WORK_DIR/runs/_sweeps/quickstart/instructions.resolved.json" \
+  --scenes-root "$SUPERNAV_HM3D_SCENES_ROOT" \
+  --visuals-root "$SUPERNAV_WORK_DIR/visuals" \
+  --criterion viewpoint_geodesic --success-distance 0.2 \
+  --l-source viewpoint_geodesic \
+  --out-json "$SUPERNAV_WORK_DIR/score-geodesic.json" \
+  --out-md "$SUPERNAV_WORK_DIR/score-geodesic.md"
+```
+
+For **HM3D-OVON**, use `supernav prepare ovon` with the external selection
+manifest, then follow the same run and scoring workflow. The
+[full guide](docs/release/en/hm3d-and-ovon.md) includes OVON preparation commands,
+data download links, task selection, batch runs, and Learned Executor setup.
+
+### Run an AI2-THOR episode
+
+After preparing the dataset and Unity build described in the
+[AI2-THOR guide](docs/release/en/ai2thor.md):
+
+```bash
+python -m pip install -e '.[ai2thor,agents,evaluation]'
+export SUPERNAV_AI2THOR_DATASET=/path/to/frozen-demand-driven-dataset
+export SUPERNAV_AI2THOR_RELEASES=/path/to/ai2thor/releases
+
+supernav run --experiment ai2thor-primitive \
+  --instructions /path/to/tasks/ai2thor.json \
+  --task-ids example-task \
+  --model gpt-6-astra \
+  --output-dir data/runs/ai2thor-example
+```
+
+Use a task ID and matching request text from your external dataset.
+This backend records actions, resource claims, and STOP events. Its current
+evaluation mode is `withheld`: SR and SPL remain `null`.
+
+<a id="visualization-and-evaluation"></a>
+
+## 🖥️ Visualization and Evaluation
+
+To watch a real run, set the same absolute live directory in both the viewer
+terminal and the experiment terminal **before** starting either process:
+
+```bash
+export SUPERNAV_LIVE_DIR="$PWD/data/nav_artifacts/live"
+```
+
+Start the viewer in one terminal, then run an experiment in the other:
+
+```bash
+supernav web --live-dir "$SUPERNAV_LIVE_DIR" --runs-root data/runs
+```
+
+The viewer shows observations, trajectories, and recorded agent/tool activity.
+See the [viewer guide](docs/release/en/web-viewer.md) for remote access and existing recordings.
+
+Runs save configuration and task snapshots, prompts, raw agent logs, tool events,
+and metrics under `data/runs/` or the selected output directory. Inspect the
+evaluation and export commands with:
+
+```bash
+supernav score-objectnav --help
+supernav score-multi-objectnav --help
+supernav prepare habitatgs --help
+supernav export-habitatgs --help
+supernav score-habitatgs --help
+supernav aggregate --help
+supernav video --help
+```
+
+Compute SR/SPL with the task's offline scorer and ground truth. Agent completion
+claims, STOP events, and process status are recorded separately.
+
+<a id="documentation-and-development"></a>
+
+## 📚 Documentation and Development
+
+Deployment and simulation guides are available in [English](docs/release/en/README.md)
+and [简体中文](docs/release/zh/README.md).
+
+| Guide | Contents |
+| --- | --- |
+| [Configuration](docs/release/en/configuration.md) | Experiments, models, local settings, and task manifests |
+| [Scene assets and Skills](docs/release/en/assets-and-skills.md) | Backend requirements, external assets, and navigation Skills |
+| [Habitat-GS](docs/release/en/habitat.md) | Simulator installation and scene integration |
+| [HabitatGS-Benchmark](docs/release/en/habitatgs-benchmark.md) | Public GS dataset conversion, navigation, SR/SPL and stage SR |
+| [HM3D v2 and OVON](docs/release/en/hm3d-and-ovon.md) | Scene and episode data, task preparation, navigation, and offline scoring |
+| [AI2-THOR](docs/release/en/ai2thor.md) | Dataset, Unity build, observations, and execution |
+| [Unitree Go2](docs/release/en/go2.md) | Jetson installation, PixelGoal operation, source maintenance, and tests |
+| [Web viewer](docs/release/en/web-viewer.md) | Live observation and recorded runs |
+| [Architecture](docs/release/en/architecture.md) | Runtime, methods, backends, experiments, and evaluation |
+| [Directory layout](docs/release/en/layout.md) | Source, configuration, asset, and output locations |
+
+For development:
+
+```bash
+python -m pip install -e '.[test]'
+python -m pytest -q
+```
+
+CI builds a wheel and checks its CLI, configuration, prompt, and Skill resources
+in a clean environment with only the base dependencies.
+
+<a id="citation"></a>
+
+## 📄 Citation
+
+If you find SuperNav useful in your research, please cite our
+[paper](https://arxiv.org/abs/2610.12126v1):
+
+```bibtex
+@misc{zhang2026supernav,
+  title={{SuperNav}: An Agentic Navigation System for Any Task in Any Scene},
+  author={Jinkai Zhang and Jingyi Xu and Yuanhong Yu and Jiarui Guo and Ruizhen Hu and Hujun Bao and Xiaowei Zhou and Sida Peng},
+  year={2026},
+  eprint={2610.12126},
+  archivePrefix={arXiv},
+  primaryClass={cs.RO},
+  url={https://arxiv.org/abs/2610.12126v1}
+}
+```
+
+<a id="acknowledgements-and-license"></a>
+
+## 🙏 Acknowledgements and License
+
+SuperNav uses [Habitat-GS](https://github.com/zju3dv/habitat-gs),
+[Habitat-Sim](https://github.com/facebookresearch/habitat-sim), and
+[AI2-THOR](https://github.com/allenai/ai2thor) as simulator foundations. We thank
+their authors and the contributors to the datasets and tools used in this project.
+
+SuperNav is distributed under the [Project Registration License (PRL) v1.0](LICENSE).
+Use solely for academic research, education, evaluation, or personal purposes is
+free and does not require registration, including publication of research results.
+
+Organizational project use is free but requires registration before use, including
+commercial and non-commercial projects, internal R&D, testing, deployment, and
+production. Complete and accurate registration automatically grants permission;
+no approval or fee is required. Register each materially distinct project once.
+
+**Project use registration:** [Google Forms](https://docs.google.com/forms/d/e/1FAIpQLSff5QjjANlJ2hnXYqBSAzKWxEM58gIxPLh17-t3j3-MqO1a5w/viewform).
+
+Third-party code and bundled fonts retain their original licenses and copyright
+notices; see [Third-party notices](THIRD_PARTY_NOTICES.md). External simulators,
+datasets, and model weights retain their respective licenses.

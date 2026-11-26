@@ -1,0 +1,80 @@
+{
+  "schema": "supernav-migration-provenance/v1",
+  "source_repository": "habitat-gs",
+  "source_commit": "042ccf109fc5b56419d593bfa15930f86739aae2",
+  "cartographer_commit": "877157a0d91788a7700221d87232d412cb3c1ef4",
+  "entries": [
+    {
+      "source": "tools/habitat_agent/interfaces/graph_memory.py",
+      "sha256": "05b9a75528250cf4fa396bad1d7a7eae531b7a7d8bec5912e5e972a9b4c87eef",
+      "destination": "src/supernav/methods/navigation/graph_memory.py",
+      "deviations": ["release term: memory nodes", "schema v7", "v1-v6 migration", "navigation_goal removed"]
+    },
+    {
+      "source": "tools/habitat_agent/slam/area_segmentation.py",
+      "sha256": "1e8aa79c2127ead1565f80437e67318ecf235a445a4a1a3618c444e445036974",
+      "destination": "src/supernav/backends/habitat/memory_slam/area_segmentation.py",
+      "deviations": []
+    },
+    {
+      "source": "tools/habitat_agent/slam/occupancy_navigation.py",
+      "sha256": "d477d1bc3dbf41d0cfd9d0fc69587960f789d8ad7e54eb07df18ed0ef07a2738",
+      "destination": "src/supernav/backends/habitat/memory_slam/occupancy_navigation.py",
+      "deviations": []
+    },
+    {
+      "source": "tools/habitat_agent/slam/area_captioning.py",
+      "sha256": "05112fab1e76bfce5898182b3d68b788e32873dd22a661a6021e6105530d2383",
+      "destination": "src/supernav/backends/habitat/memory_slam/area_captioning.py",
+      "deviations": ["inline image transport default", "startup health check"]
+    },
+    {
+      "source": "tools/cartographer/relocalize.py",
+      "sha256": "18531f2077684b19756f55e4eea36d6695d9618fc9f6fa27db845a1363622d64",
+      "destination": "src/supernav/backends/habitat/memory_slam/relocalize.py",
+      "deviations": []
+    },
+    {
+      "source": "tools/slam_area_caption/qwen_caption_server.py",
+      "sha256": "582cdb55fb75272c1af7d7995e2e2c95cbda579af9d1c9d7456de9e45ab16eac",
+      "destination": "src/supernav/backends/habitat/memory_slam/qwen_caption_server.py",
+      "deviations": ["portable Qwen/Qwen3.5-2B default", "versioned health payload"]
+    },
+    {
+      "source": "src_python/habitat_sim/habitat_adapter_internal/cartographer.py",
+      "sha256": "5affdc2dd60429fc2f2d2d4b75dcaa8bd07a89bfcfbed9d82f59672cc08b8038",
+      "destination": "src/supernav/backends/habitat/memory_slam/cartographer.py",
+      "deviations": ["SuperNav-1.5 spatial-memory naming", "simulator_evaluator only", "authoritative default", "worker capability probe", "SuperNav protocol names"]
+    },
+    {
+      "source": "tools/cartographer/worker.cpp",
+      "sha256": "8db4b0f3acbe2791baf1f25b0505f0206dc55d2dd42b369c46638542b6affed8",
+      "destination": "native/cartographer/worker.cpp",
+      "deviations": ["memory_nodes sidecar name", "portable relocalizer command", "capability probe"]
+    },
+    {
+      "source": "tools/cartographer/scan.cpp",
+      "sha256": "2d90f512799a9d3270d22b0292bd70e6d496fc38913819665de8c2cbdadc03ab",
+      "destination": "native/cartographer/scan.cpp",
+      "deviations": []
+    },
+    {
+      "source": "tools/cartographer/delayed_relocalization.cpp",
+      "sha256": "17996260c662f52969bc3e7fd25e5c5722cdabbf607eda67bbca1ee7264540f0",
+      "destination": "native/cartographer/delayed_relocalization.cpp",
+      "deviations": []
+    },
+    {
+      "source": "tools/cartographer/patches/authoritative_odometry.patch",
+      "sha256": "9b8ebb36314b47075fdb06400e725922fcf3223402d7ffce548893c785dac817",
+      "destination": "native/cartographer/patches/authoritative_odometry.patch",
+      "deviations": []
+    }
+  ],
+  "excluded": [
+    "benchmark and evaluation harness code",
+    "GT/NavMesh memory-node navigation",
+    "SuperOdom and AI2-THOR odometry sources",
+    "machine-specific launch scripts and artifacts"
+  ]
+}

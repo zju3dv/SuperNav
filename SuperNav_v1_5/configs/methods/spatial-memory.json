@@ -1,0 +1,57 @@
+{
+  "extends": "geo-based-executor.json",
+  "skill_runtime": {
+    "skill_set_id": "supernav-1.5-structured-spatial-memory"
+  },
+  "mcp": {
+    "environment": {
+      "HAB_STRUCTURED_SPATIAL_MEMORY_ENABLED": "1",
+      "HAB_MCP_SPATIAL_MEMORY": "0",
+      "HAB_CARTOGRAPHER_ENABLED": "1",
+      "HAB_CARTOGRAPHER_USE_ODOMETRY": "1",
+      "HAB_CARTOGRAPHER_ODOMETRY_SOURCE": "simulator_evaluator",
+      "HAB_CARTOGRAPHER_ODOMETRY_MODE": "authoritative",
+      "HAB_GPU_DEVICE_ID": "0",
+      "HAB_CARTOGRAPHER_WORKER_COMMAND": "scripts/run_cartographer_worker.sh {input_fifo} {occupancy_path}",
+      "HAB_CARTOGRAPHER_RELOCALIZATION_ENABLED": "1",
+      "HAB_CARTOGRAPHER_AGENT_GUIDED_RELOCALIZATION_ENABLED": "1",
+      "HAB_SLAM_AREA_CAPTION_ENABLED": "1",
+      "HAB_SLAM_AREA_CAPTION_TRANSPORT": "inline"
+    }
+  },
+  "arms": {
+    "default": {
+      "movement": "spatial_memory",
+      "skill_name": "memory-nodes",
+      "tool_whitelist": [
+        "hab_init_scene",
+        "hab_turn",
+        "hab_visual_point_navigate",
+        "hab_depth_analyze",
+        "hab_depth_grid",
+        "hab_list_nodes",
+        "hab_grep_node",
+        "hab_inspect_node",
+        "hab_query_node_context",
+        "hab_add_node",
+        "hab_upsert_node",
+        "hab_update_node",
+        "hab_apply_memory_node_mutations",
+        "hab_delete_node",
+        "hab_report_memory_pos",
+        "hab_navigate_to_memory_node_occ",
+        "hab_close_session"
+      ],
+      "skill_names": [
+        "memory-nodes",
+        "2d-slam",
+        "spatial-memory-navigation"
+      ],
+      "required_skill_names": [
+        "memory-nodes",
+        "2d-slam",
+        "spatial-memory-navigation"
+      ]
+    }
+  }
+}

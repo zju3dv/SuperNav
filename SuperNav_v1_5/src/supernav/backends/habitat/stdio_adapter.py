@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Meta Platforms, Inc. and its affiliates.
+# This source code is licensed under the MIT license found in the
+# THIRD_PARTY_NOTICES.md file in the root directory of this source tree.
+
+
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import importlib.util
+import json
+import sys
+from pathlib import Path
+from typing import Any, Dict
+
+
+from supernav.backends.habitat.http_server import _load_adapter
+
+HabitatAdapter = None
+
+
+def _emit(response: Dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(response, ensure_ascii=True) + "\n")
+    sys.stdout.flush()
+
+
+def _parse_request(raw: str) -> Dict[str, Any]:
+    request = json.loads(raw)
+    if not isinstance(request, dict):
+        raise ValueError("Request must be a JSON object")
+    return request
+
+
+def _json_error(action: str, message: str) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "action": action,
+        "request_id": None,
+        "session_id": None,
+        "error": {"type": "ValueError", "message": message},
+    }
+
+
+def _run_single_request(adapter: HabitatAdapter, request_json: str) -> int:
+    try:
+        request = _parse_request(request_json)
+    except (json.JSONDecodeError, ValueError) as exc:
+        _emit(_json_error("parse_request", str(exc)))
+        return 2
+
+    _emit(adapter.handle_request(request))
+    return 0
+
+
+def _run_stream(adapter: HabitatAdapter) -> int:
+    for line in sys.stdin:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            request = _parse_request(stripped)
+        except (json.JSONDecodeError, ValueError) as exc:
+            _emit(_json_error("parse_request", str(exc)))
+            continue
+        _emit(adapter.handle_request(request))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "habitat-gs bridge adapter. "
+            "Reads JSON requests and writes JSON responses."
+        )
+    )
+    parser.add_argument(
+        "--request-json",
+        type=str,
+        default=None,
+        help="One-shot JSON request string. If omitted, run in stdin stream mode.",
+    )
+    return parser
+
+
+def main() -> int:
+    global HabitatAdapter
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if HabitatAdapter is None:
+        HabitatAdapter = _load_adapter()
+    adapter = HabitatAdapter()
+    try:
+        if args.request_json is not None:
+            return _run_single_request(adapter, args.request_json)
+        return _run_stream(adapter)
+    finally:
+        adapter.close_all()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

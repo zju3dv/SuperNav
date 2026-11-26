@@ -1,0 +1,1 @@
+Nothing else is specified. There is no map, no list of objects, no coordinates, no predefined route. Everything - what's in the room, where to go, and how to satisfy the request - is for YOU to figure out from what you see.

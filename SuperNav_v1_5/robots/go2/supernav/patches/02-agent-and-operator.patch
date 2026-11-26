@@ -1,0 +1,4304 @@
+diff --git a/dimos/agents/annotation.py b/dimos/agents/annotation.py
+index 847156e..26e9253 100644
+--- a/dimos/agents/annotation.py
++++ b/dimos/agents/annotation.py
+@@ -69,7 +69,12 @@ def _stamp_and_log(func_name: str, result: Any, elapsed_ms: float) -> Any:
+     return result
+ 
+ 
+-def _make_skill(func: F, uses: list[str], lifecycle: SkillLifecycle) -> F:
++def _make_skill(
++    func: F,
++    uses: list[str],
++    lifecycle: SkillLifecycle,
++    requires_modules: list[str],
++) -> F:
+     if inspect.iscoroutinefunction(func):
+ 
+         @functools.wraps(func)
+@@ -113,13 +118,19 @@ def _make_skill(func: F, uses: list[str], lifecycle: SkillLifecycle) -> F:
+     wrapped.__skill__ = True  # type: ignore[attr-defined]
+     wrapped.__skill_uses__ = list(uses)  # type: ignore[attr-defined]
+     wrapped.__skill_lifecycle__ = lifecycle  # type: ignore[attr-defined]
++    wrapped.__skill_requires_modules__ = list(requires_modules)  # type: ignore[attr-defined]
+     return cast("F", wrapped)
+ 
+ 
+ @overload
+ def skill(func: F) -> F: ...
+ @overload
+-def skill(*, uses: list[str] | None = ..., lifecycle: SkillLifecycle = ...) -> Callable[[F], F]: ...
++def skill(
++    *,
++    uses: list[str] | None = ...,
++    lifecycle: SkillLifecycle = ...,
++    requires_modules: list[str] | None = ...,
++) -> Callable[[F], F]: ...
+ 
+ 
+ def skill(
+@@ -127,6 +138,7 @@ def skill(
+     *,
+     uses: list[str] | None = None,
+     lifecycle: SkillLifecycle = "instant",
++    requires_modules: list[str] | None = None,
+ ) -> F | Callable[[F], F]:
+     """Mark a method as an agent-callable skill.
+ 
+@@ -140,13 +152,23 @@ def skill(
+     returning, or `"background"` for skills that kick off background work and
+     return early -- those must use `start_tool`/`stop_tool` so the matching
+     stop-tool frame can release their capabilities.
++
++    `requires_modules` declares concrete module dependencies that must be active
++    for this skill to be useful. If a run disables one of those modules, the MCP
++    server hides the skill from `tools/list` instead of letting the agent call an
++    unavailable capability and fail at execution time.
+     """
+     if lifecycle not in _VALID_LIFECYCLES:
+         raise ValueError(f"lifecycle must be one of {_VALID_LIFECYCLES}, got {lifecycle!r}")
+     if func is not None:
+-        return _make_skill(func, uses=[], lifecycle="instant")
++        return _make_skill(func, uses=[], lifecycle="instant", requires_modules=[])
+ 
+     def decorator(f: F) -> F:
+-        return _make_skill(f, uses=list(uses or []), lifecycle=lifecycle)
++        return _make_skill(
++            f,
++            uses=list(uses or []),
++            lifecycle=lifecycle,
++            requires_modules=list(requires_modules or []),
++        )
+ 
+     return decorator
+diff --git a/dimos/agents/mcp/mcp_adapter.py b/dimos/agents/mcp/mcp_adapter.py
+index 213bf71..f851efe 100644
+--- a/dimos/agents/mcp/mcp_adapter.py
++++ b/dimos/agents/mcp/mcp_adapter.py
+@@ -85,20 +85,35 @@ class McpAdapter:
+ 
+     def initialize(self) -> dict[str, Any]:
+         """Send ``initialize`` and return server info."""
+-        return self.call("initialize")
++        return self._unwrap(self.call("initialize"))
+ 
+     def list_tools(self) -> list[dict[str, Any]]:
+         """Return the list of available tools."""
+         result = self._unwrap(self.call("tools/list"))
+         return result.get("tools", [])  # type: ignore[no-any-return]
+ 
+-    def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
++    def call_tool(
++        self,
++        name: str,
++        arguments: dict[str, Any] | None = None,
++        *,
++        meta: dict[str, Any] | None = None,
++    ) -> dict[str, Any]:
+         """Call a tool by name and return the result dict."""
+-        return self._unwrap(self.call("tools/call", {"name": name, "arguments": arguments or {}}))
+-
+-    def call_tool_text(self, name: str, arguments: dict[str, Any] | None = None) -> str:
++        params: dict[str, Any] = {"name": name, "arguments": arguments or {}}
++        if meta is not None:
++            params["_meta"] = meta
++        return self._unwrap(self.call("tools/call", params))
++
++    def call_tool_text(
++        self,
++        name: str,
++        arguments: dict[str, Any] | None = None,
++        *,
++        meta: dict[str, Any] | None = None,
++    ) -> str:
+         """Call a tool and return just the first text content item."""
+-        result = self.call_tool(name, arguments)
++        result = self.call_tool(name, arguments, meta=meta)
+         content = result.get("content", [])
+         if not content:
+             return ""
+@@ -143,10 +158,9 @@ class McpAdapter:
+         Falls back to the default URL if no entry is found.
+         """
+         if entry is None:
+-            from dimos.core.run_registry import list_runs
++            from dimos.core.run_registry import get_most_recent
+ 
+-            runs = list_runs(alive_only=True)
+-            entry = runs[0] if runs else None
++            entry = get_most_recent(alive_only=True)
+ 
+         if entry is not None and hasattr(entry, "mcp_url") and entry.mcp_url:
+             return cls(url=entry.mcp_url, timeout=timeout)
+diff --git a/dimos/agents/mcp/mcp_client.py b/dimos/agents/mcp/mcp_client.py
+index 75b532e..97d35a5 100644
+--- a/dimos/agents/mcp/mcp_client.py
++++ b/dimos/agents/mcp/mcp_client.py
+@@ -13,11 +13,10 @@
+ # limitations under the License.
+ 
+ from collections.abc import Callable
++import os
+ from queue import Empty, Queue
+ from threading import Event, RLock, Thread
+-import time
+ from typing import Any
+-import uuid
+ 
+ import httpx
+ from langchain.agents import create_agent
+@@ -25,11 +24,49 @@ from langchain_core.messages import HumanMessage
+ from langchain_core.messages.base import BaseMessage
+ from langchain_core.tools import StructuredTool
+ from langgraph.graph.state import CompiledStateGraph
++from pydantic import Field, SecretStr
+ from reactivex.disposable import Disposable
+ 
++from dimos.agents.harness.context_manager import ConversationContextManager
++from dimos.agents.harness.model_provider import (
++    NativeAgentModelConfig,
++    build_native_agent_model,
++    resolve_context_target_provider,
++)
++from dimos.agents.harness.native_agent_io import NativeAgentIO
++from dimos.agents.harness.native_auto_followup import NativeAutoFollowupState
++from dimos.agents.harness.native_continuation import dispatch_native_continuation
++from dimos.agents.harness.native_session_tracing import (
++    emit_native_session_end_trace,
++    emit_native_session_start_trace,
++    new_native_session_id,
++)
++from dimos.agents.harness.native_tool_catalog import (
++    build_native_tool_catalog,
++    fetch_mcp_tools_list,
++)
++from dimos.agents.harness.native_tool_dispatch import (
++    NativeToolDispatchState,
++    dispatch_native_mcp_tool,
++)
++from dimos.agents.harness.native_tool_status_stream import (
++    publish_native_tool_status_stream_message,
++)
++from dimos.agents.harness.native_tool_wrapper import native_mcp_tool_to_langchain
++from dimos.agents.harness.native_turn_processor import (
++    NativeTurnRuntimeState,
++    process_native_turn,
++)
++from dimos.agents.harness.policy_prompt import build_native_policy_system_prompt
++from dimos.agents.harness.speech_policy import NativeSpeechGate, resolve_speech_gate_limits
++from dimos.agents.harness.task_state import TaskStateManager
++from dimos.agents.harness.trace import emit_trace_event
+ from dimos.agents.mcp import tool_stream
++from dimos.agents.runtime_policy import (
++    AgentRuntimePolicy,
++    resolve_agent_runtime_policy,
++)
+ from dimos.agents.system_prompt import SYSTEM_PROMPT
+-from dimos.agents.utils import pretty_print_langchain_message
+ from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
+ from dimos.core.core import rpc
+ from dimos.core.module import Module, ModuleConfig
+@@ -41,11 +78,33 @@ from dimos.utils.sequential_ids import SequentialIds
+ logger = setup_logger()
+ 
+ 
++def _env_secret(*names: str) -> SecretStr | None:
++    for name in names:
++        value = os.getenv(name)
++        if value:
++            return SecretStr(value)
++    return None
++
++
+ class McpClientConfig(ModuleConfig):
+     system_prompt: str | None = SYSTEM_PROMPT
+-    model: str = "gpt-4o"
++    model: str = Field(default_factory=lambda: os.getenv("DIMOS_AGENT_MODEL") or "gpt-4o")
++    model_provider: str | None = Field(
++        default_factory=lambda: os.getenv("DIMOS_AGENT_PROVIDER") or None
++    )
++    model_base_url: str | None = Field(
++        default_factory=lambda: os.getenv("DIMOS_AGENT_BASE_URL") or os.getenv("OPENAI_BASE_URL")
++    )
++    model_api_key: SecretStr | None = Field(
++        default_factory=lambda: _env_secret("DIMOS_AGENT_API_KEY", "OPENAI_API_KEY")
++    )
+     model_fixture: str | None = None
+     mcp_server_url: str = "http://localhost:9990/mcp"
++    # Deprecated module-local overrides. Prefer GlobalConfig
++    # agent_speak_rate_limit_s / agent_speak_dedupe_window_s so every MCP client
++    # shares one runtime policy surface.
++    speak_rate_limit_s: float | None = None
++    speak_dedupe_window_s: float | None = None
+ 
+ 
+ class McpClient(Module):
+@@ -58,12 +117,23 @@ class McpClient(Module):
+     _state_graph: CompiledStateGraph[Any, Any, Any, Any] | None
+     _message_queue: Queue[BaseMessage]
+     _tool_registry: dict[str, dict[str, Any]]
++    _visible_tool_details: list[dict[str, Any]]
+     _history: list[BaseMessage]
+     _thread: Thread
+     _stop_event: Event
+     _http_client: httpx.Client
+     _seq_ids: SequentialIds
++    _turn_ids: SequentialIds
+     _tool_stream_cleanup: Callable[[], None] | None
++    _context_manager: ConversationContextManager
++    _agent_io: NativeAgentIO | None
++    _session_id: str
++    _speech_gate: NativeSpeechGate
++    _movement_confirmed_for_turn: bool
++    _movement_authorization_reason: str | None
++    _auto_followup_state: NativeAutoFollowupState
++    _task_state: TaskStateManager
++    _last_user_message_text: str
+ 
+     def __init__(self, **kwargs: Any) -> None:
+         super().__init__(**kwargs)
+@@ -71,6 +141,7 @@ class McpClient(Module):
+         self._state_graph = None
+         self._message_queue = Queue()
+         self._tool_registry = {}
++        self._visible_tool_details = []
+         self._history = []
+         self._thread = Thread(
+             target=self._thread_loop,
+@@ -80,11 +151,73 @@ class McpClient(Module):
+         self._stop_event = Event()
+         self._http_client = httpx.Client(timeout=120.0)
+         self._seq_ids = SequentialIds()
++        self._turn_ids = SequentialIds()
+         self._tool_stream_cleanup = None
++        self._context_manager = self._make_context_manager()
++        self._agent_io = None
++        self._session_id = new_native_session_id()
++        self._speech_gate = NativeSpeechGate()
++        self._movement_confirmed_for_turn = False
++        self._movement_authorization_reason = None
++        self._auto_followup_state = NativeAutoFollowupState()
++        self._task_state = TaskStateManager()
++        self._last_user_message_text = ""
+ 
+     def __reduce__(self) -> Any:
+         return (self.__class__, (), {})
+ 
++    def _make_context_manager(self) -> ConversationContextManager:
++        config = self.config.g
++        return ConversationContextManager(
++            artifact_dir=config.agent_artifact_dir,
++            max_context_tokens=config.agent_context_max_tokens,
++            max_recent_messages=config.agent_context_recent_messages,
++            max_tool_result_chars=config.agent_context_tool_result_max_chars,
++            max_image_blocks=config.agent_context_image_max,
++            target_provider=self._context_target_provider(),
++            target_model=self.config.model,
++        )
++
++    def _context_target_provider(self) -> str:
++        return resolve_context_target_provider(self._model_provider_config())
++
++    def _model_provider_config(self) -> NativeAgentModelConfig:
++        return NativeAgentModelConfig(
++            model=self.config.model,
++            model_provider=self.config.model_provider,
++            model_base_url=self.config.model_base_url,
++            model_api_key=self.config.model_api_key,
++            model_fixture=self.config.model_fixture,
++        )
++
++    def _get_context_manager(self) -> ConversationContextManager:
++        manager = getattr(self, "_context_manager", None)
++        if manager is None:
++            manager = self._make_context_manager()
++            self._context_manager = manager
++        return manager
++
++    def _get_agent_io(self) -> NativeAgentIO:
++        agent_io = getattr(self, "_agent_io", None)
++        if agent_io is None:
++            agent_io = NativeAgentIO(agent=self.agent, agent_idle=self.agent_idle)
++            self._agent_io = agent_io
++        return agent_io
++
++    def _native_runtime_state(self) -> NativeTurnRuntimeState:
++        return NativeTurnRuntimeState(
++            last_user_message_text=self._last_user_message_text,
++            movement_confirmed=self._movement_confirmed_for_turn,
++            movement_authorization=self._movement_authorization_reason,
++            auto_followup=getattr(self, "_auto_followup_state", NativeAutoFollowupState()),
++        )
++
++    def _apply_native_runtime_state(self, state: NativeTurnRuntimeState) -> None:
++        self._last_user_message_text = state.last_user_message_text
++        self._movement_confirmed_for_turn = state.movement_confirmed
++        self._movement_authorization_reason = state.movement_authorization
++        self._auto_followup_state = state.auto_followup
++
+     def _mcp_request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+         body: dict[str, Any] = {
+             "jsonrpc": "2.0",
+@@ -104,31 +237,73 @@ class McpClient(Module):
+         result: dict[str, Any] = data.get("result")
+         return result
+ 
++    def _next_turn_id(self) -> str:
++        turn_ids = getattr(self, "_turn_ids", None)
++        if turn_ids is None:
++            turn_ids = SequentialIds()
++            self._turn_ids = turn_ids
++        return f"turn_{turn_ids.next():06d}"
++
+     def _mcp_tool_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+-        progress_token = str(uuid.uuid4())
+-        return self._mcp_request(
+-            "tools/call",
+-            {
+-                "name": name,
+-                "arguments": arguments,
+-                "_meta": {"progressToken": progress_token},
+-            },
++        dispatch = dispatch_native_mcp_tool(
++            name,
++            arguments,
++            state=NativeToolDispatchState(
++                movement_confirmed=self._movement_confirmed_for_turn,
++                movement_authorization=self._movement_authorization_reason,
++                user_message=self._last_user_message_text,
++                active_task=self._task_state.active_task(),
++                speech_authorized=name == "speak",
++            ),
++            mcp_request=self._mcp_request,
+         )
++        self._movement_confirmed_for_turn = dispatch.movement_confirmed
++        self._movement_authorization_reason = dispatch.movement_authorization
++        return dispatch.result
+ 
+-    def _on_tool_stream_message(self, msg: dict[str, Any]) -> None:
+-        method = msg.get("method")
+-        params = msg.get("params") or {}
+-        if method == tool_stream.NOTIFICATIONS_PROGRESS_METHOD:
+-            text = params.get("message") or ""
+-            tool_name = (params.get("_meta") or {}).get("tool_name") or "tool"
+-        elif method == tool_stream.NOTIFICATIONS_MESSAGE_METHOD:
+-            text = params.get("data") or ""
+-            tool_name = params.get("logger") or "tool"
+-        else:
+-            return
+-        if not text:
++    def _preempt_task_terminal_movement_authority(self, preempted_by: str) -> None:
++        """Ask the MCP server to close movement authority for model-terminal tasks."""
++
++        try:
++            result = self._mcp_request(
++                "dimos/preempt_movement_authority",
++                {
++                    "preempted_by": preempted_by,
++                    "client_ids": ["dimos-agent", "default"],
++                    "source": "model_terminal_directive",
++                },
++            )
++        except Exception as e:
++            logger.warning(
++                "Task-terminal movement preemption was unavailable",
++                preempted_by=preempted_by,
++                error=f"{e.__class__.__name__}: {e}",
++            )
++            emit_trace_event(
++                logger,
++                "task_terminal_preemption_unavailable",
++                preempted_by=preempted_by,
++                error_type=e.__class__.__name__,
++                error=str(e)[:200],
++            )
+             return
+-        self._message_queue.put(HumanMessage(content=f"[tool:{tool_name}] {text}"))
++
++        emit_trace_event(
++            logger,
++            "task_terminal_preemption_requested",
++            preempted_by=preempted_by,
++            preempted_count=int(result.get("preempted_count") or 0),
++            client_ids=list(result.get("client_ids") or []),
++            source="model_terminal_directive",
++        )
++
++    def _on_tool_stream_message(self, msg: dict[str, Any]) -> None:
++        publish_native_tool_status_stream_message(
++            msg,
++            logger=logger,
++            agent_io=self._get_agent_io(),
++            trace_emit=emit_trace_event,
++        )
+ 
+     def _fetch_tools(self, timeout: float = 60.0, interval: float = 1.0) -> list[StructuredTool]:
+         result = self._try_fetch_tools(timeout=timeout, interval=interval)
+@@ -138,8 +313,14 @@ class McpClient(Module):
+             )
+ 
+         raw_tools = result.get("tools", [])
+-        self._tool_registry = {t["name"]: t for t in raw_tools}
+-        tools = [self._mcp_tool_to_langchain(t) for t in raw_tools]
++        catalog = build_native_tool_catalog(
++            raw_tools,
++            policy=self._runtime_policy(),
++            wrap_tool=self._mcp_tool_to_langchain,
++        )
++        self._tool_registry = catalog.registry
++        self._visible_tool_details = catalog.visible_tools
++        tools = catalog.langchain_tools
+ 
+         if not tools:
+             logger.warning("No tools found from MCP server.")
+@@ -149,47 +330,44 @@ class McpClient(Module):
+ 
+         return tools
+ 
++    def _runtime_policy(self) -> AgentRuntimePolicy:
++        return resolve_agent_runtime_policy(self.config.g)
++
+     def _try_fetch_tools(self, timeout: float, interval: float) -> dict[str, Any] | None:
+-        deadline = time.monotonic() + timeout
++        return fetch_mcp_tools_list(
++            self._mcp_request,
++            timeout=timeout,
++            interval=interval,
++        )
+ 
+-        while True:
+-            try:
+-                self._mcp_request("initialize")
+-                break
+-            except (httpx.ConnectError, httpx.RemoteProtocolError):
+-                if time.monotonic() >= deadline:
+-                    return None
+-                time.sleep(interval)
++    def _mcp_tool_to_langchain(self, mcp_tool: dict[str, Any]) -> StructuredTool:
++        return native_mcp_tool_to_langchain(
++            mcp_tool,
++            call_mcp_tool=self._mcp_tool_call,
++            speech_refusal=self._enforce_agent_speak_policy,
++        )
+ 
+-        return self._mcp_request("tools/list")
++    def _enforce_agent_speak_policy(self, args: dict[str, Any]) -> str | None:
++        policy = self._runtime_policy()
++        limits = resolve_speech_gate_limits(
++            self.config.g,
++            rate_limit_s=self.config.speak_rate_limit_s,
++            dedupe_window_s=self.config.speak_dedupe_window_s,
++        )
++        return self._speech_gate.refusal_for_call(
++            args,
++            policy=policy,
++            rate_limit_s=limits.rate_limit_s,
++            dedupe_window_s=limits.dedupe_window_s,
++        )
+ 
+-    def _mcp_tool_to_langchain(self, mcp_tool: dict[str, Any]) -> StructuredTool:
+-        name = mcp_tool["name"]
+-        description = mcp_tool.get("description", "")
+-        input_schema = mcp_tool.get("inputSchema", {"type": "object", "properties": {}})
+-
+-        def call_tool(**kwargs: Any) -> str:
+-            result = self._mcp_tool_call(name, kwargs)
+-            content = result.get("content", [])
+-            parts = [c.get("text", "") for c in content if c.get("type") == "text"]
+-            text = "\n".join(parts)
+-
+-            # Images need to be added to the history separately because they
+-            # cannot be included in the tool response for OpenAI models and
+-            # probably others.
+-            for item in content:
+-                if item.get("type") != "text":
+-                    uuid_ = str(uuid.uuid4())
+-                    text += f"Tool call started with UUID: {uuid_}. You will be updated with the result soon."
+-                    _append_image_to_history(self, name, uuid_, item)
+-
+-            return text
+-
+-        return StructuredTool(
+-            name=name,
+-            description=description,
+-            func=call_tool,
+-            args_schema=input_schema,
++    def _make_agent_model(self) -> str | Any:
++        return build_native_agent_model(self._model_provider_config())
++
++    def _policy_system_prompt(self) -> str | None:
++        return build_native_policy_system_prompt(
++            self.config.system_prompt,
++            policy=self._runtime_policy(),
+         )
+ 
+     @rpc
+@@ -207,22 +385,26 @@ class McpClient(Module):
+         # is established.  External clients like Claude Code still use GET
+         # /mcp, which the server fans out to from the same LCM topic.
+         self._tool_stream_cleanup = tool_stream.subscribe(self._on_tool_stream_message)
++        emit_native_session_start_trace(
++            logger,
++            session_id=self._session_id,
++            policy=self._runtime_policy(),
++            model_config=self._model_provider_config(),
++            mcp_server_url=self.config.mcp_server_url,
++            context_manager=self._get_context_manager(),
++            trace_emit=emit_trace_event,
++        )
+ 
+     @rpc
+     def on_system_modules(self, _modules: list[RPCClient]) -> None:
+         tools = self._fetch_tools()
+-
+-        model: str | Any = self.config.model
+-        if self.config.model_fixture is not None:
+-            from dimos.agents.testing import MockModel
+-
+-            model = MockModel(json_path=self.config.model_fixture)
++        model = self._make_agent_model()
+ 
+         with self._lock:
+             self._state_graph = create_agent(
+                 model=model,
+                 tools=tools,
+-                system_prompt=self.config.system_prompt,
++                system_prompt=self._policy_system_prompt(),
+             )
+             if not self._thread.is_alive():
+                 self._thread.start()
+@@ -234,6 +416,14 @@ class McpClient(Module):
+         if self._tool_stream_cleanup is not None:
+             self._tool_stream_cleanup()
+             self._tool_stream_cleanup = None
++        emit_native_session_end_trace(
++            logger,
++            session_id=getattr(self, "_session_id", "unknown"),
++            reason="stop",
++            queue_size=self._message_queue.qsize() if hasattr(self, "_message_queue") else None,
++            task_snapshot=self._task_state.snapshot() if hasattr(self, "_task_state") else None,
++            trace_emit=emit_trace_event,
++        )
+         self._stop_event.set()
+         if self._thread.is_alive():
+             self._thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+@@ -262,46 +452,13 @@ class McpClient(Module):
+             continuation_context: runtime detection data, e.g.
+                 ``{"bbox": [x1, y1, x2, y2], "label": "person"}``.
+         """
+-        tool_name = continuation.get("tool")
+-        if not tool_name:
+-            self._message_queue.put(
+-                HumanMessage(f"Continuation failed: missing 'tool' key in {continuation}")
+-            )
+-            return
+-
+-        if tool_name not in self._tool_registry:
+-            self._message_queue.put(
+-                HumanMessage(f"Continuation failed: tool '{tool_name}' not found")
+-            )
+-            return
+-
+-        tool_args: dict[str, Any] = dict(continuation.get("args", {}))
+-
+-        # Substitute $-prefixed template variables from continuation_context
+-        for key, value in tool_args.items():
+-            if isinstance(value, str) and value.startswith("$"):
+-                context_key = value[1:]
+-                if context_key in continuation_context:
+-                    tool_args[key] = continuation_context[context_key]
+-
+-        try:
+-            result = self._mcp_tool_call(tool_name, tool_args)
+-            content = result.get("content", [])
+-            parts = [c.get("text", "") for c in content if c.get("type") == "text"]
+-            text = "\n".join(parts)
+-        except Exception as e:
+-            self._message_queue.put(
+-                HumanMessage(f"Continuation '{tool_name}' failed with error: {e}")
+-            )
+-            return
+-
+-        label = continuation_context.get("label", "unknown")
+-        self._message_queue.put(
+-            HumanMessage(
+-                f"Automatically executed '{tool_name}' as a continuation of lookout "
+-                f"detection (detected: {label}). Result: {text or 'started'}"
+-            )
++        result = dispatch_native_continuation(
++            continuation,
++            continuation_context,
++            tool_registry=self._tool_registry,
++            call_tool=self._mcp_tool_call,
+         )
++        self._message_queue.put(result.to_message())
+ 
+     def _thread_loop(self) -> None:
+         while not self._stop_event.is_set():
+@@ -318,33 +475,38 @@ class McpClient(Module):
+     def _process_message(
+         self, state_graph: CompiledStateGraph[Any, Any, Any, Any], message: BaseMessage
+     ) -> None:
+-        self.agent_idle.publish(False)
+-        self._history.append(message)
+-        pretty_print_langchain_message(message)
+-        self.agent.publish(message)
+-
+-        for update in state_graph.stream({"messages": self._history}, stream_mode="updates"):
+-            for node_output in update.values():
+-                for msg in node_output.get("messages", []):
+-                    self._history.append(msg)
+-                    pretty_print_langchain_message(msg)
+-                    self.agent.publish(msg)
+-
+-        if self._message_queue.empty():
+-            self.agent_idle.publish(True)
+-
+-
+-def _append_image_to_history(
+-    mcp_client: McpClient, func_name: str, uuid_: str, result: Any
+-) -> None:
+-    mcp_client.add_message(
+-        HumanMessage(
+-            content=[
+-                {
+-                    "type": "text",
+-                    "text": f"This is the artefact for the '{func_name}' tool with UUID:={uuid_}.",
+-                },
+-                result,
+-            ]
++        message_queue = getattr(self, "_message_queue", None)
++        queue_empty = message_queue.empty if message_queue is not None else (lambda: True)
++        visible_tool_details = getattr(self, "_visible_tool_details", [])
++        visible_tool_names = [
++            str(tool.get("name"))
++            for tool in visible_tool_details
++            if isinstance(tool, dict) and tool.get("name")
++        ]
++        result = process_native_turn(
++            state_graph=state_graph,
++            message=message,
++            policy=self._runtime_policy(),
++            speech_gate=self._speech_gate,
++            task_state=self._task_state,
++            context_manager=self._get_context_manager(),
++            history=self._history,
++            agent_io=self._get_agent_io(),
++            runtime_state=self._native_runtime_state(),
++            queue_empty=queue_empty,
++            tool_names=visible_tool_names,
++            turn_id=self._next_turn_id(),
++            tool_details=visible_tool_details,
++            model_name=self.config.model,
++            logger=logger,
++            runtime_state_update=self._apply_native_runtime_state,
++            runtime_state_snapshot=self._native_runtime_state,
++            enqueue_message=message_queue.put if message_queue is not None else None,
++            terminal_task_preempt=self._preempt_task_terminal_movement_authority,
++            max_auto_followups_per_task=self.config.g.agent_auto_followup_max_attempts,
++            max_navigation_status_followups_per_task=(
++                self.config.g.agent_navigation_auto_followup_max_attempts
++            ),
++            trace_emit=emit_trace_event,
+         )
+-    )
++        self._apply_native_runtime_state(result.runtime_state)
+diff --git a/dimos/agents/mcp/mcp_server.py b/dimos/agents/mcp/mcp_server.py
+index 2b792ef..85d9568 100644
+--- a/dimos/agents/mcp/mcp_server.py
++++ b/dimos/agents/mcp/mcp_server.py
+@@ -14,12 +14,14 @@
+ from __future__ import annotations
+ 
+ import asyncio
+-from collections.abc import AsyncGenerator, Callable
++from collections.abc import Callable
+ import concurrent.futures
+ import json
+ import os
++from queue import Empty, Queue
++from threading import Event, Thread
+ import time
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, cast
+ import uuid
+ 
+ from fastapi import FastAPI
+@@ -31,7 +33,59 @@ import uvicorn
+ 
+ from dimos.agents.annotation import skill
+ from dimos.agents.capabilities import CapabilityRegistry
++from dimos.agents.harness.artifact_ledger import (
++    ArtifactLedger,
++    ImageArtifactReadback,
++    is_valid_artifact_id,
++    resolve_artifact_dir,
++)
++from dimos.agents.harness.display_content import redact_display_content
++from dimos.agents.harness.image_blocks import (
++    image_block_data_url,
++    image_block_mime_type,
++    is_image_block,
++)
++from dimos.agents.harness.movement_authority import (
++    MovementAuthorityRequest,
++    consume_movement_authority_token,
++    movement_authority_refusal_message,
++    movement_authority_request_from_meta,
++)
++from dimos.agents.harness.movement_lease import (
++    MovementLease,
++    MovementLeaseManager,
++    MovementLeaseTicket,
++    estimate_movement_cost,
++)
++from dimos.agents.harness.runtime_status import build_mcp_runtime_status
++from dimos.agents.harness.skill_trace import skill_result_payload
++from dimos.agents.harness.speech_policy import ServerSpeechGate, resolve_speech_gate_limits
++from dimos.agents.harness.tool_execution_trace import (
++    emit_tool_call_refused_trace,
++    emit_tool_call_requested_trace,
++    emit_tool_execution_result_trace,
++    emit_tool_execution_start_trace,
++)
++from dimos.agents.harness.tool_status_context import build_tool_status_context
++from dimos.agents.harness.trace import emit_trace_event
++from dimos.agents.harness.user_stop import (
++    AuthorityPreemptionIntent,
++    AuthorityPreemptionReason,
++    movement_authority_preemption_intent,
++)
+ from dimos.agents.mcp import tool_stream
++from dimos.agents.mcp.streamable_http import StreamableHttpSseHub
++from dimos.agents.runtime_policy import (
++    AgentRuntimePolicy,
++    is_movement_tool,
++    is_stop_tool,
++    is_task_authority_mode,
++    resolve_agent_runtime_policy,
++    tool_exposed_by_policy,
++    tool_exposure_refusal,
++    tool_policy_refusal,
++)
++from dimos.agents.skill_result import SkillResult
+ from dimos.core.core import rpc
+ from dimos.core.module import Module
+ from dimos.core.rpc_client import RpcCall, RPCClient
+@@ -43,13 +97,36 @@ if TYPE_CHECKING:
+ logger = setup_logger()
+ 
+ 
+-_SSE_KEEPALIVE_INTERVAL = 20.0  # seconds
+-
+ # How long a `tools/call` waits for a capability held by a short, self-completing
+ # (instant) skill before refusing. Well under the MCP client's 120s HTTP timeout.
+ # Background holders run until stopped, so they are never waited on (see
+ # `_can_wait` in `_handle_tools_call`).
+ DEFAULT_CAP_ACQUIRE_TIMEOUT = 30.0  # seconds
++MOVEMENT_LEASE_WATCHDOG_INTERVAL = 0.25  # seconds
++MOVEMENT_PREEMPTION_STOP_TIMEOUT_S = 3.0
++PIXELGOAL_MOVEMENT_LEASE_DURATION_S = 210.0
++STATUS_READ_TIMEOUT_S = 3.0
++STATUS_READ_TOOLS = frozenset(
++    {
++        "go2_robot_status",
++        "motion_safety_status",
++        "go2_situation",
++        "last_motion_diagnostics",
++        "robot_protection_status",
++    }
++)
++MOVEMENT_PREEMPTION_TOOLS = (
++    "stop_movement",
++    "stop_navigation",
++    "end_exploration",
++    "stop_patrol",
++    "stop_following",
++)
++MOVEMENT_AUTHORITY_PREEMPTION_REASONS = {
++    "user_stop",
++    "task_completed",
++    "task_blocked",
++}
+ 
+ app = FastAPI()
+ app.add_middleware(
+@@ -61,10 +138,14 @@ app.add_middleware(
+ app.state.skills = []
+ app.state.skills_by_name = {}
+ app.state.rpc_calls = {}
+-app.state.sse_queues = []
+-app.state.event_loop = None
++app.state.status_read_cache = {}
++app.state.sse_hub = StreamableHttpSseHub()
+ app.state.cap_registry = CapabilityRegistry()
+ app.state.cap_acquire_timeout = DEFAULT_CAP_ACQUIRE_TIMEOUT
++app.state.runtime_config = None
++app.state.disabled_modules = ()
++app.state.movement_leases = MovementLeaseManager()
++app.state.speech_gate = ServerSpeechGate()
+ 
+ 
+ def _jsonrpc_result(req_id: Any, result: Any) -> dict[str, Any]:
+@@ -79,6 +160,138 @@ def _jsonrpc_error(req_id: Any, code: int, message: str) -> dict[str, Any]:
+     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+ 
+ 
++def _content_blocks_from_result(result: Any) -> list[dict[str, Any]] | None:
++    """Convert rich skill results into MCP content blocks without stringifying."""
++
++    if hasattr(result, "agent_encode"):
++        encoded = result.agent_encode()
++        if _is_mcp_content_blocks(encoded):
++            return _normalize_mcp_content_blocks(encoded)
++        return [{"type": "text", "text": str(encoded)}]
++    if _is_mcp_content_blocks(result):
++        return _normalize_mcp_content_blocks(result)
++    return None
++
++
++def _is_mcp_content_blocks(value: Any) -> bool:
++    return (
++        isinstance(value, list)
++        and bool(value)
++        and all(isinstance(item, dict) and "type" in item for item in value)
++    )
++
++
++def _normalize_mcp_content_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Normalize provider image blocks into MCP image content blocks.
++
++    Native DimOS and LangChain paths use provider-specific image shapes such as
++    OpenAI ``image_url`` or Responses ``input_image``. External MCP clients such
++    as Codex expect MCP image content: ``{"type": "image", "data": "...",
++    "mimeType": "..."}``. Keep that impedance match at the MCP boundary.
++    """
++
++    normalized: list[dict[str, Any]] = []
++    for block in blocks:
++        if not is_image_block(block):
++            normalized.append(block)
++            continue
++        normalized.append(_to_mcp_image_content_block(block) or block)
++    return normalized
++
++
++def _to_mcp_image_content_block(block: dict[str, Any]) -> dict[str, Any] | None:
++    data_url = image_block_data_url(block)
++    if data_url is None or ";base64," not in data_url:
++        return None
++    data = data_url.split(";base64,", 1)[1]
++    mime_type = image_block_mime_type(block) or "image/jpeg"
++    return {
++        "type": "image",
++        "data": data,
++        "mimeType": mime_type,
++    }
++
++
++def _read_image_artifact(
++    artifact_id: str, runtime_config: Any | None
++) -> ImageArtifactReadback | SkillResult[str]:
++    """Read a persisted image artifact for MCP/native harness clients."""
++
++    artifact_id = str(artifact_id or "").strip()
++    if not is_valid_artifact_id(artifact_id):
++        return SkillResult.fail(
++            "INVALID_INPUT",
++            "Invalid artifact id. Expected an id like artifact_000001.",
++            artifact_id=artifact_id,
++        )
++
++    artifact_dir = resolve_artifact_dir(runtime_config=runtime_config)
++    if artifact_dir is None:
++        return SkillResult.fail(
++            "NOT_CONFIGURED",
++            "No artifact directory is configured for this DimOS run.",
++            artifact_id=artifact_id,
++        )
++
++    ledger = ArtifactLedger(artifact_dir=artifact_dir)
++    ref = ledger.get_ref(artifact_id)
++    block = ledger.get_block(artifact_id)
++    if ref is None or block is None:
++        return SkillResult.fail(
++            "NOT_FOUND",
++            f"Artifact '{artifact_id}' was not found in {artifact_dir}.",
++            artifact_id=artifact_id,
++            artifact_dir=str(artifact_dir),
++        )
++    if not is_image_block(block):
++        return SkillResult.fail(
++            "NOT_IMAGE",
++            f"Artifact '{artifact_id}' is not an image artifact.",
++            artifact_id=artifact_id,
++            artifact_dir=str(artifact_dir),
++            kind=ref.kind,
++        )
++    return ImageArtifactReadback(ref=ref, block=block)
++
++
++def _class_skill_infos(module_name: str, module_class: type[Any]) -> list[SkillInfo]:
++    """Build skill schemas from a module class without calling a live module."""
++
++    from langchain_core.tools.base import create_schema_from_function
++
++    from dimos.core.module import SkillInfo
++
++    skills: list[SkillInfo] = []
++    for name in dir(module_class):
++        attr = getattr(module_class, name)
++        if not callable(attr) or not hasattr(attr, "__skill__"):
++            continue
++        schema_model = create_schema_from_function(
++            name,
++            attr,
++            filter_args=("self",),
++            parse_docstring=False,
++            error_on_invalid_docstring=False,
++        )
++        schema = json.dumps(schema_model.model_json_schema())
++        uses = tuple(getattr(attr, "__skill_uses__", ()) or ())
++        lifecycle = getattr(attr, "__skill_lifecycle__", "instant")
++        required_modules = tuple(
++            str(name) for name in (getattr(attr, "__skill_requires_modules__", ()) or ())
++        )
++        skills.append(
++            SkillInfo(
++                class_name=module_name,
++                func_name=name,
++                args_schema=schema,
++                uses=uses,
++                lifecycle=lifecycle,
++                required_modules=required_modules,
++            )
++        )
++    return skills
++
++
+ def _handle_initialize(req_id: Any) -> dict[str, Any]:
+     return _jsonrpc_result(
+         req_id,
+@@ -92,8 +305,19 @@ def _handle_initialize(req_id: Any) -> dict[str, Any]:
+ 
+ def _handle_tools_list(req_id: Any, skills: list[SkillInfo]) -> dict[str, Any]:
+     tools = []
++    policy = resolve_agent_runtime_policy(app.state.runtime_config)
++    disabled_modules = tuple(getattr(app.state, "disabled_modules", ()) or ())
+ 
+     for s in skills:
++        uses = list(s.uses)
++        if not tool_exposed_by_policy(
++            s.func_name,
++            uses,
++            policy=policy,
++            required_modules=s.required_modules,
++            disabled_modules=disabled_modules,
++        ):
++            continue
+         schema = json.loads(s.args_schema)
+         description = schema.pop("description", None)
+         schema.pop("title", None)
+@@ -104,12 +328,50 @@ def _handle_tools_list(req_id: Any, skills: list[SkillInfo]) -> dict[str, Any]:
+             tool["_meta"] = {
+                 "dimos/uses": list(s.uses),
+                 "dimos/lifecycle": s.lifecycle,
++                "dimos/tool_scope": policy.tool_scope,
+             }
++        if s.required_modules:
++            meta = dict(tool.get("_meta") or {})
++            meta["dimos/requires_modules"] = list(s.required_modules)
++            tool["_meta"] = meta
+         tools.append(tool)
+ 
+     return _jsonrpc_result(req_id, {"tools": tools})
+ 
+ 
++def _handle_preempt_movement_authority(
++    req_id: Any,
++    params: dict[str, Any],
++) -> dict[str, Any]:
++    """Handle an internal request to close server-side movement authority."""
++
++    preempted_by = str(params.get("preempted_by") or "").strip()
++    if preempted_by not in MOVEMENT_AUTHORITY_PREEMPTION_REASONS:
++        return _jsonrpc_error(
++            req_id,
++            -32602,
++            "Invalid preempted_by. Expected user_stop, task_completed, or task_blocked.",
++        )
++
++    client_ids = _preemption_client_ids_from_params(
++        params,
++        preempted_by=cast("AuthorityPreemptionReason", preempted_by),
++    )
++    preempted = _preempt_movement_authority_for_clients(
++        client_ids,
++        preempted_by=preempted_by,
++    )
++    return _jsonrpc_result(
++        req_id,
++        {
++            "preempted_by": preempted_by,
++            "client_ids": client_ids,
++            "preempted_count": len(preempted),
++            "preempted": [_movement_lease_summary(lease) for lease in preempted],
++        },
++    )
++
++
+ async def _handle_tools_call(
+     req_id: Any, params: dict[str, Any], rpc_calls: dict[str, Any]
+ ) -> dict[str, Any]:
+@@ -117,16 +379,176 @@ async def _handle_tools_call(
+     args: dict[str, Any] = params.get("arguments") or {}
+     meta = params.get("_meta") or {}
+     progress_token = meta.get("progressToken")
++    invocation_id = uuid.uuid4().hex
++    client_id = _movement_lease_client_id(meta)
+ 
+     rpc_call = rpc_calls.get(name)
+     if rpc_call is None:
++        emit_tool_call_requested_trace(
++            logger,
++            invocation_id=invocation_id,
++            tool_name=name,
++            arguments=args,
++            client_id=client_id,
++            request_id=req_id,
++            progress_token=progress_token,
++            found=False,
++            trace_emit=emit_trace_event,
++        )
++        emit_tool_call_refused_trace(
++            logger,
++            invocation_id=invocation_id,
++            tool_name=name,
++            client_id=client_id,
++            request_id=req_id,
++            refusal_source="not_found",
++            reason=f"Tool not found: {name}",
++            trace_emit=emit_trace_event,
++        )
+         logger.warning("MCP tool not found", tool=name)
+         return _jsonrpc_result_text(req_id, f"Tool not found: {name}")
+ 
+     skill_info = app.state.skills_by_name.get(name)
+     uses: list[str] = list(skill_info.uses) if skill_info is not None else []
+     lifecycle = skill_info.lifecycle if skill_info is not None else "instant"
++    emit_tool_call_requested_trace(
++        logger,
++        invocation_id=invocation_id,
++        tool_name=name,
++        arguments=args,
++        client_id=client_id,
++        request_id=req_id,
++        progress_token=progress_token,
++        uses=uses,
++        lifecycle=lifecycle,
++        found=True,
++        trace_emit=emit_trace_event,
++    )
+     cap_registry: CapabilityRegistry = app.state.cap_registry
++    policy = resolve_agent_runtime_policy(app.state.runtime_config)
++    required_modules = tuple(skill_info.required_modules) if skill_info is not None else ()
++    exposure_refusal = None
++    if required_modules:
++        exposure_refusal = tool_exposure_refusal(
++            name,
++            uses,
++            policy=policy,
++            required_modules=required_modules,
++            disabled_modules=tuple(getattr(app.state, "disabled_modules", ()) or ()),
++        )
++    if exposure_refusal is not None:
++        reason = f"Tool not available: {exposure_refusal}"
++        emit_trace_event(
++            logger,
++            "tool_policy_decision",
++            tool_name=name,
++            uses=uses,
++            lifecycle=lifecycle,
++            policy=policy.model_dump(),
++            client_id=client_id,
++            allowed=False,
++            reason=reason,
++        )
++        emit_tool_call_refused_trace(
++            logger,
++            invocation_id=invocation_id,
++            tool_name=name,
++            client_id=client_id,
++            request_id=req_id,
++            refusal_source="tool_exposure",
++            reason=reason,
++            trace_emit=emit_trace_event,
++        )
++        logger.info("MCP tool refused by exposure policy", tool=name, reason=reason)
++        return _jsonrpc_result_text(req_id, reason)
++
++    confirmation_refusal = _confirm_mode_authorization(name, args, uses, meta, policy)
++    if confirmation_refusal is not None:
++        emit_trace_event(
++            logger,
++            "tool_policy_decision",
++            tool_name=name,
++            uses=uses,
++            lifecycle=lifecycle,
++            policy=policy.model_dump(),
++            client_id=client_id,
++            allowed=False,
++            reason=confirmation_refusal,
++        )
++        emit_tool_call_refused_trace(
++            logger,
++            invocation_id=invocation_id,
++            tool_name=name,
++            client_id=client_id,
++            request_id=req_id,
++            refusal_source="movement_authority",
++            reason=confirmation_refusal,
++            trace_emit=emit_trace_event,
++        )
++        logger.info(
++            "MCP tool refused by movement authority",
++            tool=name,
++            reason=confirmation_refusal,
++        )
++        return _jsonrpc_result_text(req_id, confirmation_refusal)
++
++    refusal = tool_policy_refusal(
++        name,
++        args,
++        uses,
++        policy=policy,
++        confirmed=bool(meta.get("dimos/movement_confirmed")),
++        dangerous_confirmed=(
++            bool(meta["dimos/dangerous_confirmed"]) if "dimos/dangerous_confirmed" in meta else None
++        ),
++    )
++    refusal_source = "runtime_policy"
++    if refusal is None:
++        speech_refusal = _speech_policy_refusal(name, args, meta, policy)
++        if speech_refusal is not None:
++            refusal = speech_refusal
++            refusal_source = "speech_policy"
++    emit_trace_event(
++        logger,
++        "tool_policy_decision",
++        tool_name=name,
++        uses=uses,
++        lifecycle=lifecycle,
++        policy=policy.model_dump(),
++        client_id=client_id,
++        allowed=refusal is None,
++        reason=refusal,
++    )
++    if refusal is not None:
++        emit_tool_call_refused_trace(
++            logger,
++            invocation_id=invocation_id,
++            tool_name=name,
++            client_id=client_id,
++            request_id=req_id,
++            refusal_source=refusal_source,
++            reason=refusal,
++            trace_emit=emit_trace_event,
++        )
++        logger.info("MCP tool refused by policy", tool=name, source=refusal_source, reason=refusal)
++        return _jsonrpc_result_text(req_id, refusal)
++
++    movement_ticket: MovementLeaseTicket | None = None
++    if is_task_authority_mode(policy.movement_mode) and not policy.tool_policy_admin_override:
++        lease_refusal, movement_ticket = _movement_lease_authorization(name, args, uses, meta)
++        if lease_refusal is not None:
++            emit_tool_call_refused_trace(
++                logger,
++                invocation_id=invocation_id,
++                tool_name=name,
++                client_id=client_id,
++                request_id=req_id,
++                refusal_source="movement_lease",
++                reason=lease_refusal,
++                trace_emit=emit_trace_event,
++            )
++            logger.info("MCP tool refused by movement lease", tool=name, reason=lease_refusal)
++            return _jsonrpc_result_text(req_id, lease_refusal)
+ 
+     # A per-invocation token scopes the capability hold, so a stale invocation's
+     # teardown can't release a hold that a newer same-tool invocation took over.
+@@ -169,21 +591,89 @@ async def _handle_tools_call(
+                 advice = "Call the appropriate stop tool first, then retry."
+             else:
+                 advice = "It is taking longer than expected; wait a moment and then retry."
++            reason = f"Cannot start '{name}': capability '{cap}' is held by '{holder}'. {advice}"
++            if movement_ticket is not None:
++                app.state.movement_leases.refund_authorization(
++                    movement_ticket,
++                    reason="capability_busy",
++                )
++            emit_tool_call_refused_trace(
++                logger,
++                invocation_id=invocation_id,
++                tool_name=name,
++                client_id=client_id,
++                request_id=req_id,
++                refusal_source="capability_busy",
++                reason=reason,
++                trace_emit=emit_trace_event,
++            )
+             return _jsonrpc_result_text(
+                 req_id,
+-                f"Cannot start '{name}': capability '{cap}' is held by '{holder}'. {advice}",
++                reason,
++            )
++
++    if movement_ticket is not None:
++        lease_refusal = _movement_lease_execution_refusal(name, movement_ticket)
++        if lease_refusal is not None:
++            if uses:
++                cap_registry.release_by_token(acquire_token)
++            logger.info(
++                "MCP tool refused by stale movement lease ticket",
++                tool=name,
++                ticket=movement_ticket.model_dump(),
++                reason=lease_refusal,
+             )
++            emit_tool_call_refused_trace(
++                logger,
++                invocation_id=invocation_id,
++                tool_name=name,
++                client_id=client_id,
++                request_id=req_id,
++                refusal_source="stale_movement_ticket",
++                reason=lease_refusal,
++                trace_emit=emit_trace_event,
++            )
++            return _jsonrpc_result_text(req_id, lease_refusal)
+ 
+-    logger.info("MCP tool call", tool=name, args=args, progress_token=progress_token)
++    logger.info(
++        "MCP tool call",
++        tool=name,
++        args=redact_display_content(args),
++        progress_token=progress_token,
++    )
+     t0 = time.monotonic()
++    emit_tool_execution_start_trace(
++        logger,
++        invocation_id=invocation_id,
++        tool_name=name,
++        client_id=client_id,
++        uses=uses,
++        lifecycle=lifecycle,
++        progress_token=progress_token,
++        movement_ticket=movement_ticket,
++        trace_emit=emit_trace_event,
++    )
+ 
+     # _mcp_context is a reserved kwarg consumed by the `@skill` wrapper; it never
+     # reaches the user-visible skill signature. The acquire token rides along so
+     # a background skill's ToolStream can stamp it on its stop frame for release.
+     call_kwargs = dict(args)
++    movement_lease = app.state.movement_leases.active(client_id)
+     mcp_context: dict[str, Any] = {}
++    if lifecycle == "background" or uses:
++        mcp_context["tool_status_context"] = build_tool_status_context(
++            policy=policy,
++            client_id=client_id,
++            request_meta=meta,
++            runtime_config=app.state.runtime_config,
++            movement_ticket=movement_ticket,
++            movement_lease=movement_lease,
++        )
+     if progress_token is not None:
+         mcp_context["progress_token"] = progress_token
++    task_context = _task_context_from_meta(meta)
++    if task_context is not None:
++        mcp_context["task"] = task_context
+     if uses:
+         mcp_context["acquire_token"] = acquire_token
+     if mcp_context:
+@@ -196,9 +686,21 @@ async def _handle_tools_call(
+     try:
+         try:
+             result = await asyncio.get_event_loop().run_in_executor(
+-                None, lambda: rpc_call(**call_kwargs)
++                None, lambda: _call_tool_rpc(name, rpc_call, call_kwargs)
+             )
+         except Exception as e:
++            duration_ms = (time.monotonic() - t0) * 1000.0
++            emit_tool_execution_result_trace(
++                logger,
++                invocation_id=invocation_id,
++                tool_name=name,
++                client_id=client_id,
++                success=False,
++                duration_ms=duration_ms,
++                error=f"{e.__class__.__name__}: {e}",
++                movement_ticket=movement_ticket,
++                trace_emit=emit_trace_event,
++            )
+             logger.exception("MCP tool error", tool=name, duration=f"{time.monotonic() - t0:.3f}s")
+             return _jsonrpc_result_text(req_id, f"Error running tool '{name}': {e}")
+ 
+@@ -212,10 +714,34 @@ async def _handle_tools_call(
+     duration = f"{time.monotonic() - t0:.3f}s"
+     response = str(result)[:200]
+ 
+-    if hasattr(result, "agent_encode"):
++    content_blocks = _content_blocks_from_result(result)
++    if content_blocks is not None:
++        emit_tool_execution_result_trace(
++            logger,
++            invocation_id=invocation_id,
++            tool_name=name,
++            client_id=client_id,
++            success=True,
++            duration_ms=(time.monotonic() - t0) * 1000.0,
++            result=result,
++            content_blocks=content_blocks,
++            movement_ticket=movement_ticket,
++            trace_emit=emit_trace_event,
++        )
+         logger.info("MCP tool done", tool=name, duration=duration, response=response)
+-        return _jsonrpc_result(req_id, {"content": result.agent_encode()})
+-
++        return _jsonrpc_result(req_id, {"content": content_blocks})
++
++    emit_tool_execution_result_trace(
++        logger,
++        invocation_id=invocation_id,
++        tool_name=name,
++        client_id=client_id,
++        success=True,
++        duration_ms=(time.monotonic() - t0) * 1000.0,
++        result=result,
++        movement_ticket=movement_ticket,
++        trace_emit=emit_trace_event,
++    )
+     logger.info("MCP tool done", tool=name, duration=duration, response=response)
+     return _jsonrpc_result_text(req_id, str(result))
+ 
+@@ -244,9 +770,32 @@ async def handle_request(
+         return _handle_tools_list(req_id, skills)
+     if method == "tools/call":
+         return await _handle_tools_call(req_id, params, rpc_calls)
++    if method == "dimos/preempt_movement_authority":
++        return _handle_preempt_movement_authority(req_id, params)
+     return _jsonrpc_error(req_id, -32601, f"Unknown: {method}")
+ 
+ 
++def _speech_policy_refusal(
++    tool_name: str,
++    args: dict[str, Any],
++    meta: dict[str, Any],
++    policy: AgentRuntimePolicy,
++) -> str | None:
++    """Apply server-side speech dedupe/rate/on-request policy for all clients."""
++
++    if tool_name != "speak" or policy.tool_policy_admin_override:
++        return None
++    gate: ServerSpeechGate = app.state.speech_gate
++    limits = resolve_speech_gate_limits(app.state.runtime_config)
++    return gate.refusal_for_call(
++        args,
++        policy=policy,
++        meta=meta,
++        rate_limit_s=limits.rate_limit_s,
++        dedupe_window_s=limits.dedupe_window_s,
++    )
++
++
+ @app.post("/mcp")
+ async def mcp_endpoint(request: Request) -> Response:
+     raw = await request.body()
+@@ -266,11 +815,6 @@ async def mcp_endpoint(request: Request) -> Response:
+     return JSONResponse(result)
+ 
+ 
+-def _sse_frame(data: dict[str, Any]) -> str:
+-    """Format a JSON-RPC message as an SSE ``event: message`` frame."""
+-    return f"event: message\ndata: {json.dumps(data)}\n\n"
+-
+-
+ def _fan_out_to_sse_queues(msg: dict[str, Any]) -> None:
+     """LCM subscriber callback: forward a tool-stream frame to every active SSE client.
+ 
+@@ -289,14 +833,536 @@ def _fan_out_to_sse_queues(msg: dict[str, Any]) -> None:
+                     token=token,
+                     released=released,
+                 )
+-    loop = app.state.event_loop
+-    if loop is None:
+-        return
+-    for queue in list(app.state.sse_queues):
++    app.state.sse_hub.fan_out(msg)
++
++
++def _confirm_mode_authorization(
++    tool_name: str,
++    args: dict[str, Any],
++    uses: list[str],
++    meta: dict[str, Any],
++    policy: AgentRuntimePolicy,
++) -> str | None:
++    """Validate one-shot movement confirmation in per-tool confirm mode."""
++
++    if (
++        policy.tool_policy_admin_override
++        or policy.movement_mode != "confirm"
++        or is_stop_tool(tool_name)
++        or not is_movement_tool(tool_name, uses)
++        or not bool(meta.get("dimos/movement_confirmed"))
++    ):
++        return None
++
++    request = movement_authority_request_from_meta(
++        meta,
++        client_id=_movement_lease_client_id(meta),
++        fallback_task=f"{tool_name}({args})",
++    )
++    return _consume_movement_grant_token(
++        tool_name=tool_name,
++        args=args,
++        request=request,
++        event_name="movement_authority_refused",
++    )
++
++
++def _consume_movement_grant_token(
++    *,
++    tool_name: str,
++    args: dict[str, Any],
++    request: MovementAuthorityRequest,
++    event_name: str,
++) -> str | None:
++    leases: MovementLeaseManager = app.state.movement_leases
++    check = consume_movement_authority_token(leases, request)
++    if check.allowed:
++        return None
++
++    reason = check.reason or "Movement authority token was refused."
++    emit_trace_event(
++        logger,
++        event_name,
++        client_id=request.client_id,
++        tool_name=tool_name,
++        reason=reason,
++        cost=estimate_movement_cost(tool_name, args).model_dump(),
++        grant_token_present=check.token_present,
++        replayed_grant_token=check.replayed_token,
++        agent_metadata=request.agent_metadata,
++        external_harness_metadata=request.external_harness_metadata,
++    )
++    return movement_authority_refusal_message(tool_name, reason)
++
++
++def _movement_lease_authorization(
++    tool_name: str,
++    args: dict[str, Any],
++    uses: list[str],
++    meta: dict[str, Any],
++) -> tuple[str | None, MovementLeaseTicket | None]:
++    if is_stop_tool(tool_name) or not is_movement_tool(tool_name, uses):
++        return None, None
++
++    client_id = _movement_lease_client_id(meta)
++    leases: MovementLeaseManager = app.state.movement_leases
++    grant_request = movement_authority_request_from_meta(
++        meta,
++        client_id=client_id,
++        fallback_task=f"{tool_name}({args})",
++    )
++    if grant_request.confirmed:
++        token_refusal = _consume_movement_grant_token(
++            tool_name=tool_name,
++            args=args,
++            request=grant_request,
++            event_name="movement_lease_refused",
++        )
++        if token_refusal is not None:
++            return token_refusal, None
++
++        expired_lease = leases.preempt_expired(client_id)
++        if expired_lease is not None:
++            _preempt_movement_lease(expired_lease, preempted_by="authority_expired")
++
++        lease = leases.grant(
++            client_id=client_id,
++            task=grant_request.task,
++            max_duration_s=(
++                PIXELGOAL_MOVEMENT_LEASE_DURATION_S if tool_name == "pixelgoal_navigate" else 60.0
++            ),
++        )
++        emit_trace_event(
++            logger,
++            "movement_lease_created",
++            client_id=client_id,
++            lease_id=lease.lease_id,
++            epoch=lease.epoch,
++            task=lease.task,
++            remaining=lease.remaining(),
++            grant_token_present=grant_request.token_present,
++        )
++        logger.info(
++            "Movement lease granted",
++            client_id=client_id,
++            lease_id=lease.lease_id,
++            epoch=lease.epoch,
++            task=lease.task,
++        )
++
++    authorization = leases.consume_authorization(
++        client_id=client_id,
++        tool_name=tool_name,
++        args=args,
++    )
++    allowed = authorization.allowed
++    reason = authorization.reason
++    lease = authorization.lease
++    cost = authorization.cost
++    if allowed:
++        assert lease is not None and authorization.ticket is not None
++        emit_trace_event(
++            logger,
++            "movement_lease_consumed",
++            client_id=client_id,
++            lease_id=lease.lease_id,
++            epoch=lease.epoch,
++            tool_name=tool_name,
++            cost=cost.model_dump(),
++            remaining=lease.remaining(),
++            ticket=authorization.ticket.model_dump(),
++        )
++        logger.info(
++            "Movement lease consumed",
++            client_id=client_id,
++            lease_id=lease.lease_id,
++            epoch=lease.epoch,
++            tool=tool_name,
++            cost=cost.model_dump(),
++            remaining=lease.remaining(),
++        )
++        return None, authorization.ticket
++
++    if lease is None:
++        emit_trace_event(
++            logger,
++            "movement_lease_refused",
++            client_id=client_id,
++            tool_name=tool_name,
++            reason="No active movement lease.",
++            cost=cost.model_dump(),
++        )
++        return (
++            f"Runtime movement policy is lease. Tool '{tool_name}' was not executed "
++            "because there is no active movement lease. Ask the user to confirm a "
++            "bounded movement task, then retry."
++        ), None
++    emit_trace_event(
++        logger,
++        "movement_lease_refused",
++        client_id=client_id,
++        lease_id=lease.lease_id,
++        epoch=lease.epoch,
++        tool_name=tool_name,
++        reason=reason,
++        cost=cost.model_dump(),
++        remaining=lease.remaining(),
++    )
++    return (
++        f"Runtime movement policy is lease. Tool '{tool_name}' was not executed: "
++        f"{reason} Remaining budget: {lease.remaining()}."
++    ), None
++
++
++def _movement_lease_execution_refusal(
++    tool_name: str,
++    ticket: MovementLeaseTicket,
++) -> str | None:
++    leases: MovementLeaseManager = app.state.movement_leases
++    allowed, reason, lease = leases.validate_ticket(ticket)
++    if allowed:
++        return None
++
++    emit_trace_event(
++        logger,
++        "movement_lease_refused",
++        client_id=ticket.client_id,
++        lease_id=ticket.lease_id,
++        epoch=ticket.epoch,
++        tool_name=tool_name,
++        reason=reason,
++        cost=ticket.cost.model_dump(),
++        ticket=ticket.model_dump(),
++        active_lease=lease.model_dump() if lease is not None else None,
++        preempted=True,
++    )
++    return (
++        f"Runtime movement policy is lease. Tool '{tool_name}' was not executed: "
++        f"{reason or 'Movement lease was preempted before execution.'} "
++        "Renew the bounded movement task before retrying."
++    )
++
++
++def _call_tool_rpc(tool_name: str, rpc_call: Any, call_kwargs: dict[str, Any]) -> Any:
++    if tool_name not in STATUS_READ_TOOLS:
++        return rpc_call(**call_kwargs)
++
++    try:
++        result = _call_rpc_with_timeout(
++            rpc_call,
++            timeout_s=STATUS_READ_TIMEOUT_S,
++            call_kwargs=call_kwargs,
++            thread_name=f"McpServer-status-{tool_name}",
++            timeout_message=f"Status tool '{tool_name}' timed out after {STATUS_READ_TIMEOUT_S:.1f}s",
++        )
++    except TimeoutError as e:
++        return _status_read_timeout_result(tool_name, e)
++    _remember_status_read_result(tool_name, result)
++    return result
++
++
++def _task_context_from_meta(meta: dict[str, Any]) -> dict[str, Any] | None:
++    task_id = meta.get("dimos/task_id")
++    task_goal = meta.get("dimos/task_goal")
++    if task_id is None and task_goal is not None:
++        client_id = meta.get("dimos/client_id") or "external"
++        task_id = (
++            f"external_{_compact_meta_token(str(client_id))}_"
++            f"{_compact_meta_token(str(task_goal))}"
++        )
++    if task_id is None:
++        return None
++    context: dict[str, Any] = {"task_id": str(task_id)}
++    for meta_key, context_key in (
++        ("dimos/task_goal", "task_goal"),
++        ("dimos/task_origin", "task_origin"),
++    ):
++        value = meta.get(meta_key)
++        if value is not None:
++            context[context_key] = str(value)
++    return context
++
++
++def _compact_meta_token(value: str) -> str:
++    token = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in value.strip())
++    return token[:48] or "task"
++
++
++def _remember_status_read_result(tool_name: str, result: Any) -> None:
++    cache: dict[str, tuple[float, Any]] = app.state.status_read_cache
++    cache[tool_name] = (time.monotonic(), result)
++
++
++def _status_read_timeout_result(tool_name: str, error: TimeoutError) -> SkillResult[str]:
++    metadata: dict[str, Any] = {
++        "tool_name": tool_name,
++        "timed_out": True,
++        "timeout_s": STATUS_READ_TIMEOUT_S,
++        "error": str(error),
++    }
++    cache: dict[str, tuple[float, Any]] = app.state.status_read_cache
++    cached = cache.get(tool_name)
++    if cached is not None:
++        cached_at, cached_result = cached
++        cache_age_s = round(time.monotonic() - cached_at, 1)
++        metadata["cache_age_s"] = cache_age_s
++        metadata["cached_result"] = _status_cached_result_payload(cached_result)
++        message = (
++            f"Status tool '{tool_name}' timed out after {STATUS_READ_TIMEOUT_S:.1f}s; "
++            f"returning cached result age={cache_age_s:.1f}s."
++        )
++    else:
++        metadata["cache_age_s"] = None
++        metadata["partial_result"] = {"tool_name": tool_name, "status": "timeout"}
++        message = (
++            f"Status tool '{tool_name}' timed out after {STATUS_READ_TIMEOUT_S:.1f}s; "
++            "no cached result is available."
++        )
++    return SkillResult.fail("EXECUTION_TIMEOUT", message, **metadata)
++
++
++def _status_cached_result_payload(result: Any) -> dict[str, Any]:
++    if isinstance(result, SkillResult):
++        payload: dict[str, Any] = {
++            "kind": "SkillResult",
++            "success": result.success,
++            "message": result.message,
++            "error_code": result.error_code,
++        }
++        if result.metadata:
++            payload["metadata"] = result.metadata
++        return payload
++    return {"kind": result.__class__.__name__, "text": str(result)[:2000]}
++
++
++def _movement_lease_client_id(meta: dict[str, Any]) -> str:
++    client_id = meta.get("dimos/client_id")
++    if client_id:
++        return str(client_id)
++    if meta.get("dimos/agent"):
++        return "dimos-agent"
++    return "default"
++
++
++def _movement_lease_watchdog_loop(stop_event: Event) -> None:
++    while not stop_event.wait(MOVEMENT_LEASE_WATCHDOG_INTERVAL):
++        expired = app.state.movement_leases.pop_expired()
++        for lease in expired:
++            _preempt_expired_movement_lease(lease)
++
++
++def _preempt_expired_movement_lease(lease: MovementLease) -> None:
++    """Issue stop tools from a watchdog thread when a movement lease expires."""
++
++    _preempt_movement_lease(lease, preempted_by="authority_expired")
++
++
++def _preempt_movement_lease(lease: MovementLease, *, preempted_by: str) -> None:
++    """Issue stop tools from outside the LLM turn loop for a preempted lease."""
++
++    started_at = time.monotonic()
++    attempted: list[str] = []
++    succeeded: list[str] = []
++    errors: dict[str, str] = {}
++    stop_results: list[dict[str, Any]] = []
++    for tool_name in MOVEMENT_PREEMPTION_TOOLS:
++        rpc_call = app.state.rpc_calls.get(tool_name)
++        if rpc_call is None:
++            continue
++        attempted.append(tool_name)
++        tool_started_at = time.monotonic()
+         try:
+-            asyncio.run_coroutine_threadsafe(queue.put(msg), loop)
+-        except RuntimeError:
+-            pass
++            result = _call_preemption_stop_tool(
++                rpc_call,
++                tool_name=tool_name,
++                timeout_s=MOVEMENT_PREEMPTION_STOP_TIMEOUT_S,
++            )
++            duration_ms = (time.monotonic() - tool_started_at) * 1000.0
++            stop_result = _preemption_stop_result_summary(tool_name, result, duration_ms)
++            stop_results.append(stop_result)
++            if stop_result.get("success") is not False:
++                succeeded.append(tool_name)
++        except TimeoutError as e:
++            duration_ms = (time.monotonic() - tool_started_at) * 1000.0
++            errors[tool_name] = str(e)
++            stop_results.append(
++                {
++                    "tool_name": tool_name,
++                    "success": False,
++                    "error_code": "TIMEOUT",
++                    "message": str(e),
++                    "duration_ms": round(duration_ms, 1),
++                }
++            )
++            logger.warning("Movement preemption stop tool timed out", tool=tool_name, error=str(e))
++        except Exception as e:
++            duration_ms = (time.monotonic() - tool_started_at) * 1000.0
++            errors[tool_name] = str(e)
++            stop_results.append(
++                {
++                    "tool_name": tool_name,
++                    "success": False,
++                    "error_code": "EXCEPTION",
++                    "message": str(e),
++                    "duration_ms": round(duration_ms, 1),
++                }
++            )
++            logger.exception("Movement preemption stop tool failed", tool=tool_name)
++
++    emit_trace_event(
++        logger,
++        "movement_preempted",
++        preempted_by=preempted_by,
++        client_id=lease.client_id,
++        lease_id=lease.lease_id,
++        epoch=lease.epoch,
++        task=lease.task,
++        last_tool_name=lease.last_tool_name,
++        attempted_stop_tools=attempted,
++        succeeded_stop_tools=succeeded,
++        stop_results=stop_results,
++        duration_ms=round((time.monotonic() - started_at) * 1000.0, 1),
++        errors=errors,
++    )
++    if not attempted:
++        logger.warning(
++            "Movement lease expired but no stop tool was available",
++            client_id=lease.client_id,
++            lease_id=lease.lease_id,
++            task=lease.task,
++        )
++
++
++def _preempt_movement_authority_for_clients(
++    client_ids: list[str],
++    *,
++    preempted_by: str,
++) -> list[MovementLease]:
++    """Preempt active movement authority for client ids and issue stop tools."""
++
++    leases: MovementLeaseManager = app.state.movement_leases
++    preempted: list[MovementLease] = []
++    seen: set[str] = set()
++    for client_id in client_ids:
++        if client_id in seen:
++            continue
++        seen.add(client_id)
++        lease = leases.preempt(client_id)
++        if lease is None:
++            continue
++        preempted.append(lease)
++        _preempt_movement_lease(lease, preempted_by=preempted_by)
++    return preempted
++
++
++def _preemption_client_ids_from_params(
++    params: dict[str, Any],
++    *,
++    preempted_by: AuthorityPreemptionReason,
++) -> list[str]:
++    """Return explicit or default client ids for movement-authority preemption."""
++
++    raw_client_ids = params.get("client_ids")
++    if isinstance(raw_client_ids, list):
++        client_ids = [str(client_id).strip() for client_id in raw_client_ids]
++        return [client_id for client_id in client_ids if client_id]
++    return _movement_authority_preemption_client_ids_for_reason(preempted_by)
++
++
++def _movement_authority_preemption_client_ids_for_reason(
++    preempted_by: AuthorityPreemptionReason | None,
++) -> list[str]:
++    """Return movement-authority clients affected by a preemption reason."""
++
++    if preempted_by == "user_stop":
++        leases: MovementLeaseManager = app.state.movement_leases
++        return leases.client_ids()
++    return ["dimos-agent", "default"]
++
++
++def _movement_lease_summary(lease: MovementLease) -> dict[str, Any]:
++    """Return a trace-safe summary of one preempted movement lease."""
++
++    return {
++        "client_id": lease.client_id,
++        "lease_id": lease.lease_id,
++        "epoch": lease.epoch,
++        "task": lease.task,
++        "last_tool_name": lease.last_tool_name,
++    }
++
++
++def _call_preemption_stop_tool(rpc_call: Any, *, tool_name: str, timeout_s: float) -> Any:
++    return _call_rpc_with_timeout(
++        rpc_call,
++        timeout_s=timeout_s,
++        call_kwargs={},
++        thread_name=f"McpServer-preempt-{tool_name}",
++        timeout_message=f"Stop tool '{tool_name}' timed out after {timeout_s:.1f}s",
++    )
++
++
++def _call_rpc_with_timeout(
++    rpc_call: Any,
++    *,
++    timeout_s: float,
++    call_kwargs: dict[str, Any],
++    thread_name: str,
++    timeout_message: str,
++) -> Any:
++    if isinstance(rpc_call, RpcCall):
++        return rpc_call.call_with_timeout(timeout_s, **call_kwargs)
++
++    result_queue: Queue[tuple[bool, Any]] = Queue(maxsize=1)
++
++    def _run() -> None:
++        try:
++            result_queue.put((True, rpc_call(**call_kwargs)))
++        except BaseException as exc:
++            result_queue.put((False, exc))
++
++    Thread(target=_run, name=thread_name, daemon=True).start()
++    try:
++        ok, value = result_queue.get(timeout=timeout_s)
++    except Empty:
++        raise TimeoutError(timeout_message) from None
++    if ok:
++        return value
++    raise value
++
++
++def _movement_authority_preemption_client_ids(intent: AuthorityPreemptionIntent) -> list[str]:
++    """Return movement-authority clients affected by a human task-control intent."""
++
++    return _movement_authority_preemption_client_ids_for_reason(intent.preempted_by)
++
++
++def _agent_send_should_preempt(message: str) -> bool:
++    return _agent_send_preemption_intent(message).should_preempt
++
++
++def _agent_send_preemption_intent(message: str) -> AuthorityPreemptionIntent:
++    return movement_authority_preemption_intent(message)
++
++
++def _preemption_stop_result_summary(
++    tool_name: str,
++    result: Any,
++    duration_ms: float,
++) -> dict[str, Any]:
++    """Summarize one best-effort stop tool call for trace auditing."""
++
++    if isinstance(result, SkillResult):
++        payload = skill_result_payload(tool_name, result)
++        payload["duration_ms"] = round(duration_ms, 1)
++        return payload
++    return {
++        "tool_name": tool_name,
++        "success": True,
++        "error_code": None,
++        "message": str(result)[:200],
++        "duration_ms": round(duration_ms, 1),
++    }
+ 
+ 
+ @app.get("/mcp")
+@@ -308,64 +1374,35 @@ async def mcp_sse_endpoint() -> StreamingResponse:
+     so the subscription is live for the full client session and independent
+     of any particular ``tools/call`` request.
+     """
+-    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+-    # Remember the loop so the LCM subscriber (running on an LCM thread)
+-    # can schedule queue.put via run_coroutine_threadsafe.
+-    app.state.event_loop = asyncio.get_running_loop()
+-    app.state.sse_queues.append(queue)
+-
+-    async def event_generator() -> AsyncGenerator[str, None]:
+-        try:
+-            # Initial comment flushes the response headers and unblocks
+-            # any synchronous client that's waiting on iter_lines().
+-            yield ": connected\n\n"
+-            while True:
+-                try:
+-                    msg = await asyncio.wait_for(queue.get(), timeout=_SSE_KEEPALIVE_INTERVAL)
+-                except asyncio.TimeoutError:
+-                    yield ": keepalive\n\n"
+-                    continue
+-                if msg is None:
+-                    return
+-                yield _sse_frame(msg)
+-        except asyncio.CancelledError:
+-            pass
+-        finally:
+-            try:
+-                app.state.sse_queues.remove(queue)
+-            except ValueError:
+-                pass
+-
+-    return StreamingResponse(
+-        event_generator(),
+-        media_type="text/event-stream",
+-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+-    )
++    return await app.state.sse_hub.response()
+ 
+ 
+ class McpServer(Module):
++    early_system_modules = True
++
+     _uvicorn_server: uvicorn.Server | None = None
+     _serve_future: concurrent.futures.Future[None] | None = None
+     _tool_stream_cleanup: Callable[[], None] | None = None
++    _movement_watchdog_stop: Event | None = None
++    _movement_watchdog_thread: Thread | None = None
+ 
+     @rpc
+     def start(self) -> None:
+         super().start()
++        app.state.runtime_config = self.config.g
++        app.state.movement_leases = MovementLeaseManager()
++        self._start_movement_lease_watchdog()
+         self._start_server()
+         self._tool_stream_cleanup = tool_stream.subscribe(_fan_out_to_sse_queues)
+ 
+     @rpc
+     def stop(self) -> None:
++        self._stop_movement_lease_watchdog()
+         if self._tool_stream_cleanup is not None:
+             self._tool_stream_cleanup()
+             self._tool_stream_cleanup = None
+ 
+-        for queue in list(app.state.sse_queues):
+-            try:
+-                queue.put_nowait(None)
+-            except Exception:
+-                pass
+-        app.state.sse_queues.clear()
++        app.state.sse_hub.close_all()
+ 
+         if self._uvicorn_server:
+             self._uvicorn_server.should_exit = True
+@@ -376,13 +1413,66 @@ class McpServer(Module):
+             self._serve_future = None
+         super().stop()
+ 
++    def _start_movement_lease_watchdog(self) -> None:
++        stop_event = Event()
++        thread = Thread(
++            target=_movement_lease_watchdog_loop,
++            args=(stop_event,),
++            name="McpServer-movement-lease-watchdog",
++            daemon=True,
++        )
++        self._movement_watchdog_stop = stop_event
++        self._movement_watchdog_thread = thread
++        thread.start()
++
++    def _stop_movement_lease_watchdog(self) -> None:
++        if self._movement_watchdog_stop is not None:
++            self._movement_watchdog_stop.set()
++        if self._movement_watchdog_thread is not None:
++            self._movement_watchdog_thread.join(timeout=1.0)
++            if self._movement_watchdog_thread.is_alive():
++                logger.warning("Movement lease watchdog did not stop in time.")
++        self._movement_watchdog_stop = None
++        self._movement_watchdog_thread = None
++
++    @rpc
++    def on_disabled_modules(self, module_names: list[str]) -> None:
++        app.state.disabled_modules = tuple(dict.fromkeys(str(name) for name in module_names))
++
+     @rpc
+     def on_system_modules(self, modules: list[RPCClient]) -> None:
+-        # TODO: this is a bit hacky, also not thread-safe
++        # Do the cross-module RPC discovery off the startup hook. On Jetson the
++        # LCM receive buffer can be small, and holding this lifecycle RPC open
++        # while collecting every module's schema makes startup fragile.
++        Thread(
++            target=self._collect_system_module_skills,
++            args=(list(modules),),
++            daemon=True,
++            name="mcp-skill-collector",
++        ).start()
++
++    def _collect_system_module_skills(self, modules: list[RPCClient]) -> None:
+         assert self.rpc is not None
+-        app.state.skills = [
+-            skill_info for module in modules for skill_info in (module.get_skills() or [])
+-        ]
++        skills: list[SkillInfo] = []
++        for module in modules:
++            module_name = getattr(module, "remote_name", module.__class__.__name__)
++            logger.info("Collecting MCP skills", module=module_name)
++            module_class = (
++                self.__class__
++                if module_name == self.__class__.__name__
++                else getattr(module, "actor_class", None)
++            )
++            if module_class is None:
++                logger.warning("Skipping MCP skills: module class unavailable", module=module_name)
++                continue
++            module_skills = _class_skill_infos(module_name, module_class)
++            logger.info(
++                "Collected MCP skills",
++                module=module_name,
++                n_skills=len(module_skills),
++            )
++            skills.extend(module_skills)
++        app.state.skills = skills
+         app.state.skills_by_name = {s.func_name: s for s in app.state.skills}
+         app.state.rpc_calls = {
+             skill_info.func_name: RpcCall(
+@@ -390,46 +1480,85 @@ class McpServer(Module):
+             )
+             for skill_info in app.state.skills
+         }
++        app.state.status_read_cache = {}
++        logger.info("MCP skill registration complete", n_skills=len(app.state.skills))
+ 
+     @skill
+     def server_status(self) -> str:
+-        """Get MCP server status: main process PID, deployed modules, and skill count."""
++        """Get MCP server status, runtime policy, active authority, and tool scope."""
+         from dimos.core.run_registry import get_most_recent
+ 
+         skills: list[SkillInfo] = app.state.skills
+-        modules = list(dict.fromkeys(s.class_name for s in skills))
+         entry = get_most_recent()
+         pid = entry.pid if entry else os.getpid()
+-        return json.dumps(
+-            {
+-                "pid": pid,
+-                "modules": modules,
+-                "skills": [s.func_name for s in skills],
+-            }
++        policy = resolve_agent_runtime_policy(self.config.g)
++        payload = build_mcp_runtime_status(
++            pid=pid,
++            skills=skills,
++            policy=policy,
++            cap_registry=app.state.cap_registry,
++            movement_leases=app.state.movement_leases,
++            runtime_config=self.config.g,
++            disabled_modules=app.state.disabled_modules,
+         )
++        return json.dumps(payload)
+ 
+     @skill
+     def list_modules(self) -> str:
+         """List deployed modules and their skills."""
+         skills: list[SkillInfo] = app.state.skills
++        policy = resolve_agent_runtime_policy(self.config.g)
++        disabled_modules = tuple(getattr(app.state, "disabled_modules", ()) or ())
+         modules: dict[str, list[str]] = {}
+         for s in skills:
++            if not tool_exposed_by_policy(
++                s.func_name,
++                list(s.uses),
++                policy=policy,
++                required_modules=s.required_modules,
++                disabled_modules=disabled_modules,
++            ):
++                continue
+             modules.setdefault(s.class_name, []).append(s.func_name)
+         return json.dumps({"modules": modules})
+ 
++    @skill
++    def read_image(self, artifact_id: str) -> ImageArtifactReadback | SkillResult[str]:
++        """Read a persisted image artifact and return it as model-visible content.
++
++        Args:
++            artifact_id: Artifact id from an earlier visual tool result, such
++                as ``artifact_000001``.
++        """
++        return _read_image_artifact(artifact_id, self.config.g)
++
+     @skill
+     def agent_send(self, message: str) -> str:
+         """Send a message to the running DimOS agent via LCM."""
+         if not message:
+             raise ValueError("Message cannot be empty")
+ 
++        preempted: list[MovementLease] = []
++        intent = _agent_send_preemption_intent(message)
++        if intent.should_preempt:
++            preempted = _preempt_movement_authority_for_clients(
++                _movement_authority_preemption_client_ids(intent),
++                preempted_by=intent.preempted_by or "user_stop",
++            )
++
+         from dimos.core.transport import pLCMTransport
+ 
+         transport: pLCMTransport[str] = pLCMTransport("/human_input")
+         try:
+             transport.start()
+             transport.publish(message)
+-            return f"Message sent to agent: {message[:100]}"
++            suffix = (
++                f" Preempted {len(preempted)} active movement authorit"
++                f"{'y' if len(preempted) == 1 else 'ies'}."
++                if preempted
++                else ""
++            )
++            return f"Message sent to agent: {message[:100]}{suffix}"
+         finally:
+             transport.stop()
+ 
+diff --git a/dimos/agents/mcp/tool_stream.py b/dimos/agents/mcp/tool_stream.py
+index 403539f..7208cd4 100644
+--- a/dimos/agents/mcp/tool_stream.py
++++ b/dimos/agents/mcp/tool_stream.py
+@@ -38,6 +38,10 @@ from typing import Any
+ import uuid
+ 
+ from dimos.agents.annotation import current_skill_context
++from dimos.agents.harness.tool_status_context import (
++    TOOL_STATUS_CONTEXT_META_KEY,
++    merge_tool_status_context,
++)
+ from dimos.core.transport import pLCMTransport
+ from dimos.utils.logging_config import setup_logger
+ 
+@@ -51,16 +55,24 @@ TOOL_STREAM_STOPPED_METHOD = "dimos/tool_stopped"
+ ToolStreamCallback = Callable[[dict[str, Any]], Any]
+ 
+ 
+-def make_notification(tool_name: str, text: str) -> dict[str, Any]:
++def make_notification(
++    tool_name: str,
++    text: str,
++    *,
++    status_context: dict[str, Any] | None = None,
++) -> dict[str, Any]:
+     """Build an MCP `notifications/message` frame (log-style fallback)."""
++    params: dict[str, Any] = {
++        "level": "info",
++        "logger": tool_name,
++        "data": text,
++    }
++    if status_context is not None:
++        params["_meta"] = {TOOL_STATUS_CONTEXT_META_KEY: status_context}
+     return {
+         "jsonrpc": "2.0",
+         "method": NOTIFICATIONS_MESSAGE_METHOD,
+-        "params": {
+-            "level": "info",
+-            "logger": tool_name,
+-            "data": text,
+-        },
++        "params": params,
+     }
+ 
+ 
+@@ -70,6 +82,7 @@ def make_progress_notification(
+     message: str,
+     tool_name: str | None = None,
+     total: int | None = None,
++    status_context: dict[str, Any] | None = None,
+ ) -> dict[str, Any]:
+     """Build an MCP `notifications/progress` frame bound to `progress_token`."""
+     params: dict[str, Any] = {"progressToken": progress_token, "progress": progress}
+@@ -79,6 +92,9 @@ def make_progress_notification(
+         params["message"] = message
+     if tool_name is not None:
+         params["_meta"] = {"tool_name": tool_name}
++    if status_context is not None:
++        meta = params.setdefault("_meta", {})
++        meta[TOOL_STATUS_CONTEXT_META_KEY] = status_context
+     return {"jsonrpc": "2.0", "method": NOTIFICATIONS_PROGRESS_METHOD, "params": params}
+ 
+ 
+@@ -149,6 +165,10 @@ class ToolStream:
+                 f"detached background thread."
+             )
+         self._progress_token: str | int | None = context.get("progress_token")
++        status_context = context.get("tool_status_context")
++        self._status_context: dict[str, Any] | None = (
++            dict(status_context) if isinstance(status_context, dict) else None
++        )
+         # Capability hold token (set by the MCP server for capability-using
+         # skills); stamped on the stop frame so release is invocation-scoped.
+         self._acquire_token: str | None = context.get("acquire_token")
+@@ -170,8 +190,11 @@ class ToolStream:
+             if self._closed.is_set():
+                 return
+             self._acquire_token = context.get("acquire_token")
++            status_context = context.get("tool_status_context")
++            if isinstance(status_context, dict):
++                self._status_context = dict(status_context)
+ 
+-    def send(self, message: str) -> None:
++    def send(self, message: str, metadata: dict[str, Any] | None = None) -> None:
+         with self._lock:
+             if self._closed.is_set():
+                 logger.warning("send on closed ToolStream", stream_id=self.id)
+@@ -183,12 +206,17 @@ class ToolStream:
+             progress = self._progress
+             transport = self._transport
+             progress_token = self._progress_token
++            status_context = merge_tool_status_context(self._status_context, metadata)
+         if progress_token is not None:
+             frame = make_progress_notification(
+-                progress_token, progress, message, tool_name=self.tool_name
++                progress_token,
++                progress,
++                message,
++                tool_name=self.tool_name,
++                status_context=status_context,
+             )
+         else:
+-            frame = make_notification(self.tool_name, message)
++            frame = make_notification(self.tool_name, message, status_context=status_context)
+         transport.publish(frame)
+ 
+     def stop(self) -> None:
+diff --git a/dimos/agents/skill_result.py b/dimos/agents/skill_result.py
+index c241f51..e38bf5b 100644
+--- a/dimos/agents/skill_result.py
++++ b/dimos/agents/skill_result.py
+@@ -65,6 +65,7 @@ class SkillResult(Generic[E]):
+     error_code: E | None = None
+     duration_ms: float = 0.0
+     metadata: dict[str, Any] = field(default_factory=dict)
++    content_blocks: list[dict[str, Any]] = field(default_factory=list)
+ 
+     def is_success(self) -> bool:
+         return self.success
+@@ -74,8 +75,13 @@ class SkillResult(Generic[E]):
+         return cls(success=True, message=message, metadata=dict(metadata))
+ 
+     @classmethod
+-    def fail(cls, error_code: E, message: str = "") -> SkillResult[E]:
+-        return cls(success=False, error_code=error_code, message=message)
++    def fail(cls, error_code: E, message: str = "", **metadata: Any) -> SkillResult[E]:
++        return cls(
++            success=False,
++            error_code=error_code,
++            message=message,
++            metadata=dict(metadata),
++        )
+ 
+     def agent_encode(self) -> list[dict[str, Any]]:
+         payload: dict[str, Any] = {
+@@ -86,7 +92,7 @@ class SkillResult(Generic[E]):
+         }
+         if self.metadata:
+             payload["metadata"] = self.metadata
+-        return [{"type": "text", "text": json.dumps(payload)}]
++        return [{"type": "text", "text": json.dumps(payload)}] + list(self.content_blocks)
+ 
+     def __str__(self) -> str:
+         if self.success:
+diff --git a/dimos/agents/system_prompt.py b/dimos/agents/system_prompt.py
+index fd4830d..5d46c4f 100644
+--- a/dimos/agents/system_prompt.py
++++ b/dimos/agents/system_prompt.py
+@@ -22,7 +22,10 @@ Prioritize human safety above all else. Respect personal boundaries. Never take
+ You are Daneel. If someone says "daniel" or similar, ignore it (speech-to-text error). When greeted, briefly introduce yourself as an AI agent operating autonomously in physical space.
+ 
+ # COMMUNICATION
+-Users hear you through speakers but cannot see text. Use `speak` to communicate your actions or responses. Be concise—one or two sentences.
++Operator text UI may be visible during supervised harness runs, while some demos
++also provide robot speakers. Follow the runtime speech policy before calling
++`speak`: use concise text by default, and use audible speech only when policy
++allows it or the user explicitly asks for voice.
+ 
+ # SKILL COORDINATION
+ 
+@@ -32,8 +35,22 @@ Some skills hold a shared capability (e.g. `movement`). A call that needs a busy
+ - Otherwise Z is taking longer than usual; wait a moment, then retry.
+ 
+ ## Navigation Flow
+-- Use `navigate_with_text` for most navigation. It searches tagged locations first, then visible objects, then the semantic map.
++- Use explicit navigation tools when the user names the evidence source:
++  - `navigate_to_tag(name)` for saved locations from `tag_location`.
++  - `navigate_to_semantic(query)` for locations already present in spatial memory.
++  - `visual_find(query)` to inspect the current camera frame without moving.
++  - `visual_approach(query)` only when you need to approach a currently visible object.
++  - `return_to_task_start()` to navigate back to the odometry breadcrumb recorded when the current navigation task began.
++- Use `navigate_with_text(query, evidence_source="auto")` only as a compatibility wrapper when the user did not specify tagged, semantic, or visual evidence. If you must use the wrapper for an explicit source, set `evidence_source` to `tagged_location`, `semantic_memory`, or `current_frame` so it cannot silently fall back to the wrong evidence source.
++- After starting navigation, use `navigation_status(request_id)` to check progress before claiming arrival.
++- If movement fails, stalls, or is blocked, call `motion_safety_status()` or
++  `last_motion_diagnostics()` before retrying so you know whether the blocker is
++  policy, planner no-path, local obstacle stop, no odom, or unknown protection.
++- Use `go2_robot_status()` when you need read-only battery, motor, or low-level
++  Unitree status before deciding whether to continue a task.
+ - Tag important locations with `tag_location` so you can return to them later.
++- Use `return_to_task_start()` only after a navigation task has started and
++  odometry was available; if it reports no breadcrumb, do not guess a pose.
+ - Always run `execute_sport_command("RecoveryStand")` after dynamic movements (flips, jumps, sit) before navigating.
+ 
+ ## GPS Navigation Flow
+diff --git a/dimos/agents/utils.py b/dimos/agents/utils.py
+index 5084c65..a92bfce 100644
+--- a/dimos/agents/utils.py
++++ b/dimos/agents/utils.py
+@@ -17,6 +17,7 @@ from typing import Any
+ 
+ from langchain_core.messages.base import BaseMessage
+ 
++from dimos.agents.harness.display_content import content_to_display_text
+ from dimos.utils.logging_config import setup_logger
+ 
+ logger = setup_logger()
+@@ -51,7 +52,7 @@ def pretty_print_langchain_message(msg: BaseMessage) -> None:
+     time_str = f"{GRAY}{timestamp}{RESET}  "
+     type_str = f"{type_color}{msg_type:<{TYPE_WIDTH}}{RESET}"
+ 
+-    content = _try_to_remove_url_data(d.get("content", ""))
++    content = content_to_display_text(d.get("content", ""))
+     tool_calls = d.get("tool_calls", [])
+ 
+     # 12 chars for timestamp + 1 space + TYPE_WIDTH + 1 space
+@@ -67,7 +68,7 @@ def pretty_print_langchain_message(msg: BaseMessage) -> None:
+             print(f"{indent}{text}")
+ 
+     if content:
+-        content_str = repr(content)
++        content_str = content
+         if len(content_str) > 2000:
+             content_str = content_str[:5000] + "... [truncated]"
+         print_line(f"{BOLD}{type_color}{content_str}{RESET}")
+@@ -94,18 +95,3 @@ def _log_message(msg_type: str, content: object, tool_calls: list[dict[str, Any]
+     if tool_calls:
+         kw["tool_calls"] = [{"name": tc.get("name"), "args": tc.get("args")} for tc in tool_calls]
+     logger.info("Agent message", **kw)
+-
+-
+-def _try_to_remove_url_data(content: Any) -> Any:
+-    if not isinstance(content, list):
+-        return content
+-
+-    ret = []
+-
+-    for item in content:
+-        if isinstance(item, dict) and item.get("type") == "image_url":
+-            ret.append({**item, "image_url": "<removed>"})
+-        else:
+-            ret.append(item)
+-
+-    return ret
+diff --git a/dimos/agents/web_human_input.py b/dimos/agents/web_human_input.py
+index 0a4fe7c..e09d6b4 100644
+--- a/dimos/agents/web_human_input.py
++++ b/dimos/agents/web_human_input.py
+@@ -12,12 +12,17 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import os
+ from threading import Thread
+ from typing import TYPE_CHECKING
+ 
+ import reactivex as rx
+ import reactivex.operators as ops
+ 
++from dimos.agents.harness.human_input_dispatch import (
++    HumanInputDispatcher,
++    HumanInputDispatchError,
++)
+ from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
+ from dimos.core.core import rpc
+ from dimos.core.module import Module
+@@ -36,12 +41,14 @@ class WebInput(Module):
+     _web_interface: RobotWebInterface | None = None
+     _thread: Thread | None = None
+     _human_transport: pLCMTransport[str] | None = None
++    _human_input: HumanInputDispatcher | None = None
+ 
+     @rpc
+     def start(self) -> None:
+         super().start()
+ 
+         self._human_transport = pLCMTransport("/human_input")
++        self._human_input = HumanInputDispatcher(self._human_transport)
+ 
+         audio_subject: rx.subject.Subject[AudioEvent] = rx.subject.Subject()
+ 
+@@ -51,31 +58,54 @@ class WebInput(Module):
+             audio_subject=audio_subject,
+         )
+ 
+-        normalizer = AudioNormalizer()
++        # Subscribe to both text input sources
++        # 1. Direct text from web interface
++        unsub = self._web_interface.query_stream.subscribe(self._send_human_input)
++        self.register_disposable(unsub)
+ 
+-        # Here to prevent unwanted imports in the file.
+-        from dimos.stream.audio.stt.node_whisper import WhisperNode
++        disable_stt = os.getenv("DIMOS_WEBINPUT_DISABLE_STT", "").lower() in (
++            "1",
++            "true",
++            "yes",
++        )
++        if disable_stt:
++            logger.info("WebInput STT disabled by DIMOS_WEBINPUT_DISABLE_STT")
++        else:
++            normalizer = AudioNormalizer()
+ 
+-        stt_node = WhisperNode()
++            # Here to prevent unwanted imports in the file.
++            from dimos.stream.audio.stt.node_whisper import WhisperNode
+ 
+-        # Connect audio pipeline: browser audio → normalizer → whisper
+-        normalizer.consume_audio(audio_subject.pipe(ops.share()))
+-        stt_node.consume_audio(normalizer.emit_audio())
++            stt_node = WhisperNode()
+ 
+-        # Subscribe to both text input sources
+-        # 1. Direct text from web interface
+-        unsub = self._web_interface.query_stream.subscribe(self._human_transport.publish)
+-        self.register_disposable(unsub)
++            # Connect audio pipeline: browser audio → normalizer → whisper
++            normalizer.consume_audio(audio_subject.pipe(ops.share()))
++            stt_node.consume_audio(normalizer.emit_audio())
+ 
+-        # 2. Transcribed text from STT
+-        unsub = stt_node.emit_text().subscribe(self._human_transport.publish)
+-        self.register_disposable(unsub)
++            # 2. Transcribed text from STT
++            unsub = stt_node.emit_text().subscribe(self._send_human_input)
++            self.register_disposable(unsub)
+ 
+         self._thread = Thread(target=self._web_interface.run, daemon=True)
+         self._thread.start()
+ 
+         logger.info("Web interface started at http://localhost:5555")
+ 
++    def _send_human_input(self, message: str) -> None:
++        if self._human_input is None:
++            logger.warning("WebInput received human input before dispatcher was initialized")
++            return
++        try:
++            result = self._human_input.send(message)
++        except HumanInputDispatchError:
++            logger.exception("WebInput failed to send human input through MCP")
++            return
++        if result.route == "lcm_fallback" and not result.authority_preemption_supported:
++            logger.warning(
++                "WebInput used LCM fallback without confirmed movement authority preemption",
++                message=message,
++            )
++
+     @rpc
+     def stop(self) -> None:
+         if self._web_interface:
+diff --git a/dimos/robot/cli/dimos.py b/dimos/robot/cli/dimos.py
+--- a/dimos/robot/cli/dimos.py
++++ b/dimos/robot/cli/dimos.py
+@@ -33,6 +33,23 @@
+ import requests
+ import typer
+ 
++from dimos.agents.harness.artifact_ledger import (
++    ArtifactLedger,
++    ArtifactRef,
++    ImageArtifactReadback,
++    is_valid_artifact_id,
++)
++from dimos.agents.harness.display_content import content_to_display_text
++from dimos.agents.harness.go2_harness_profiles import (
++    GO2_STACK_DISABLED_MODULES,
++    resolve_go2_profile_axes,
++)
++from dimos.agents.harness.image_blocks import (
++    image_block_mime_type,
++    image_block_payload_bytes,
++    is_image_block,
++)
++from dimos.agents.mcp.external_harness_validation import validate_external_harness_surface
+ from dimos.agents.mcp.mcp_adapter import McpAdapter, McpError
+ from dimos.constants import CONFIG_DIR, LOG_DIR
+ from dimos.core.daemon import daemonize, install_signal_handlers
+@@ -50,6 +67,7 @@
+ 
+ if TYPE_CHECKING:
+     from dimos.core.coordination.blueprints import Blueprint, BlueprintAtom
++    from dimos.core.module import ModuleBase
+ 
+ logger = setup_logger()
+ 
+@@ -61,6 +79,18 @@
+ load_dotenv()
+ 
+ SIMULATORS = ("mujoco", "dimsim")
++_HIDDEN_AGENT_POLICY_OPTIONS = {
++    "agent_control",
++    "agent_movement_mode",
++    "agent_profile",
++    "agent_tool_policy_admin_override",
++    "agent_tool_scope",
++}
++EDGE_PROFILE_ENV = "DIMOS_EDGE_PROFILE"
++MOTION_ONLY_EDGE_PROFILE = "motion-only"
++MOTION_ONLY_DISABLE_MODULES = GO2_STACK_DISABLED_MODULES["motion"]
++NAVIGATION_LITE_EDGE_PROFILE = "navigation-lite"
++NAVIGATION_LITE_DISABLE_MODULES = GO2_STACK_DISABLED_MODULES["mapping"]
+ 
+ 
+ def _normalize_simulation_argv(argv: list[str]) -> list[str]:
+@@ -118,6 +148,7 @@
+                     None,  # None means use the model's default if not provided
+                     f"--{cli_option_name}/--no-{cli_option_name}",
+                     help=f"Override {field_name} in GlobalConfig",
++                    hidden=field_name in _HIDDEN_AGENT_POLICY_OPTIONS,
+                 ),
+                 annotation=bool | None,
+             )
+@@ -130,6 +161,7 @@
+                     None,  # None means use the model's default if not provided
+                     f"--{cli_option_name}",
+                     help=f"Override {field_name} in GlobalConfig",
++                    hidden=field_name in _HIDDEN_AGENT_POLICY_OPTIONS,
+                 ),
+                 annotation=actual_type | None,
+             )
+@@ -217,12 +249,115 @@
+     return kwargs  # type: ignore[no-any-return]
+ 
+ 
++def _split_disable_args(disable: Iterable[str]) -> tuple[str, ...]:
++    return tuple(name.strip() for value in disable for name in value.split(",") if name.strip())
++
++
++def _resolve_disabled_module_classes(disable: Iterable[str]) -> tuple[type[ModuleBase], ...]:
++    from dimos.robot.get_all_blueprints import class_name_to_registry_key, get_module_by_name
++
++    modules: list[type[ModuleBase]] = []
++    seen: set[type[ModuleBase]] = set()
++    for name in _split_disable_args(disable):
++        candidates = dict.fromkeys((name, class_name_to_registry_key(name)))
++        errors: list[ValueError] = []
++        for candidate in candidates:
++            try:
++                module = get_module_by_name(candidate).blueprints[0].module
++                break
++            except ValueError as exc:
++                errors.append(exc)
++        else:
++            msg = f"Unknown module to disable: {name!r}. Use a module kebab-name or class name."
++            if errors:
++                msg += f" {errors[-1]}"
++            raise ValueError(msg) from errors[-1] if errors else None
++
++        if module not in seen:
++            seen.add(module)
++            modules.append(module)
++    return tuple(modules)
++
++
++def _edge_profile_disable_args(edge_profile: str | None) -> tuple[str, ...]:
++    if not edge_profile or not edge_profile.strip():
++        return ()
++
++    return resolve_go2_profile_axes(edge_profile, "inspect").disabled_modules
++
++
++def _disable_args_with_edge_profile(
++    disable: Iterable[str], edge_profile: str | None
++) -> tuple[str, ...]:
++    return (*disable, *_edge_profile_disable_args(edge_profile))
++
++
++def _disabled_dependency_errors(blueprint: Blueprint) -> tuple[str, ...]:
++    from dimos.core.module import is_module_type
++    from dimos.spec.utils import is_spec, spec_structural_compliance
++
++    disabled = set(blueprint.disabled_modules_tuple)
++    if not disabled:
++        return ()
++
++    errors: list[str] = []
++    active = blueprint.active_blueprints
++    for atom in active:
++        for module_ref in atom.module_refs:
++            if module_ref.optional:
++                continue
++
++            spec = blueprint.remapping_map.get((atom.module, module_ref.name), module_ref.spec)
++            if is_module_type(spec):
++                if spec in disabled:
++                    errors.append(
++                        f"{atom.module.__name__}.{module_ref.name} requires disabled module "
++                        f"{spec.__name__}"
++                    )
++                continue
++
++            if not is_spec(spec):
++                continue
++
++            has_active_provider = any(
++                other != atom and spec_structural_compliance(other.module, spec) for other in active
++            )
++            if has_active_provider:
++                continue
++
++            disabled_providers = [
++                other.module.__name__
++                for other in blueprint.blueprints
++                if other.module in disabled and spec_structural_compliance(other.module, spec)
++            ]
++            if disabled_providers:
++                errors.append(
++                    f"{atom.module.__name__}.{module_ref.name} requires disabled provider "
++                    f"for {spec.__name__}: {', '.join(disabled_providers)}"
++                )
++    return tuple(errors)
++
++
+ @main.command()
+ def run(
+     ctx: typer.Context,
+     robot_types: list[str] = typer.Argument(..., help="Blueprints or modules to run"),
+     daemon: bool = typer.Option(False, "--daemon", "-d", help="Run in background"),
+-    disable: list[str] = typer.Option([], "--disable", help="Module names to disable"),
++    disable: list[str] = typer.Option(
++        [], "--disable", help="Module names to disable; repeat or pass comma-separated names"
++    ),
++    stack: str = typer.Option(
++        "",
++        "--stack",
++        envvar="DIMOS_STACK",
++        help="Server modules: full, mapping, or motion.",
++    ),
++    control: str = typer.Option(
++        "",
++        "--control",
++        envvar="DIMOS_CONTROL",
++        help="Go2 tool authority: inspect, direct, local-planner, or frontier.",
++    ),
+     blueprint_args: list[str] = typer.Option((), "--option", "-o"),
+     config_path: Path = typer.Option(
+         CONFIG_DIR / "dimos", "--config", "-c", help="Path to config file"
+@@ -230,6 +365,22 @@
+     show_help: bool = typer.Option(False, "--help"),
+ ) -> None:
+     """Start a robot blueprint"""
++    axes = None
++    legacy_stack = os.environ.get(EDGE_PROFILE_ENV)
++    if any("go2" in name.casefold() for name in robot_types):
++        try:
++            axes = resolve_go2_profile_axes(
++                stack or legacy_stack or "full",
++                control or "local-planner",
++            )
++        except ValueError as exc:
++            typer.echo(typer.style(str(exc), fg=typer.colors.RED), err=True)
++            raise typer.Exit(1) from exc
++    elif stack or control or legacy_stack:
++        message = "--stack/--control currently support Go2 blueprints only."
++        typer.echo(typer.style(message, fg=typer.colors.RED), err=True)
++        raise typer.Exit(1)
++
+     logger.info("Starting DimOS")
+ 
+     from dimos.core.coordination.blueprints import autoconnect
+@@ -243,12 +394,20 @@
+         cleanup_stale,
+         generate_run_id,
+     )
+-    from dimos.robot.get_all_blueprints import get_by_name_or_exit, get_module_by_name_or_exit
++    from dimos.robot.get_all_blueprints import get_by_name_or_exit
+     from dimos.utils.logging_config import set_run_log_dir, setup_exception_handler
+ 
+     setup_exception_handler()
+ 
+-    cli_config_overrides: dict[str, Any] = ctx.obj
++    cli_config_overrides: dict[str, Any] = dict(ctx.obj)
++    if axes is not None:
++        cli_config_overrides.update(
++            agent_profile="supervised_live",
++            agent_control=axes.control,
++            agent_movement_mode="task_authority",
++            agent_tool_policy_admin_override=False,
++            agent_tool_scope=axes.tool_scope,
++        )
+ 
+     # this is a workaround until we have a proper way to have delayed-module-choice in blueprints
+     # ex: vis_module(viewer=global_config.viewer) is wrong (viewer will always be default value) without this patch
+@@ -273,11 +432,36 @@
+ 
+     blueprint = autoconnect(*map(get_by_name_or_exit, robot_types))
+ 
+-    if disable:
+-        disabled_classes = tuple(
+-            get_module_by_name_or_exit(name).blueprints[0].module for name in disable
++    try:
++        stack_disable = axes.disabled_modules if axes is not None else ()
++        disable_args = (*disable, *stack_disable)
++        disabled_classes = _resolve_disabled_module_classes(disable_args) if disable_args else ()
++    except ValueError as exc:
++        typer.echo(typer.style(str(exc), fg=typer.colors.RED), err=True)
++        raise typer.Exit(1) from exc
++
++    if disabled_classes:
++        if stack_disable:
++            assert axes is not None
++            logger.info(
++                "DimOS stack active",
++                stack=axes.stack,
++                control=axes.control,
++                disable_modules=list(stack_disable),
++            )
++        logger.info(
++            "Disabling DimOS modules",
++            modules=[module.__name__ for module in disabled_classes],
+         )
+         blueprint = blueprint.disabled_modules(*disabled_classes)
++        dependency_errors = _disabled_dependency_errors(blueprint)
++        if dependency_errors:
++            for error in dependency_errors:
++                typer.echo(
++                    typer.style(f"Cannot disable module: {error}", fg=typer.colors.RED),
++                    err=True,
++                )
++            raise typer.Exit(1)
+ 
+     if show_help:
+         print("Blueprint arguments:")
+@@ -374,6 +558,114 @@
+     typer.echo(f"  Log:       {entry.log_dir}")
+ 
+ 
++@main.command("operate")
++def operate(
++    blueprint: str = typer.Option(
++        "unitree-go2-edge-mcp",
++        "--blueprint",
++        help="Blueprint to start after explicit operator confirmation.",
++    ),
++    attach: bool = typer.Option(
++        True,
++        "--attach/--start",
++        help="Attach first by default; --start still requires operator confirmation.",
++    ),
++    mcp_url: str = typer.Option(
++        "",
++        "--mcp-url",
++        envvar="DIMOS_MCP_URL",
++        help="Explicit MCP URL. Overrides active-run discovery.",
++    ),
++    mcp_ready_timeout_s: float = typer.Option(
++        10.0,
++        "--mcp-ready-timeout-s",
++        help="Seconds to wait for MCP initialize/tools readiness.",
++    ),
++    stack: str = typer.Option(
++        "full",
++        "--stack",
++        "--profile",
++        "--edge-profile",
++        envvar="DIMOS_STACK",
++        help=("Server modules: full, mapping, or motion. Old edge profile names remain aliases."),
++    ),
++    control: str = typer.Option(
++        "local-planner",
++        "--control",
++        "--tool-profile",
++        envvar="DIMOS_CONTROL",
++        help=(
++            "Tool authority: inspect, direct, local-planner, or frontier. "
++            "Old tool profile names remain aliases."
++        ),
++    ),
++    mode: str = typer.Option(
++        "auto",
++        "--mode",
++        help=(
++            "Agent mode: auto, readonly, authority-proxy, or admin-override-debug."
++        ),
++        hidden=True,
++    ),
++    authority_tool: list[str] = typer.Option(
++        [],
++        "--authority-tool",
++        help="Restrict agent movement authority to these tools (repeatable).",
++    ),
++    model: str = typer.Option(
++        "gpt-5.4",
++        "--model",
++        help="Codex model for future agent submissions.",
++    ),
++    model_reasoning_effort: str = typer.Option(
++        "medium",
++        "--model-reasoning-effort",
++        help="Codex reasoning effort for future agent submissions.",
++    ),
++    run_root: Path | None = typer.Option(
++        None,
++        "--run-root",
++        help="Optional operator-console artifact root override.",
++    ),
++    viewer: str = typer.Option(
++        "none",
++        "--viewer",
++        help="Viewer setting forwarded only if the console starts DimOS.",
++    ),
++    no_launch: bool = typer.Option(
++        False,
++        "--no-launch",
++        help="Never start DimOS from the console; attach/probe only.",
++    ),
++) -> None:
++    """Launch the DimOS operator console."""
++
++    from dimos.agents.console.app import run_console
++    from dimos.agents.console.config import ConsoleConfig, StartupPolicy
++
++    try:
++        config = ConsoleConfig(
++            blueprint=blueprint,
++            startup_policy=StartupPolicy.ATTACH if attach else StartupPolicy.START,
++            no_launch=no_launch,
++            mcp_url=mcp_url or None,
++            mcp_ready_timeout_s=mcp_ready_timeout_s,
++            stack=stack,
++            control=control,
++            mode=mode,
++            model=model,
++            reasoning=model_reasoning_effort,
++            run_root=run_root,
++            viewer=viewer,
++            authority_tools=tuple(authority_tool),
++        )
++    except ValueError as exc:
++        typer.echo(typer.style(f"Error: {exc}", fg=typer.colors.RED), err=True)
++        raise typer.Exit(1) from exc
++
++    run_console(config)
++
++
+ @main.command()
+ def stop(
+     force: bool = typer.Option(False, "--force", "-f", help="Force kill (SIGKILL)"),
+@@ -428,24 +720,707 @@
+             typer.echo(format_line(line, json_output=json_output))
+ 
+ 
++@main.command("trace")
++def trace_cmd(
++    event_type: list[str] = typer.Option(
++        [],
++        "--type",
++        "-t",
++        help="Only show this harness event type. Can be repeated.",
++    ),
++    lines: int = typer.Option(100, "--lines", "-n", help="Number of log lines to scan"),
++    all_lines: bool = typer.Option(False, "--all", "-a", help="Scan the full log"),
++    json_output: bool = typer.Option(False, "--json", help="Raw JSON events"),
++    run_id: str = typer.Option("", "--run", "-r", help="Specific run ID"),
++) -> None:
++    """View structured harness trace events from a DimOS run."""
++
++    from dimos.agents.harness.trace_log import (
++        extract_harness_trace_event,
++        format_harness_trace_event,
++    )
++    from dimos.core.log_viewer import read_log, resolve_log_path
++
++    path = resolve_log_path(run_id)
++    if not path:
++        typer.echo("No log files found", err=True)
++        raise typer.Exit(1)
++
++    wanted = set(event_type)
++    count = None if all_lines else lines
++    found = 0
++    for raw in read_log(path, count):
++        event = extract_harness_trace_event(raw)
++        if event is None:
++            continue
++        if wanted and event.get("event_type") not in wanted:
++            continue
++        found += 1
++        if json_output:
++            typer.echo(json.dumps(event, ensure_ascii=False))
++        else:
++            typer.echo(format_harness_trace_event(event))
++
++    if found == 0:
++        typer.echo("No harness trace events found")
++
++
++@main.command("trace-audit")
++def trace_audit_cmd(
++    require_visual: bool = typer.Option(
++        False,
++        "--require-visual",
++        help="Require model-visible image evidence in request_assembled events.",
++    ),
++    require_session_lifecycle: bool = typer.Option(
++        False,
++        "--require-session-lifecycle",
++        help="Require native session_start/session_end traces with matching session ids.",
++    ),
++    require_turn_lifecycle: bool = typer.Option(
++        False,
++        "--require-turn-lifecycle",
++        help="Require native turn_start/turn_end traces linked to request_assembled events.",
++    ),
++    require_model_turn: bool = typer.Option(
++        False,
++        "--require-model-turn",
++        help="Require at least one native turn_end outcome=model_completed event.",
++    ),
++    require_model_response: bool = typer.Option(
++        False,
++        "--require-model-response",
++        help="Require completed native model turns to emit compact model_response traces.",
++    ),
++    forbid_turn_errors: bool = typer.Option(
++        False,
++        "--forbid-turn-errors",
++        help="Fail if any native turn_end event has outcome=error.",
++    ),
++    require_movement: bool = typer.Option(
++        False,
++        "--require-movement",
++        help="Require movement policy and task-authority trace events.",
++    ),
++    require_navigation: bool = typer.Option(
++        False,
++        "--require-navigation",
++        help="Require navigation task lifecycle trace events.",
++    ),
++    require_request_contract: bool = typer.Option(
++        False,
++        "--require-request-contract",
++        help="Require request_assembled policy, exposed-tool, and section metadata.",
++    ),
++    require_request_tool_scope: bool = typer.Option(
++        False,
++        "--require-request-tool-scope",
++        help="Require request_assembled tools_exposed to match runtime policy scope.",
++    ),
++    require_task_state: bool = typer.Option(
++        False,
++        "--require-task-state",
++        help="Require pinned native task-state context in request_assembled events.",
++    ),
++    require_task_control: bool = typer.Option(
++        False,
++        "--require-task-control",
++        help="Require native task-control command trace events.",
++    ),
++    require_task_followup: bool = typer.Option(
++        False,
++        "--require-task-followup",
++        help="Require active-task follow-up traces and pending navigation follow-up.",
++    ),
++    require_auto_followup: bool = typer.Option(
++        False,
++        "--require-auto-followup",
++        help="Require zero-tool pending task turns to queue and process auto follow-ups.",
++    ),
++    require_tool_status_isolated: bool = typer.Option(
++        False,
++        "--require-tool-status-isolated",
++        help="Require typed tool-status events to stay out of model request history.",
++    ),
++    require_tool_status_context: bool = typer.Option(
++        False,
++        "--require-tool-status-context",
++        help="Require tool-status traces to carry Human CLI panel context.",
++    ),
++    require_tool_execution: bool = typer.Option(
++        False,
++        "--require-tool-execution",
++        help="Require MCP tool call request/start/result execution traces.",
++    ),
++    require_tool_call_terminal: bool = typer.Option(
++        False,
++        "--require-tool-call-terminal",
++        help="Require every MCP tool call request to end in execution result or refusal trace.",
++    ),
++    forbid_raw_trace_payloads: bool = typer.Option(
++        False,
++        "--forbid-raw-trace-payloads",
++        help="Fail if harness traces contain raw image data URLs or long base64 strings.",
++    ),
++    require_context_compaction: bool = typer.Option(
++        False,
++        "--require-context-compaction",
++        help="Require dropped request context to have matching context_compacted traces.",
++    ),
++    require_failure_escalation: bool = typer.Option(
++        False,
++        "--require-failure-escalation",
++        help="Require at least one structured failure_escalated trace event.",
++    ),
++    require_relative_move: bool = typer.Option(
++        False,
++        "--require-relative-move",
++        help="Require relative_move result trace with measured odom and arrival evidence.",
++    ),
++    require_rotation: bool = typer.Option(
++        False,
++        "--require-rotation",
++        help="Require rotate_in_place result trace with measured yaw evidence.",
++    ),
++    require_stop: bool = typer.Option(
++        False,
++        "--require-stop",
++        help="Require stop_movement result trace with zero-velocity command evidence.",
++    ),
++    forbid_navigation_escalation: bool = typer.Option(
++        False,
++        "--forbid-navigation-escalation",
++        help="Fail if navigation retry-limit escalation events are present.",
++    ),
++    require_preemption: bool = typer.Option(
++        False,
++        "--require-preemption",
++        help="Require movement_preempted trace with stop result and duration evidence.",
++    ),
++    preemption_max_ms: float | None = typer.Option(
++        None,
++        "--preemption-max-ms",
++        help="Fail if any movement_preempted trace exceeds this duration in ms.",
++    ),
++    expected_preempted_by: list[str] = typer.Option(
++        [],
++        "--expect-preempted-by",
++        help=(
++            "Require at least one movement_preempted trace with this preempted_by "
++            "reason. Can be repeated."
++        ),
++    ),
++    max_context_token_growth: int | None = typer.Option(
++        None,
++        "--max-context-token-growth",
++        help=(
++            "Fail if consecutive request_assembled estimated token counts grow by more "
++            "than this amount."
++        ),
++    ),
++    max_context_images: int | None = typer.Option(
++        None,
++        "--max-context-images",
++        help="Fail if any request_assembled event includes more model-visible images.",
++    ),
++    max_context_image_tokens: int | None = typer.Option(
++        None,
++        "--max-context-image-tokens",
++        help="Fail if any request_assembled event exceeds this image-token total.",
++    ),
++    profile: str = typer.Option(
++        "",
++        "--profile",
++        help="Apply a named trace-audit gate bundle, e.g. go2-prelive or go2-live-motion.",
++    ),
++    list_profiles: bool = typer.Option(
++        False,
++        "--list-profiles",
++        help="List named trace-audit profiles and exit.",
++    ),
++    lines: int = typer.Option(1000, "--lines", "-n", help="Number of log lines to scan"),
++    all_lines: bool = typer.Option(False, "--all", "-a", help="Scan the full log"),
++    json_output: bool = typer.Option(False, "--json", help="Raw JSON audit report"),
++    run_id: str = typer.Option("", "--run", "-r", help="Specific run ID"),
++) -> None:
++    """Audit a DimOS run against trace-backed harness validation checks."""
++
++    from dimos.agents.harness.live_validation import validate_live_trace_events
++    from dimos.agents.harness.trace_audit_profiles import (
++        available_trace_audit_profiles,
++        merge_trace_audit_options,
++    )
++    from dimos.agents.harness.trace_log import harness_trace_events_from_lines
++    from dimos.core.log_viewer import read_log, resolve_log_path
++
++    if list_profiles:
++        for item in available_trace_audit_profiles():
++            typer.echo(f"{item.name}: {item.description}")
++        return
++
++    try:
++        audit_options, applied_profile = merge_trace_audit_options(
++            profile,
++            {
++                "require_visual": require_visual,
++                "require_session_lifecycle": require_session_lifecycle,
++                "require_turn_lifecycle": require_turn_lifecycle,
++                "require_model_turn": require_model_turn,
++                "require_model_response": require_model_response,
++                "forbid_turn_errors": forbid_turn_errors,
++                "require_movement": require_movement,
++                "require_navigation": require_navigation,
++                "require_request_contract": require_request_contract,
++                "require_request_tool_scope": require_request_tool_scope,
++                "require_task_state": require_task_state,
++                "require_task_control": require_task_control,
++                "require_task_followup": require_task_followup,
++                "require_auto_followup": require_auto_followup,
++                "require_tool_status_isolated": require_tool_status_isolated,
++                "require_tool_status_context": require_tool_status_context,
++                "require_tool_execution": require_tool_execution,
++                "require_tool_call_terminal": require_tool_call_terminal,
++                "forbid_raw_trace_payloads": forbid_raw_trace_payloads,
++                "require_context_compaction": require_context_compaction,
++                "require_failure_escalation": require_failure_escalation,
++                "require_relative_move": require_relative_move,
++                "require_rotation": require_rotation,
++                "require_stop": require_stop,
++                "require_preemption": require_preemption,
++                "preemption_max_ms": preemption_max_ms,
++                "expected_preempted_by": expected_preempted_by,
++                "max_context_token_growth": max_context_token_growth,
++                "max_context_images": max_context_images,
++                "max_context_image_tokens": max_context_image_tokens,
++                "forbid_navigation_escalation": forbid_navigation_escalation,
++            },
++        )
++    except ValueError as exc:
++        typer.echo(str(exc), err=True)
++        raise typer.Exit(2) from exc
++
++    path = resolve_log_path(run_id)
++    if not path:
++        typer.echo("No log files found", err=True)
++        raise typer.Exit(1)
++
++    count = None if all_lines else lines
++    events = harness_trace_events_from_lines(read_log(path, count))
++    report = validate_live_trace_events(events, **audit_options)
++    if json_output:
++        payload = report.model_dump()
++        if applied_profile is not None:
++            payload["profile"] = applied_profile.model_dump()
++        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
++    else:
++        if applied_profile is not None:
++            typer.echo(f"Profile: {applied_profile.name} - {applied_profile.description}")
++        typer.echo(report.render_text())
++    if not report.ok:
++        raise typer.Exit(1)
++
++
++@main.command("agent-provider-status")
++def agent_provider_status_cmd(
++    provider: str = typer.Option(
++        "",
++        "--provider",
++        help="Provider override; defaults to DIMOS_AGENT_PROVIDER or native model inference.",
++    ),
++    model: str = typer.Option(
++        "",
++        "--model",
++        help="Model override; defaults to DIMOS_AGENT_MODEL or gpt-4o.",
++    ),
++    base_url: str = typer.Option(
++        "",
++        "--base-url",
++        help="OpenAI-compatible base URL; defaults to DIMOS_AGENT_BASE_URL or OPENAI_BASE_URL.",
++    ),
++    fixture: str = typer.Option(
++        "",
++        "--fixture",
++        help="Fixture model path for offline native-agent smoke tests.",
++    ),
++    require_native: bool = typer.Option(
++        False,
++        "--require-native",
++        help="Exit nonzero unless the native agent can build its model client.",
++    ),
++    require_vision_roundtrip: bool = typer.Option(
++        False,
++        "--require-vision-roundtrip",
++        help="Exit nonzero unless the live provider visual round-trip is ready.",
++    ),
++    json_output: bool = typer.Option(False, "--json", help="Raw JSON readiness report"),
++) -> None:
++    """Print a display-safe native agent model/provider readiness summary."""
++
++    from pydantic import SecretStr
++
++    from dimos.agents.harness.model_provider import (
++        NativeAgentModelConfig,
++        native_agent_model_readiness,
++    )
++
++    api_key = os.getenv("DIMOS_AGENT_API_KEY") or os.getenv("OPENAI_API_KEY")
++    config = NativeAgentModelConfig(
++        model=model or os.getenv("DIMOS_AGENT_MODEL") or "gpt-4o",
++        model_provider=provider or os.getenv("DIMOS_AGENT_PROVIDER") or None,
++        model_base_url=base_url
++        or os.getenv("DIMOS_AGENT_BASE_URL")
++        or os.getenv("OPENAI_BASE_URL"),
++        model_api_key=SecretStr(api_key) if api_key else None,
++        model_fixture=fixture or None,
++    )
++    readiness = native_agent_model_readiness(config)
++    exit_code = 0
++    if require_native and not readiness.ready_for_native_agent:
++        exit_code = 1
++    if require_vision_roundtrip and not readiness.ready_for_provider_vision_roundtrip:
++        exit_code = 1
++
++    if json_output:
++        typer.echo(json.dumps(readiness.model_dump(), ensure_ascii=False, indent=2))
++    else:
++        typer.echo(readiness.render_text())
++        typer.echo("")
++        typer.echo("Next checks:")
++        typer.echo("  uv run dimos agent-vision-roundtrip --preflight")
++        if readiness.ready_for_provider_vision_roundtrip:
++            typer.echo("  uv run dimos agent-vision-roundtrip")
++        else:
++            typer.echo("  set DIMOS_AGENT_API_KEY/OPENAI_API_KEY before live provider round-trip")
++
++    if exit_code:
++        raise typer.Exit(exit_code)
++
++
++@main.command("agent-vision-roundtrip")
++def agent_vision_roundtrip_cmd(
++    provider: str = typer.Option(
++        "",
++        "--provider",
++        help="Provider to validate; defaults to DIMOS_AGENT_PROVIDER or openai-compatible.",
++    ),
++    model: str = typer.Option(
++        "",
++        "--model",
++        help="Model to validate; defaults to DIMOS_AGENT_MODEL or gpt-4o.",
++    ),
++    base_url: str = typer.Option(
++        "",
++        "--base-url",
++        help="OpenAI-compatible base URL; defaults to DIMOS_AGENT_BASE_URL or OPENAI_BASE_URL.",
++    ),
++    expected_answer: str = typer.Option(
++        "",
++        "--expected-answer",
++        help="Expected answer. Defaults to 'red' for synthetic checks and 'yes' for artifact checks.",
++    ),
++    question: str = typer.Option(
++        "",
++        "--question",
++        help="Question to ask about the carried image evidence.",
++    ),
++    artifact_id: str = typer.Option(
++        "",
++        "--artifact-id",
++        help="Use a persisted image artifact instead of the synthetic square image.",
++    ),
++    latest_image_artifact: bool = typer.Option(
++        False,
++        "--latest-image-artifact",
++        help="Use the latest persisted image artifact from the active DimOS run.",
++    ),
++    artifact_dir: str = typer.Option(
++        "",
++        "--artifact-dir",
++        help="Artifact directory override; defaults to DIMOS_AGENT_ARTIFACT_DIR or latest run.",
++    ),
++    preflight: bool = typer.Option(
++        False,
++        "--preflight",
++        help="Only validate request assembly/image placement; do not call the model provider.",
++    ),
++    json_output: bool = typer.Option(False, "--json", help="Raw JSON validation report"),
++) -> None:
++    """Run an opt-in provider vision round-trip against the configured model."""
++
++    from dimos.agents.harness.visual_roundtrip import (
++        VisualRoundTripConfig,
++        VisualRoundTripImage,
++        make_roundtrip_model,
++        preflight_visual_roundtrip,
++        run_visual_roundtrip,
++    )
++
++    resolved_provider = provider or os.getenv("DIMOS_AGENT_PROVIDER") or "openai-compatible"
++    resolved_model = model or os.getenv("DIMOS_AGENT_MODEL") or "gpt-4o"
++    resolved_base_url = (
++        base_url or os.getenv("DIMOS_AGENT_BASE_URL") or os.getenv("OPENAI_BASE_URL")
++    )
++    source_image: VisualRoundTripImage | None = None
++    resolved_expected_answer = expected_answer or "red"
++    resolved_question = question
++    run_entry = _get_mcp_run_entry()
++
++    if artifact_id or latest_image_artifact:
++        readback = _read_cli_image_artifact(
++            artifact_id=artifact_id or None,
++            latest_image_artifact=latest_image_artifact,
++            artifact_dir=artifact_dir or None,
++            run_entry=run_entry,
++        )
++        if readback is None:
++            raise typer.Exit(1)
++        source_image = VisualRoundTripImage(
++            block=readback.block,
++            source="artifact",
++            artifact_id=readback.ref.artifact_id,
++            description="persisted DimOS visual artifact",
++        )
++        resolved_expected_answer = expected_answer or "yes"
++        resolved_question = question or (
++            "Does the earlier visual evidence contain a visible image? Answer exactly yes or no."
++        )
++
++    config = VisualRoundTripConfig(
++        target_provider=resolved_provider,
++        target_model=resolved_model,
++        target_base_url=resolved_base_url or None,
++        expected_answer=resolved_expected_answer,
++        square_color=resolved_expected_answer,
++        source_image=source_image,
++        question=resolved_question or VisualRoundTripConfig().question,
++    )
++    api_key = os.getenv("DIMOS_AGENT_API_KEY") or os.getenv("OPENAI_API_KEY")
++    if not preflight and not api_key:
++        typer.echo(
++            "Error: set DIMOS_AGENT_API_KEY or OPENAI_API_KEY before running the live "
++            "provider visual round-trip. Use --preflight to validate request assembly "
++            "without a provider call.",
++            err=True,
++        )
++        raise typer.Exit(1)
++
++    try:
++        if preflight:
++            report = preflight_visual_roundtrip(config)
++        else:
++            live_model = make_roundtrip_model(
++                provider=resolved_provider,
++                model=resolved_model,
++                api_key=api_key,
++                base_url=resolved_base_url,
++            )
++            report = run_visual_roundtrip(live_model, config)
++    except Exception as e:
++        typer.echo(f"Error: provider visual round-trip failed to run: {e}", err=True)
++        raise typer.Exit(1)
++
++    if json_output:
++        typer.echo(json.dumps(report.model_dump(), indent=2))
++    else:
++        typer.echo(report.render_text())
++    if not report.ok:
++        raise typer.Exit(1)
++
++
++@main.command("go2-harness-gates")
++def go2_harness_gates_cmd(
++    profile: str = typer.Option(
++        "supervised-prelive",
++        "--profile",
++        help=(
++            "Gate profile to render, e.g. readonly-prelive, supervised-prelive, "
++            "navigation-live-audit, or live-motion-audit."
++        ),
++    ),
++    list_profiles: bool = typer.Option(
++        False,
++        "--list-profiles",
++        help="List Go2 harness gate profiles and exit.",
++    ),
++    json_output: bool = typer.Option(
++        False,
++        "--json",
++        help="Print the gate profile as JSON.",
++    ),
++) -> None:
++    """Render repeatable Go2 harness gate commands without starting motion."""
++
++    from dimos.agents.harness.go2_harness_gate import (
++        available_go2_harness_gate_profiles,
++        go2_harness_gate_profile,
++    )
++
++    if list_profiles:
++        for item in available_go2_harness_gate_profiles():
++            typer.echo(f"{item.name}: {item.description}")
++        return
++
++    try:
++        gate = go2_harness_gate_profile(profile)
++    except ValueError as exc:
++        typer.echo(str(exc), err=True)
++        raise typer.Exit(2) from exc
++
++    if json_output:
++        typer.echo(json.dumps(gate.model_dump(), indent=2))
++    else:
++        typer.echo(gate.render_text())
++
++
+ mcp_app = typer.Typer(help="Interact with the running MCP server")
+ main.add_typer(mcp_app, name="mcp")
+ 
+ 
+-def _get_adapter() -> McpAdapter:
++def _get_mcp_run_entry() -> Any | None:
++    """Return the latest live DimOS run entry, if one is registered."""
++
++    return get_most_recent(alive_only=True)
++
++
++def _get_adapter(entry: Any | None = None, mcp_url: str | None = None) -> McpAdapter:
+     """Get an McpAdapter from the latest RunEntry or default URL."""
+-    from dimos.agents.mcp.mcp_adapter import McpAdapter
+-
+-    return McpAdapter.from_run_entry()
++    if mcp_url:
++        return McpAdapter(url=mcp_url)
++    if entry is None:
++        entry = _get_mcp_run_entry()
++    return McpAdapter.from_run_entry(entry)
++
++
++def _artifact_dir_for_run_entry(entry: Any | None) -> Path | None:
++    config_overrides = getattr(entry, "config_overrides", {}) or {}
++    configured = (
++        config_overrides.get("agent_artifact_dir") if isinstance(config_overrides, dict) else None
++    )
++    if configured:
++        return Path(str(configured)).expanduser()
++    env_configured = os.environ.get("DIMOS_AGENT_ARTIFACT_DIR") or global_config.agent_artifact_dir
++    if env_configured:
++        return Path(str(env_configured)).expanduser()
++    if entry is None:
++        return None
++    log_dir = getattr(entry, "log_dir", None)
++    if log_dir:
++        return Path(str(log_dir)).expanduser() / "artifacts"
++    return None
++
++
++def _latest_image_artifact_ref_for_run(entry: Any | None) -> ArtifactRef | None:
++    artifact_dir = _artifact_dir_for_run_entry(entry)
++    if artifact_dir is None:
++        return None
++    return ArtifactLedger(artifact_dir=artifact_dir).latest_image_ref()
++
++
++def _read_cli_image_artifact(
++    *,
++    artifact_id: str | None,
++    latest_image_artifact: bool,
++    artifact_dir: str | None,
++    run_entry: Any | None,
++) -> ImageArtifactReadback | None:
++    resolved_dir = (
++        Path(artifact_dir).expanduser() if artifact_dir else _artifact_dir_for_run_entry(run_entry)
++    )
++    if resolved_dir is None:
++        typer.echo(
++            "Error: no artifact directory is available. Start DimOS, set "
++            "DIMOS_AGENT_ARTIFACT_DIR, or pass --artifact-dir.",
++            err=True,
++        )
++        return None
++
++    ledger = ArtifactLedger(artifact_dir=resolved_dir)
++    ref: ArtifactRef | None
++    if artifact_id:
++        if not is_valid_artifact_id(artifact_id):
++            typer.echo(
++                "Error: invalid --artifact-id. Expected an id like artifact_000001.",
++                err=True,
++            )
++            return None
++        ref = ledger.get_ref(artifact_id)
++    elif latest_image_artifact:
++        ref = ledger.latest_image_ref()
++    else:
++        return None
++
++    if ref is None:
++        typer.echo(
++            f"Error: no image artifact found in {resolved_dir}. Run observe first "
++            "or pass --artifact-id explicitly.",
++            err=True,
++        )
++        return None
++
++    readback = ledger.read_image(ref.artifact_id)
++    if readback is None:
++        typer.echo(
++            f"Error: artifact {ref.artifact_id} in {resolved_dir} is not a readable image.",
++            err=True,
++        )
++        return None
++    return readback
++
++
++def _save_first_image_content_block(content: Any, path: Path) -> dict[str, Any] | None:
++    if not isinstance(content, list):
++        return None
++    for index, block in enumerate(content):
++        if not isinstance(block, dict) or not is_image_block(block):
++            continue
++        payload = image_block_payload_bytes(block)
++        if payload is None:
++            continue
++        path = path.expanduser()
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_bytes(payload)
++        return {
++            "path": str(path),
++            "bytes": len(payload),
++            "mime_type": image_block_mime_type(block),
++            "content_index": index,
++        }
++    return None
++
++
++def _mcp_call_summary(
++    *,
++    tool_name: str,
++    content: Any,
++    saved_image: dict[str, Any] | None = None,
++) -> dict[str, Any]:
++    blocks = content if isinstance(content, list) else []
++    return {
++        "tool_name": tool_name,
++        "content_blocks": len(blocks),
++        "image_blocks": sum(
++            1 for block in blocks if isinstance(block, dict) and is_image_block(block)
++        ),
++        "text": content_to_display_text(content),
++        "saved_image": saved_image,
++    }
+ 
+ 
+ @mcp_app.command("list-tools")
+-def mcp_list_tools() -> None:
++def mcp_list_tools(
++    mcp_url: str = typer.Option(
++        "",
++        "--mcp-url",
++        envvar="DIMOS_MCP_URL",
++        help="MCP URL to query. Defaults to DIMOS_MCP_URL, then the active DimOS run.",
++    ),
++) -> None:
+     """List available MCP tools (skills)."""
++    adapter = _get_adapter(mcp_url=mcp_url or None)
+     try:
+-        tools = _get_adapter().list_tools()
++        tools = adapter.list_tools()
+     except requests.ConnectionError:
+-        typer.echo("Error: no running MCP server (is DimOS running?)", err=True)
++        typer.echo(f"Error: no MCP server reachable at {adapter.url}", err=True)
+         raise typer.Exit(1)
+     except McpError as e:
+         typer.echo(f"Error: {e}", err=True)
+@@ -477,6 +1452,22 @@
+         [], "--arg", "-a", click_type=_KeyValueType(), help="Arguments as key=value"
+     ),
+     json_args: str = typer.Option("", "--json-args", "-j", help="Arguments as JSON string"),
++    save_image: Path | None = typer.Option(
++        None,
++        "--save-image",
++        help="Save the first image content block returned by the tool to this path.",
++    ),
++    json_summary: bool = typer.Option(
++        False,
++        "--json-summary",
++        help="Print a compact JSON summary instead of display text.",
++    ),
++    mcp_url: str = typer.Option(
++        "",
++        "--mcp-url",
++        envvar="DIMOS_MCP_URL",
++        help="MCP URL to call. Defaults to DIMOS_MCP_URL, then the active DimOS run.",
++    ),
+ ) -> None:
+     """Call an MCP tool by name."""
+     arguments: dict[str, Any] = {}
+@@ -490,10 +1481,11 @@
+         # _KeyValueType.convert() returns (key, val) tuples at runtime
+         arguments = dict(args)  # type: ignore[arg-type]
+ 
++    adapter = _get_adapter(mcp_url=mcp_url or None)
+     try:
+-        result = _get_adapter().call_tool(tool_name, arguments)
++        result = adapter.call_tool(tool_name, arguments)
+     except requests.ConnectionError:
+-        typer.echo("Error: no running MCP server (is DimOS running?)", err=True)
++        typer.echo(f"Error: no MCP server reachable at {adapter.url}", err=True)
+         raise typer.Exit(1)
+     except McpError as e:
+         typer.echo(f"Error: {e}", err=True)
+@@ -503,17 +1495,529 @@
+     if not content:
+         typer.echo("(no output)")
+         return
+-    for item in content:
+-        typer.echo(item.get("text", str(item)))
+-
+-
+-@mcp_app.command("status")
+-def mcp_status() -> None:
+-    """Show MCP server status (modules, skills)."""
++
++    saved_image = None
++    if save_image is not None:
++        saved_image = _save_first_image_content_block(content, save_image)
++        if saved_image is None:
++            typer.echo("Error: tool result did not include a readable image block.", err=True)
++            raise typer.Exit(1)
++
++    if json_summary:
++        typer.echo(
++            json.dumps(
++                _mcp_call_summary(
++                    tool_name=tool_name,
++                    content=content,
++                    saved_image=saved_image,
++                ),
++                indent=2,
++            )
++        )
++        return
++
++    typer.echo(content_to_display_text(content))
++    if saved_image is not None:
++        typer.echo(f"Saved image to {saved_image['path']}")
++
++
++@mcp_app.command("validate-harness")
++def mcp_validate_harness(
++    expected_tool_scope: str = typer.Option(
++        "",
++        "--expected-tool-scope",
++        help="Expected runtime tool scope before exposing MCP to an external harness.",
++    ),
++    profile: str = typer.Option(
++        "",
++        "--profile",
++        help=(
++            "Apply a named external harness validation profile, e.g. readonly, "
++            "readonly-visual, or vision-lidar-supervised."
++        ),
++    ),
++    list_profiles: bool = typer.Option(
++        False,
++        "--list-profiles",
++        help="List named external harness validation profiles and exit.",
++    ),
++    artifact_id: str = typer.Option(
++        "",
++        "--artifact-id",
++        help="Optional image artifact id to test with read_image.",
++    ),
++    latest_image_artifact: bool = typer.Option(
++        False,
++        "--latest-image-artifact",
++        help="Use the latest persisted image artifact from the active DimOS run.",
++    ),
++    require_visual_readback: bool = typer.Option(
++        False,
++        "--require-visual-readback",
++        help="Fail unless read_image returns metadata plus image content for --artifact-id.",
++    ),
++    require_movement_authority_refusal: bool = typer.Option(
++        False,
++        "--require-movement-authority-refusal",
++        help=("Fail unless a tokenless external movement confirmation is refused before dispatch."),
++    ),
++    require_hidden_movement_refusal: bool = typer.Option(
++        False,
++        "--require-hidden-movement-refusal",
++        help="Fail unless a hidden movement tool call is refused at MCP dispatch.",
++    ),
++    require_idle_runtime: bool = typer.Option(
++        False,
++        "--require-idle-runtime",
++        help="Fail unless movement authority and capability holders are empty.",
++    ),
++    json_output: bool = typer.Option(
++        False,
++        "--json",
++        help="Print the validation report as JSON.",
++    ),
++) -> None:
++    """Validate the MCP surface before attaching an external harness client."""
++    from dimos.agents.mcp.external_harness_profiles import (
++        available_external_harness_profiles,
++        merge_external_harness_validation_options,
++    )
++
++    if list_profiles:
++        for item in available_external_harness_profiles():
++            typer.echo(f"{item.name}: {item.description}")
++        return
++
+     try:
+-        data = _get_adapter().call_tool_text("server_status")
++        validation_options, applied_profile = merge_external_harness_validation_options(
++            profile,
++            {
++                "expected_tool_scope": expected_tool_scope or None,
++                "require_visual_readback": require_visual_readback,
++                "require_movement_authority_refusal": require_movement_authority_refusal,
++                "require_hidden_movement_refusal": require_hidden_movement_refusal,
++                "require_idle_runtime": require_idle_runtime,
++            },
++        )
++    except ValueError as exc:
++        typer.echo(str(exc), err=True)
++        raise typer.Exit(2) from exc
++
++    run_entry = _get_mcp_run_entry()
++    resolved_artifact_id = artifact_id or None
++    if latest_image_artifact and resolved_artifact_id is None:
++        latest_ref = _latest_image_artifact_ref_for_run(run_entry)
++        if latest_ref is None:
++            artifact_dir = _artifact_dir_for_run_entry(run_entry)
++            location = str(artifact_dir) if artifact_dir is not None else "the latest run"
++            typer.echo(
++                "Error: --latest-image-artifact requested, but no persisted image "
++                f"artifact was found for {location}. Run observe first or pass "
++                "--artifact-id explicitly.",
++                err=True,
++            )
++            raise typer.Exit(1)
++        resolved_artifact_id = latest_ref.artifact_id
++
++    try:
++        report = validate_external_harness_surface(
++            _get_adapter(run_entry),
++            expected_tool_scope=validation_options["expected_tool_scope"],
++            artifact_id=resolved_artifact_id,
++            require_visual_readback=validation_options["require_visual_readback"],
++            require_movement_authority_refusal=validation_options[
++                "require_movement_authority_refusal"
++            ],
++            require_hidden_movement_refusal=validation_options["require_hidden_movement_refusal"],
++            require_idle_runtime=validation_options["require_idle_runtime"],
++        )
+     except requests.ConnectionError:
+         typer.echo("Error: no running MCP server (is DimOS running?)", err=True)
++        raise typer.Exit(1)
++    except McpError as e:
++        typer.echo(f"Error: {e}", err=True)
++        raise typer.Exit(1)
++
++    if json_output:
++        payload = report.model_dump()
++        if applied_profile is not None:
++            payload["profile"] = applied_profile.model_dump()
++        typer.echo(json.dumps(payload, indent=2))
++    else:
++        if applied_profile is not None:
++            typer.echo(f"Profile: {applied_profile.name} - {applied_profile.description}")
++        typer.echo(report.render_text())
++    if not report.ok:
++        raise typer.Exit(1)
++
++
++@mcp_app.command("prepare-codex-run")
++def mcp_prepare_codex_run(
++    task: str = typer.Argument(..., help="Operator task for the isolated Codex run."),
++    run_root: Path = typer.Option(
++        ...,
++        "--run-root",
++        help="Directory where workspace, run-local CODEX_HOME, prompt, and audit files are written.",
++    ),
++    mcp_url: str = typer.Option(
++        "",
++        "--mcp-url",
++        help="DimOS MCP URL. Defaults to the active run's MCP URL when available.",
++    ),
++    server_name: str = typer.Option(
++        "dimos",
++        "--server-name",
++        help="MCP server name to expose in the run-local Codex config.",
++    ),
++    source_codex_home: Path | None = typer.Option(
++        None,
++        "--source-codex-home",
++        help="Source Codex home for minimal provider/auth copy; defaults to ~/.codex.",
++    ),
++    model: str = typer.Option(
++        "",
++        "--model",
++        help="Optional model override written into the run-local Codex config.",
++    ),
++    model_reasoning_effort: str = typer.Option(
++        "medium",
++        "--model-reasoning-effort",
++        help=(
++            "Run-local Codex reasoning effort. Defaults to medium so live runs do not "
++            "silently inherit a global high/xhigh profile."
++        ),
++    ),
++    service_tier: str = typer.Option(
++        "",
++        "--service-tier",
++        help="Optional Codex/OpenAI service tier config value, written only when provided.",
++    ),
++    codex_exec_timeout_s: float = typer.Option(
++        1800.0,
++        "--codex-exec-timeout-s",
++        help="Operator-facing timeout budget for the main codex exec run, recorded in launch.json.",
++    ),
++    sandbox: str = typer.Option(
++        "workspace-write",
++        "--sandbox",
++        help="Codex shell sandbox mode for the prepared command.",
++    ),
++    no_copy_auth: bool = typer.Option(
++        False,
++        "--no-copy-auth",
++        help="Do not copy auth.json / installation_id into the run-local CODEX_HOME.",
++    ),
++    no_goal_tools: bool = typer.Option(
++        False,
++        "--no-goal-tools",
++        help="Do not instruct Codex to call create_goal/get_goal/update_goal.",
++    ),
++    dangerously_bypass_sandbox: bool = typer.Option(
++        False,
++        "--dangerously-bypass-approvals-and-sandbox",
++        help="Prepare a command that disables Codex approvals and sandboxing.",
++    ),
++    mode: str = typer.Option(
++        "readonly",
++        "--mode",
++        help="Run mode: readonly, authority-proxy, or admin-override-debug.",
++    ),
++    prompt_mode: str = typer.Option(
++        "default",
++        "--prompt-mode",
++        help="Prompt policy variant: default (no external memory).",
++    ),
++    tool_profile: str = typer.Option(
++        "",
++        "--tool-profile",
++        help=(
++            "Go2 harness tool profile/audit label. Defaults to readonly_inspection "
++            "for readonly runs and vision_odom_local_motion for movement runs."
++        ),
++    ),
++    proxy_url: str = typer.Option(
++        "",
++        "--proxy-url",
++        help="Codex-facing MCP proxy URL for authority-proxy mode.",
++    ),
++    authority_scope: str = typer.Option(
++        "operator-approved live Go2 task",
++        "--authority-scope",
++        help="Operator-approved movement scope for authority-proxy mode.",
++    ),
++    authority_area: str = typer.Option(
++        "operator-approved local test area",
++        "--authority-area",
++        help="Operator-approved physical area for authority-proxy mode.",
++    ),
++    authority_duration_s: float = typer.Option(
++        3600.0,
++        "--authority-duration-s",
++        help="Movement authority envelope duration in seconds.",
++    ),
++    authority_tool: list[str] = typer.Option(
++        [],
++        "--authority-tool",
++        help="Movement tool allowed by the authority envelope; repeat for multiple tools.",
++    ),
++    max_movement_calls: int | None = typer.Option(
++        None,
++        "--max-movement-calls",
++        help="Optional maximum number of movement calls signed by the proxy envelope.",
++    ),
++    run_mcp_smoke: bool = typer.Option(
++        False,
++        "--run-mcp-smoke",
++        help="Run the MCP-only nested Codex smoke gate and fail closed on missing tools.",
++    ),
++    skip_mcp_smoke: bool = typer.Option(
++        False,
++        "--skip-mcp-smoke",
++        help="Skip the default MCP-only smoke gate for authority-proxy preparation.",
++    ),
++    defer_mcp_smoke: bool = typer.Option(
++        False,
++        "--defer-mcp-smoke",
++        help=(
++            "Record the default MCP smoke gate in launch.json but skip running it during "
++            "prepare-codex-run; the prepared runner will execute it after starting the proxy."
++        ),
++    ),
++    mcp_smoke_timeout_s: float | None = typer.Option(
++        None,
++        "--mcp-smoke-timeout-s",
++        help="Timeout for the nested Codex MCP smoke gate.",
++    ),
++    json_output: bool = typer.Option(
++        False,
++        "--json",
++        help="Print prepared run details as JSON.",
++    ),
++) -> None:
++    """Prepare a run-local Codex exec harness for the active DimOS MCP server."""
++    from dimos.agents.mcp.external_harness_codex import (
++        DEFAULT_MCP_SMOKE_TIMEOUT_S,
++        prepare_codex_harness_run,
++        run_codex_mcp_smoke_gate,
++    )
++
++    if skip_mcp_smoke and defer_mcp_smoke:
++        typer.echo("Error: --skip-mcp-smoke and --defer-mcp-smoke are mutually exclusive", err=True)
++        raise typer.Exit(2)
++
++    resolved_mcp_url = mcp_url
++    if not resolved_mcp_url:
++        try:
++            resolved_mcp_url = _get_mcp_run_entry().mcp_url
++        except SystemExit:
++            raise
++        except Exception as exc:
++            typer.echo(f"Error: could not resolve active MCP URL: {exc}", err=True)
++            raise typer.Exit(1) from exc
++
++    try:
++        effective_mcp_smoke_timeout_s = (
++            DEFAULT_MCP_SMOKE_TIMEOUT_S
++            if mcp_smoke_timeout_s is None
++            else mcp_smoke_timeout_s
++        )
++        prepared = prepare_codex_harness_run(
++            run_root=run_root,
++            task=task,
++            mcp_url=resolved_mcp_url,
++            source_codex_home=source_codex_home,
++            server_name=server_name,
++            model=model or None,
++            model_reasoning_effort=model_reasoning_effort or None,
++            service_tier=service_tier or None,
++            codex_exec_timeout_s=codex_exec_timeout_s,
++            mcp_smoke_timeout_s=effective_mcp_smoke_timeout_s,
++            sandbox=sandbox,
++            copy_auth=not no_copy_auth,
++            use_goal_tools=not no_goal_tools,
++            dangerously_bypass_sandbox=dangerously_bypass_sandbox,
++            mode=mode,  # type: ignore[arg-type]
++            prompt_mode=prompt_mode,  # type: ignore[arg-type]
++            tool_profile=tool_profile,
++            proxy_url=proxy_url or None,
++            authority_scope=authority_scope,
++            authority_area=authority_area,
++            authority_duration_s=authority_duration_s,
++            authority_allowed_movement_tools=tuple(authority_tool) if authority_tool else (),
++            max_movement_calls=max_movement_calls,
++            mcp_smoke_required=False if skip_mcp_smoke else None,
++        )
++    except ValueError as exc:
++        typer.echo(f"Error: {exc}", err=True)
++        raise typer.Exit(2) from exc
++
++    smoke_result = None
++    should_run_smoke = run_mcp_smoke or (
++        prepared.mcp_smoke_required and not skip_mcp_smoke and not defer_mcp_smoke
++    )
++    if should_run_smoke:
++        smoke_result = run_codex_mcp_smoke_gate(
++            prepared,
++            timeout_s=effective_mcp_smoke_timeout_s,
++        )
++        if not smoke_result.ok:
++            typer.echo(
++                f"MCP-only nested Codex smoke failed before live movement: {smoke_result.reason}",
++                err=True,
++            )
++            typer.echo(f"Smoke log: {smoke_result.log_path}", err=True)
++            typer.echo(f"Smoke stderr: {smoke_result.stderr_path}", err=True)
++            typer.echo(f"Smoke result: {smoke_result.result_path}", err=True)
++            raise typer.Exit(1)
++
++    payload = prepared.model_dump()
++    if smoke_result is not None:
++        payload["mcp_smoke_result"] = smoke_result.model_dump()
++    if json_output:
++        typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
++        return
++
++    typer.echo("Prepared isolated Codex harness run.")
++    typer.echo(f"Run root: {prepared.run_root}")
++    typer.echo(f"Workspace: {prepared.workspace}")
++    typer.echo(f"CODEX_HOME: {prepared.codex_home}")
++    typer.echo(f"Config: {prepared.config_path}")
++    typer.echo(f"Prompt: {prepared.prompt_path}")
++    typer.echo(f"Audit: {prepared.audit_path}")
++    typer.echo(f"Shareable summary: {prepared.shareable_summary_path}")
++    typer.echo(f"Mode: {prepared.mode}")
++    profile_name = (
++        prepared.tool_profile.get("name") if isinstance(prepared.tool_profile, dict) else None
++    )
++    if profile_name:
++        typer.echo(f"Tool profile: {profile_name}")
++    typer.echo(f"MCP URL: {prepared.mcp_url}")
++    typer.echo(f"Model: {prepared.model or '(config/default)'}")
++    typer.echo(f"Reasoning effort: {prepared.model_reasoning_effort or '(codex default)'}")
++    typer.echo(f"Codex exec timeout: {prepared.codex_exec_timeout_s}s")
++    if prepared.service_tier:
++        typer.echo(f"Service tier: {prepared.service_tier}")
++    typer.echo(f"MCP smoke prompt: {prepared.mcp_smoke_prompt_path}")
++    typer.echo("MCP-only smoke command:")
++    typer.echo(prepared.mcp_smoke_shell_command)
++    if smoke_result is not None:
++        typer.echo(f"MCP-only smoke: PASS ({smoke_result.reason})")
++    if prepared.proxy_shell_command is not None:
++        typer.echo("Proxy command:")
++        typer.echo(prepared.proxy_shell_command)
++    typer.echo("Command:")
++    typer.echo(prepared.shell_command)
++
++
++@mcp_app.command("authority-proxy")
++def mcp_authority_proxy(
++    task: str = typer.Option(..., "--task", help="Operator-approved task goal."),
++    upstream_mcp_url: str = typer.Option(
++        ...,
++        "--upstream-mcp-url",
++        help="Real DimOS MCP URL that remains the final movement authority.",
++    ),
++    proxy_host: str = typer.Option(
++        "127.0.0.1",
++        "--proxy-host",
++        help="Host for the local authority proxy.",
++    ),
++    proxy_port: int = typer.Option(
++        9992,
++        "--proxy-port",
++        help="Port for the local authority proxy.",
++    ),
++    scope: str = typer.Option(
++        "operator-approved live Go2 task",
++        "--scope",
++        help="Operator-approved movement scope.",
++    ),
++    area: str = typer.Option(
++        "operator-approved local test area",
++        "--area",
++        help="Operator-approved physical area.",
++    ),
++    duration_s: float = typer.Option(
++        3600.0,
++        "--duration-s",
++        help="Movement authority envelope duration in seconds.",
++    ),
++    authority_tool: list[str] = typer.Option(
++        [],
++        "--authority-tool",
++        help="Movement tool allowed by the authority envelope; repeat for multiple tools.",
++    ),
++    tool_profile: str = typer.Option(
++        "",
++        "--tool-profile",
++        help=(
++            "Go2 harness tool profile used to choose default authority tools when "
++            "--authority-tool is omitted."
++        ),
++    ),
++    max_movement_calls: int | None = typer.Option(
++        None,
++        "--max-movement-calls",
++        help="Optional maximum number of movement calls signed by the proxy envelope.",
++    ),
++) -> None:
++    """Run a local MCP proxy that signs movement calls inside a bounded envelope."""
++    import uvicorn
++
++    from dimos.agents.harness.go2_harness_profiles import go2_harness_tool_profile
++    from dimos.agents.mcp.external_harness_authority_proxy import (
++        MovementAuthorityEnvelope,
++        create_authority_proxy_app,
++    )
++
++    resolved_profile = go2_harness_tool_profile(tool_profile or "vision_odom_local_motion")
++    allowed_tools = tuple(authority_tool) or resolved_profile.default_authority_movement_tools
++    if not allowed_tools:
++        typer.echo(
++            f"Error: Go2 harness tool profile '{resolved_profile.name}' grants no movement tools; "
++            "use readonly mode or pass --authority-tool.",
++            err=True,
++        )
++        raise typer.Exit(2)
++
++    envelope = MovementAuthorityEnvelope.create(
++        task_goal=task,
++        scope=scope,
++        area=area,
++        duration_s=duration_s,
++        tool_profile=resolved_profile.name,
++        allowed_movement_tools=allowed_tools,
++        max_movement_calls=max_movement_calls,
++    )
++    proxy_url = f"http://{proxy_host}:{proxy_port}/mcp"
++    typer.echo("Starting DimOS external-harness movement authority proxy.")
++    typer.echo(f"Proxy URL: {proxy_url}")
++    typer.echo(f"Upstream MCP URL: {upstream_mcp_url}")
++    typer.echo(f"Tool profile: {resolved_profile.name}")
++    typer.echo(f"Envelope: {json.dumps(envelope.model_dump(), ensure_ascii=False)}")
++    app = create_authority_proxy_app(
++        upstream_url=upstream_mcp_url,
++        envelope=envelope,
++        proxy_url=proxy_url,
++    )
++    uvicorn.run(app, host=proxy_host, port=proxy_port)
++
++
++@mcp_app.command("status")
++def mcp_status(
++    mcp_url: str = typer.Option(
++        "",
++        "--mcp-url",
++        envvar="DIMOS_MCP_URL",
++        help="MCP URL to query. Defaults to DIMOS_MCP_URL, then the active DimOS run.",
++    ),
++) -> None:
++    """Show MCP server status (modules, skills)."""
++    adapter = _get_adapter(mcp_url=mcp_url or None)
++    try:
++        data = adapter.call_tool_text("server_status")
++    except requests.ConnectionError:
++        typer.echo(f"Error: no MCP server reachable at {adapter.url}", err=True)
+         raise typer.Exit(1)
+     except McpError as e:
+         typer.echo(f"Error: {e}", err=True)
+@@ -802,6 +2306,73 @@
+     typer.echo(f"Wrote {len(id_list)} tag(s) to {path}")
+ 
+ 
++def _default_rerun_record_path() -> Path:
++    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
++    return Path("logs") / f"rerun-record-{timestamp}.rrd"
++
++
++def _parse_rerun_record_max_hz(values: list[str]) -> dict[str, float]:
++    parsed: dict[str, float] = {}
++    for value in values:
++        if "=" not in value:
++            raise click.BadParameter("--max-hz must use ENTITY=HZ, e.g. world/global_map=0.5")
++        entity, hz_text = value.split("=", 1)
++        entity = entity.strip()
++        if not entity:
++            raise click.BadParameter("--max-hz entity cannot be empty")
++        try:
++            hz = float(hz_text)
++        except ValueError as exc:
++            raise click.BadParameter(f"--max-hz value must be numeric: {value}") from exc
++        if hz < 0:
++            raise click.BadParameter("--max-hz cannot be negative")
++        if entity.startswith("/"):
++            entity = f"world{entity}"
++        parsed[entity] = hz
++    return parsed
++
++
++@main.command(name="rerun-record")
++def rerun_record_cmd(
++    out: Path | None = typer.Option(
++        None,
++        "--out",
++        "-o",
++        help="Output .rrd path. Defaults to logs/rerun-record-<timestamp>.rrd",
++    ),
++    include: list[str] = typer.Option(
++        [],
++        "--include",
++        help="Topic or Rerun entity allowlist pattern. Repeatable.",
++    ),
++    exclude: list[str] = typer.Option(
++        [],
++        "--exclude",
++        help="Topic or Rerun entity blocklist pattern. Repeatable.",
++    ),
++    max_hz: list[str] = typer.Option(
++        [],
++        "--max-hz",
++        help="Throttle a Rerun entity as ENTITY=HZ. Repeatable.",
++    ),
++    memory_limit: str = typer.Option(
++        "25%",
++        "--memory-limit",
++        help="Accepted for parity with rerun-bridge; no live viewer is started.",
++    ),
++) -> None:
++    """Record Rerun data to a .rrd file until interrupted."""
++    from dimos.visualization.rerun.bridge import run_recording
++
++    run_recording(
++        out or _default_rerun_record_path(),
++        include=tuple(include),
++        exclude=tuple(exclude),
++        max_hz=_parse_rerun_record_max_hz(max_hz),
++        memory_limit=memory_limit,
++    )
++
++
+ @main.command(name="rerun-bridge")
+ def rerun_bridge_cmd(
+     memory_limit: str = typer.Option(

@@ -1,0 +1,7 @@
+# Reconcile serial-based services whenever a GoPro USB network interface appears.
+
+# Stable convenience aliases in addition to the requested /dev/video* nodes.
+ACTION=="add", SUBSYSTEM=="video4linux", KERNEL=="video42", SYMLINK+="gopro0", GROUP="video", MODE="0660"
+ACTION=="add", SUBSYSTEM=="video4linux", KERNEL=="video43", SYMLINK+="gopro1", GROUP="video", MODE="0660"
+ACTION=="add", SUBSYSTEM=="video4linux", KERNEL=="video44", SYMLINK+="gopro2", GROUP="video", MODE="0660"
+ACTION=="add", SUBSYSTEM=="video4linux", KERNEL=="video45", SYMLINK+="gopro3", GROUP="video", MODE="0660"

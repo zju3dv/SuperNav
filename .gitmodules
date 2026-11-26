@@ -1,3 +1,9 @@
-[submodule "robots/go2/dimos"]
-	path = robots/go2/dimos
+[submodule "SuperNav_v1/robots/go2/dimos"]
+	path = SuperNav_v1/robots/go2/dimos
 	url = https://github.com/dimensionalOS/dimos.git
+[submodule "SuperNav_v1_5/robots/go2/dimos"]
+	path = SuperNav_v1_5/robots/go2/dimos
+	url = https://github.com/dimensionalOS/dimos.git
+[submodule "SuperNav_v1_5/third_party/cartographer"]
+	path = SuperNav_v1_5/third_party/cartographer
+	url = https://github.com/cartographer-project/cartographer.git

@@ -1,0 +1,15 @@
+{
+  "environment": {
+    "backend": "habitat"
+  },
+  "bridge": {
+    "host": "127.0.0.1",
+    "per_episode": true,
+    "startup_timeout_s": 120
+  },
+  "mcp": {
+    "transport": "stdio",
+    "sensor_depth": true,
+    "name": "habitat-gs"
+  }
+}

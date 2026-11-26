@@ -1,0 +1,12 @@
+[Unit]
+Description=SuperNav DimOS LCM loopback route
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ip link set lo multicast on
+ExecStart=/usr/sbin/ip route replace 239.255.76.67/32 dev lo scope link
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

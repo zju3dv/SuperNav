@@ -1,0 +1,962 @@
+diff --git a/dimos/__init__.py b/dimos/__init__.py
+index 8466f7a..ff77191 100644
+--- a/dimos/__init__.py
++++ b/dimos/__init__.py
+@@ -12,6 +12,10 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from dimos.utils.protobuf_compat import install_message_factory_get_prototype_compat
++
++install_message_factory_get_prototype_compat()
++
+ 
+ def __getattr__(name: str) -> object:
+     if name == "Dimos":
+diff --git a/dimos/core/coordination/module_coordinator.py b/dimos/core/coordination/module_coordinator.py
+index a560152..0dd0ffc 100644
+--- a/dimos/core/coordination/module_coordinator.py
++++ b/dimos/core/coordination/module_coordinator.py
+@@ -68,6 +68,7 @@ class ModuleCoordinator(Resource):
+         self._transport_registry: dict[tuple[str, type], PubSubTransport[Any]] = {}
+         self._class_aliases: dict[type[ModuleBase], type[ModuleBase]] = {}
+         self._module_transports: dict[type[ModuleBase], dict[str, PubSubTransport[Any]]] = {}
++        self._disabled_module_names: tuple[str, ...] = ()
+         self._started = False
+         self._modules_lock = threading.RLock()
+         self._coordinator_rpc: CoordinatorRPC | None = None
+@@ -233,9 +234,11 @@ class ModuleCoordinator(Resource):
+         if not modules:
+             raise ValueError("No modules deployed. Call deploy() before start_all_modules().")
+ 
++        self._send_on_disabled_modules()
++        self._send_on_system_modules(early_only=True)
+         safe_thread_map(modules, lambda m: m.start())
+ 
+-        self._send_on_system_modules()
++        self._send_on_system_modules(skip_early=True)
+ 
+     def _resolve_class(self, cls: type[ModuleBase]) -> type[ModuleBase]:
+         return self._class_aliases.get(cls, cls)
+@@ -243,12 +246,27 @@ class ModuleCoordinator(Resource):
+     def get_instance(self, module: type[ModuleBase]) -> ModuleProxy:
+         return self._deployed_modules.get(self._resolve_class(module))  # type: ignore[return-value]
+ 
+-    def _send_on_system_modules(self) -> None:
++    def _send_on_system_modules(
++        self, *, early_only: bool = False, skip_early: bool = False
++    ) -> None:
+         modules = list(self._deployed_modules.values())
+         for module in modules:
++            actor_class = getattr(module, "actor_class", None)
++            is_early = bool(getattr(actor_class, "early_system_modules", False))
++            if early_only and not is_early:
++                continue
++            if skip_early and is_early:
++                continue
+             if hasattr(module, "on_system_modules"):
+                 module.on_system_modules(modules)
+ 
++    def _send_on_disabled_modules(self) -> None:
++        modules = list(self._deployed_modules.values())
++        disabled = list(self._disabled_module_names)
++        for module in modules:
++            if hasattr(module, "on_disabled_modules"):
++                module.on_disabled_modules(disabled)
++
+     def _connect_streams(self, blueprint: Blueprint) -> None:
+         streams: dict[tuple[str, type], list[tuple[type, str]]] = defaultdict(list)
+ 
+@@ -298,6 +316,7 @@ class ModuleCoordinator(Resource):
+         logger.info("Starting the modules")
+         coordinator = cls(g=global_config)
+         coordinator.start()
++        coordinator._disabled_module_names = _module_class_names(blueprint.disabled_modules_tuple)
+ 
+         _deploy_all_modules(blueprint, coordinator, global_config, blueprint_args)
+         coordinator._connect_streams(blueprint)
+@@ -359,6 +378,14 @@ class ModuleCoordinator(Resource):
+                 )
+ 
+         before = set(self._deployed_modules)
++        self._disabled_module_names = tuple(
++            dict.fromkeys(
++                (
++                    *self._disabled_module_names,
++                    *_module_class_names(blueprint.disabled_modules_tuple),
++                )
++            )
++        )
+ 
+         _deploy_all_modules(blueprint, self, self._global_config, blueprint_args)
+         self._connect_streams(blueprint)
+@@ -368,9 +395,11 @@ class ModuleCoordinator(Resource):
+ 
+         if new_modules:
+             safe_thread_map(new_modules, lambda m: m.build())
++            self._send_on_disabled_modules()
++            self._send_on_system_modules(early_only=True)
+             safe_thread_map(new_modules, lambda m: m.start())
+ 
+-        self._send_on_system_modules()
++        self._send_on_system_modules(skip_early=True)
+ 
+     def load_module(
+         self,
+@@ -401,17 +430,8 @@ class ModuleCoordinator(Resource):
+             )
+ 
+         proxy = self._deployed_modules[module_class]
+-
+-        try:
+-            proxy.stop()
+-        except Exception:
+-            logger.error(
+-                "Error stopping module during unload",
+-                module=module_class.__name__,
+-                exc_info=True,
+-            )
+-
+         python_wm = cast("WorkerManagerPython", self._managers["python"])
++
+         try:
+             python_wm.undeploy(proxy)
+         except Exception:
+@@ -420,6 +440,10 @@ class ModuleCoordinator(Resource):
+                 module=module_class.__name__,
+                 exc_info=True,
+             )
++        finally:
++            stop_rpc_client = getattr(proxy, "stop_rpc_client", None)
++            if callable(stop_rpc_client):
++                stop_rpc_client()
+ 
+         del self._deployed_modules[module_class]
+         self._deployed_atoms.pop(module_class, None)
+@@ -472,6 +496,11 @@ class ModuleCoordinator(Resource):
+         module_class = self._resolve_class(module_class)
+         if module_class not in self._deployed_modules:
+             raise ValueError(f"{module_class.__name__} is not deployed")
++        if not getattr(module_class, "restartable", True):
++            logger.warning(
++                "Skipping restart for non-restartable module", module=module_class.__name__
++            )
++            return self._deployed_modules[module_class]
+         if module_class.deployment != "python":
+             raise NotImplementedError(
+                 f"restart_module only supports python deployment, got {module_class.deployment!r}"
+@@ -855,6 +884,10 @@ def _connect_module_refs(
+         base_instance.set_module_ref(ref_name, cast("Any", proxy))
+ 
+ 
++def _module_class_names(modules: tuple[type[ModuleBase], ...]) -> tuple[str, ...]:
++    return tuple(dict.fromkeys(module.__name__ for module in modules))
++
++
+ def _async_methods_of_spec(spec: Any) -> frozenset[str]:
+     if not is_spec(spec):
+         return frozenset()
+diff --git a/dimos/core/coordination/python_worker.py b/dimos/core/coordination/python_worker.py
+index c0d5d8c..4a60645 100644
+--- a/dimos/core/coordination/python_worker.py
++++ b/dimos/core/coordination/python_worker.py
+@@ -233,7 +233,7 @@ class PythonWorker:
+                 response: WorkerResponse = self._conn.recv()
+ 
+             if response.error:
+-                raise RuntimeError(f"Failed to deploy module: {response.error}")
++                raise RuntimeError(f"Failed to deploy {module_class.__name__}: {response.error}")
+ 
+             actor = Actor(self._conn, module_class, self._worker_id, module_id, self._lock)
+             actor.set_ref(actor).result()
+diff --git a/dimos/core/global_config.py b/dimos/core/global_config.py
+index 6ea946e..ce013f7 100644
+--- a/dimos/core/global_config.py
++++ b/dimos/core/global_config.py
+@@ -14,6 +14,7 @@
+ 
+ import re
+ 
++from pydantic import AliasChoices, Field
+ from pydantic_settings import BaseSettings, SettingsConfigDict
+ 
+ from dimos.constants import DEFAULT_BUILD_NATIVE
+@@ -68,11 +69,137 @@ class GlobalConfig(BaseSettings):
+     listen_host: str = "127.0.0.1"
+     dimsim_scene: str = "apt"
+     dimsim_port: int = 8090
++    go2_auto_stand: bool = True
++    go2_lie_down_on_stop: bool = Field(
++        default=False,
++        validation_alias=AliasChoices("DIMOS_GO2_LIE_DOWN_ON_STOP", "go2_lie_down_on_stop"),
++    )
++    agent_profile: str = Field(
++        default="supervised_live",
++        validation_alias=AliasChoices("DIMOS_AGENT_PROFILE", "agent_profile"),
++    )
++    agent_control: str | None = Field(
++        default=None,
++        validation_alias=AliasChoices("DIMOS_CONTROL", "DIMOS_AGENT_CONTROL", "agent_control"),
++    )
++    agent_speak_mode: str | None = Field(
++        default=None,
++        validation_alias=AliasChoices("DIMOS_AGENT_SPEAK_MODE", "agent_speak_mode"),
++    )
++    agent_speak_rate_limit_s: float = Field(
++        default=2.0,
++        validation_alias=AliasChoices(
++            "DIMOS_AGENT_SPEAK_RATE_LIMIT_S",
++            "agent_speak_rate_limit_s",
++        ),
++    )
++    agent_speak_dedupe_window_s: float = Field(
++        default=30.0,
++        validation_alias=AliasChoices(
++            "DIMOS_AGENT_SPEAK_DEDUPE_WINDOW_S",
++            "agent_speak_dedupe_window_s",
++        ),
++    )
++    agent_movement_mode: str | None = Field(
++        default=None,
++        validation_alias=AliasChoices("DIMOS_AGENT_MOVEMENT_MODE", "agent_movement_mode"),
++    )
++    agent_dangerous_skills: str | None = Field(
++        default=None,
++        validation_alias=AliasChoices("DIMOS_AGENT_DANGEROUS_SKILLS", "agent_dangerous_skills"),
++    )
++    agent_tool_scope: str | None = Field(
++        default=None,
++        validation_alias=AliasChoices("DIMOS_AGENT_TOOL_SCOPE", "agent_tool_scope"),
++    )
++    agent_tool_policy_admin_override: bool = Field(
++        default=False,
++        validation_alias=AliasChoices(
++            "DIMOS_AGENT_TOOL_POLICY_ADMIN_OVERRIDE",
++            "agent_tool_policy_admin_override",
++        ),
++    )
++    agent_context_max_tokens: int = Field(
++        default=64000,
++        validation_alias=AliasChoices(
++            "DIMOS_AGENT_CONTEXT_MAX_TOKENS",
++            "agent_context_max_tokens",
++        ),
++    )
++    agent_context_recent_messages: int = Field(
++        default=80,
++        validation_alias=AliasChoices(
++            "DIMOS_AGENT_CONTEXT_RECENT_MESSAGES",
++            "DIMOS_AGENT_CONTEXT_RECENT_TURNS",
++            "agent_context_recent_messages",
++        ),
++    )
++    agent_context_tool_result_max_chars: int = Field(
++        default=2000,
++        validation_alias=AliasChoices(
++            "DIMOS_AGENT_CONTEXT_TOOL_RESULT_MAX_CHARS",
++            "agent_context_tool_result_max_chars",
++        ),
++    )
++    agent_context_image_max: int = Field(
++        default=3,
++        validation_alias=AliasChoices(
++            "DIMOS_AGENT_CONTEXT_IMAGE_MAX",
++            "agent_context_image_max",
++        ),
++    )
++    agent_auto_followup_max_attempts: int = Field(
++        default=1,
++        validation_alias=AliasChoices(
++            "DIMOS_AGENT_AUTO_FOLLOWUP_MAX_ATTEMPTS",
++            "agent_auto_followup_max_attempts",
++        ),
++    )
++    agent_navigation_auto_followup_max_attempts: int = Field(
++        default=3,
++        validation_alias=AliasChoices(
++            "DIMOS_AGENT_NAVIGATION_AUTO_FOLLOWUP_MAX_ATTEMPTS",
++            "agent_navigation_auto_followup_max_attempts",
++        ),
++    )
++    agent_artifact_dir: str | None = Field(
++        default=None,
++        validation_alias=AliasChoices("DIMOS_AGENT_ARTIFACT_DIR", "agent_artifact_dir"),
++    )
++    vlm_provider: str | None = Field(
++        default=None,
++        validation_alias=AliasChoices("DIMOS_VLM_PROVIDER", "vlm_provider"),
++    )
++    vlm_model: str | None = Field(
++        default=None,
++        validation_alias=AliasChoices("DIMOS_VLM_MODEL", "vlm_model"),
++    )
++    vlm_base_url: str | None = Field(
++        default=None,
++        validation_alias=AliasChoices("DIMOS_VLM_BASE_URL", "vlm_base_url"),
++    )
++    vlm_api_key: str | None = Field(
++        default=None,
++        validation_alias=AliasChoices("DIMOS_VLM_API_KEY", "vlm_api_key"),
++    )
++    vlm_offline: bool = Field(
++        default=False,
++        validation_alias=AliasChoices("DIMOS_VLM_OFFLINE", "vlm_offline"),
++    )
++    spatial_memory_mode: str | None = Field(
++        default=None,
++        validation_alias=AliasChoices("DIMOS_SPATIAL_MEMORY_MODE", "spatial_memory_mode"),
++    )
++    spatial_memory_new: bool | None = Field(
++        default=None,
++        validation_alias=AliasChoices("DIMOS_SPATIAL_MEMORY_NEW", "spatial_memory_new"),
++    )
+ 
+     model_config = SettingsConfigDict(
+         env_file=".env",
+         env_file_encoding="utf-8",
+         extra="ignore",
++        populate_by_name=True,
+     )
+ 
+     def update(self, **kwargs: object) -> None:
+diff --git a/dimos/core/module.py b/dimos/core/module.py
+index 26a2b6f..f402729 100644
+--- a/dimos/core/module.py
++++ b/dimos/core/module.py
+@@ -71,6 +71,7 @@ class SkillInfo:
+     args_schema: str
+     uses: tuple[str, ...] = ()
+     lifecycle: str = "instant"
++    required_modules: tuple[str, ...] = ()
+ 
+ 
+ class PeekNotFound:
+@@ -131,6 +132,14 @@ class ModuleBase(Configurable, CompositeResource):
+     # each other for CPU and the GIL.
+     dedicated_worker: ClassVar[bool] = False
+ 
++    # Set False for hardware modules whose live connection cannot be safely
++    # recreated by hot reload/restart.
++    restartable: ClassVar[bool] = True
++
++    # Modules that only need module metadata in on_system_modules can opt into
++    # this to avoid waiting for slow hardware modules to finish start().
++    early_system_modules: ClassVar[bool] = False
++
+     _rpc: RPCSpec | None = None
+     _tf: TFSpec | None = None
+     _loop: asyncio.AbstractEventLoop | None = None
+@@ -442,6 +451,9 @@ class ModuleBase(Configurable, CompositeResource):
+                 schema = json.dumps(tool(attr).args_schema.model_json_schema())
+                 uses = tuple(getattr(attr, "__skill_uses__", ()) or ())
+                 lifecycle = getattr(attr, "__skill_lifecycle__", "instant")
++                required_modules = tuple(
++                    str(name) for name in (getattr(attr, "__skill_requires_modules__", ()) or ())
++                )
+                 skills.append(
+                     SkillInfo(
+                         class_name=self.__class__.__name__,
+@@ -449,6 +461,7 @@ class ModuleBase(Configurable, CompositeResource):
+                         args_schema=schema,
+                         uses=uses,
+                         lifecycle=lifecycle,
++                        required_modules=required_modules,
+                     )
+                 )
+         return skills
+@@ -512,12 +525,18 @@ class ModuleBase(Configurable, CompositeResource):
+                 return
+             self._tools[name] = ToolStream(name)
+ 
+-    def tool_update(self, name: str, message: str) -> None:
++    def tool_update(
++        self,
++        name: str,
++        message: str,
++        metadata: dict[str, Any] | None = None,
++    ) -> None:
+         """Publish `message` on the tool-stream channel named `name`.
+ 
+         Safe to call from any thread. If `name` is not currently active (never
+         started, or already stopped), logs a warning and returns. Background
+-        loops racing against teardown don't need to guard themselves.
++        loops racing against teardown don't need to guard themselves. Optional
++        metadata is carried as display/status context, not model chat content.
+         """
+         with self._tools_lock:
+             stream = self._tools.get(name)
+@@ -528,7 +547,7 @@ class ModuleBase(Configurable, CompositeResource):
+                 module=type(self).__name__,
+             )
+             return
+-        stream.send(message)
++        stream.send(message, metadata=metadata)
+ 
+     def stop_tool(self, name: str) -> None:
+         """Close the tool-stream channel named `name`."""
+diff --git a/dimos/core/rpc_client.py b/dimos/core/rpc_client.py
+index 56dcb4e..cd2c76a 100644
+--- a/dimos/core/rpc_client.py
++++ b/dimos/core/rpc_client.py
+@@ -80,6 +80,19 @@ class RpcCall:
+         self._unsub_fns.append(unsub_fn)
+         return result
+ 
++    def call_with_timeout(self, rpc_timeout: float, *args: Any, **kwargs: Any) -> Any:
++        if not self._rpc:
++            logger.warning("RPC client not initialized")
++            return None
++
++        result, unsub_fn = self._rpc.call_sync(
++            f"{self._remote_name}/{self._name}",
++            (args, kwargs),  # type: ignore[arg-type]
++            rpc_timeout=rpc_timeout,
++        )
++        self._unsub_fns.append(unsub_fn)
++        return result
++
+     def __getstate__(self):  # type: ignore[no-untyped-def]
+         return (self._name, self._remote_name)
+ 
+@@ -139,10 +152,13 @@ class RPCClient:
+             self.rpc = None  # type: ignore[assignment]
+ 
+     def __reduce__(self):  # type: ignore[no-untyped-def]
+-        # Return the class and the arguments needed to reconstruct the object
++        # Reconstruct remote copies as lightweight RPC-only clients. The parent
++        # Actor is only useful inside the coordinator process; sending it over
++        # LCM bloats lifecycle hook payloads and can make startup unreliable on
++        # small socket buffers.
+         return (
+             self.__class__,
+-            (self.actor_instance, self.actor_class),
++            (None, self.actor_class),
+         )
+ 
+     # passthrough
+diff --git a/dimos/core/run_registry.py b/dimos/core/run_registry.py
+index 119ac4b..dec2f18 100644
+--- a/dimos/core/run_registry.py
++++ b/dimos/core/run_registry.py
+@@ -46,6 +46,16 @@ class RunEntry:
+     config_overrides: dict[str, object] = field(default_factory=dict)
+     original_argv: list[str] = field(default_factory=list)
+ 
++    @property
++    def mcp_url(self) -> str:
++        """Local MCP URL for CLI tools to reach this run's server."""
++
++        port = int(self.config_overrides.get("mcp_port") or 9990)
++        host = str(self.config_overrides.get("listen_host") or "127.0.0.1")
++        if host in {"0.0.0.0", "::"}:
++            host = "127.0.0.1"
++        return f"http://{host}:{port}/mcp"
++
+     @property
+     def registry_path(self) -> Path:
+         return REGISTRY_DIR / f"{self.run_id}.json"
+diff --git a/dimos/core/transport.py b/dimos/core/transport.py
+index 6435003..2d2831d 100644
+--- a/dimos/core/transport.py
++++ b/dimos/core/transport.py
+@@ -162,15 +162,24 @@ class JpegLcmTransport(LCMTransport):  # type: ignore[type-arg]
+         self._started = False
+ 
+ 
++def _reconstruct_pshm_transport(topic: str, shm_kwargs: dict) -> pSHMTransport:
++    return pSHMTransport(topic, **shm_kwargs)
++
++
+ class pSHMTransport(PubSubTransport[T]):
+     _started: bool = False
+ 
+     def __init__(self, topic: str, **kwargs) -> None:  # type: ignore[no-untyped-def]
+         super().__init__(topic)
++        self._shm_kwargs = kwargs
+         self.shm = PickleSharedMemory(**kwargs)
+ 
+     def __reduce__(self):  # type: ignore[no-untyped-def]
+-        return (pSHMTransport, (self.topic,))
++        # kwargs must survive pickling to forkserver workers: they carry e.g.
++        # default_capacity, which is baked into the SHM segment name. Dropping
++        # them makes every worker fall back to the default capacity and can
++        # reject payloads the blueprint explicitly sized for.
++        return (_reconstruct_pshm_transport, (self.topic, self._shm_kwargs))
+ 
+     def broadcast(self, _, msg) -> None:  # type: ignore[no-untyped-def]
+         if not self._started:
+diff --git a/dimos/protocol/rpc/pubsubrpc.py b/dimos/protocol/rpc/pubsubrpc.py
+index abfd521..cee601d 100644
+--- a/dimos/protocol/rpc/pubsubrpc.py
++++ b/dimos/protocol/rpc/pubsubrpc.py
+@@ -209,9 +209,11 @@ class PubSubRPCMixin(RPCSpec, PubSub[TopicT, MsgT], Generic[TopicT, MsgT]):
+                     if res_id is None:
+                         return
+ 
+-                    # Look up callback for this msg_id
++                    # Look up callback for this msg_id. The callback may return
++                    # False to keep listening briefly for a better duplicate
++                    # response from an overlapping old/new RPC service.
+                     with self._response_subs_lock:
+-                        callback = callbacks_dict.pop(res_id, None)
++                        callback = callbacks_dict.get(res_id)
+ 
+                     if callback is None:
+                         return  # No callback registered (already handled or timed out)
+@@ -225,10 +227,15 @@ class PubSubRPCMixin(RPCSpec, PubSub[TopicT, MsgT], Generic[TopicT, MsgT]):
+                         from dimos.protocol.rpc.rpc_utils import SerializedException
+ 
+                         exc = deserialize_exception(cast("SerializedException", exc_data))
+-                        callback(exc)
++                        remove_callback = callback(exc) is not False
+                     else:
+                         # Normal response - pass the result
+-                        callback(res.get("res"))
++                        remove_callback = callback(res.get("res")) is not False
++
++                    if remove_callback:
++                        with self._response_subs_lock:
++                            if callbacks_dict.get(res_id) is callback:
++                                callbacks_dict.pop(res_id, None)
+ 
+                 # Create single shared subscription
+                 unsub = self.subscribe(topic_res, shared_response_handler)
+diff --git a/dimos/protocol/rpc/spec.py b/dimos/protocol/rpc/spec.py
+index 69537c3..03ea0a8 100644
+--- a/dimos/protocol/rpc/spec.py
++++ b/dimos/protocol/rpc/spec.py
+@@ -15,6 +15,7 @@
+ import asyncio
+ from collections.abc import Callable
+ import threading
++import time
+ from types import MappingProxyType
+ from typing import Any, Protocol, overload
+ 
+@@ -41,6 +42,23 @@ DEFAULT_RPC_TIMEOUTS: MappingProxyType[str, float] = MappingProxyType(
+     }
+ )
+ 
++_FAST_DUPLICATE_FAILURE_ERRORS = {"connection_missing", "publish_request_failed"}
++_FAST_DUPLICATE_FAILURE_PREFERENCE_WINDOW_S = 0.5
++
++
++def _is_fast_duplicate_failure(value: Any) -> bool:
++    return (
++        isinstance(value, dict)
++        and value.get("ok") is False
++        and value.get("error") in _FAST_DUPLICATE_FAILURE_ERRORS
++    )
++
++
++def _is_successish_duplicate_response(value: Any) -> bool:
++    return not isinstance(value, BaseException) and not (
++        isinstance(value, dict) and value.get("ok") is False
++    )
++
+ 
+ class RPCClient(Protocol):
+     # call_sync resolves per-method overrides from rpc_timeouts,
+@@ -55,7 +73,7 @@ class RPCClient(Protocol):
+ 
+     # if we provide callback, we do get return unsub f
+     @overload
+-    def call(self, name: str, arguments: Args, cb: Callable[[Any], None]) -> Callable[[], Any]: ...
++    def call(self, name: str, arguments: Args, cb: Callable[[Any], Any]) -> Callable[[], Any]: ...
+ 
+     def call(self, name: str, arguments: Args, cb: Callable | None) -> Callable[[], Any] | None: ...  # type: ignore[type-arg]
+ 
+@@ -69,22 +87,51 @@ class RPCClient(Protocol):
+             rpc_timeout = self.rpc_timeouts.get(name) or self.rpc_timeouts.get(
+                 method, self.default_rpc_timeout
+             )
+-        event = threading.Event()
+-
+-        def receive_value(val) -> None:  # type: ignore[no-untyped-def]
+-            event.result = val  # type: ignore[attr-defined]  # attach to event
+-            event.set()
++        deadline = time.monotonic() + rpc_timeout
++        condition = threading.Condition()
++        result: Any = Empty
++
++        def receive_value(val: Any) -> bool:
++            nonlocal result
++            with condition:
++                if result is Empty or (
++                    _is_fast_duplicate_failure(result) and _is_successish_duplicate_response(val)
++                ):
++                    result = val
++                condition.notify_all()
++                return not _is_fast_duplicate_failure(result)
+ 
+         unsub_fn = self.call(name, arguments, receive_value)
+-        if not event.wait(rpc_timeout):
+-            raise TimeoutError(f"RPC call to '{name}' timed out after {rpc_timeout} seconds")
+-
+-        # Check if the result is an exception and raise it
+-        result = event.result  # type: ignore[attr-defined]
+-        if isinstance(result, BaseException):
+-            raise result
+-
+-        return result, unsub_fn
++        try:
++            with condition:
++                while result is Empty:
++                    remaining = deadline - time.monotonic()
++                    if remaining <= 0 or not condition.wait(remaining):
++                        raise TimeoutError(
++                            f"RPC call to '{name}' timed out after {rpc_timeout} seconds"
++                        )
++
++                if _is_fast_duplicate_failure(result):
++                    preference_deadline = min(
++                        deadline,
++                        time.monotonic() + _FAST_DUPLICATE_FAILURE_PREFERENCE_WINDOW_S,
++                    )
++                    while _is_fast_duplicate_failure(result):
++                        remaining = preference_deadline - time.monotonic()
++                        if remaining <= 0 or not condition.wait(remaining):
++                            break
++
++            if result is Empty:
++                raise TimeoutError(f"RPC call to '{name}' timed out after {rpc_timeout} seconds")
++
++            # Check if the result is an exception and raise it
++            if isinstance(result, BaseException):
++                raise result
++
++            return result, unsub_fn
++        finally:
++            if unsub_fn is not None:
++                unsub_fn()
+ 
+     async def call_async(self, name: str, arguments: Args) -> Any:
+         loop = asyncio.get_event_loop()
+diff --git a/dimos/protocol/service/lcmservice.py b/dimos/protocol/service/lcmservice.py
+index cd7992e..f147ad2 100644
+--- a/dimos/protocol/service/lcmservice.py
++++ b/dimos/protocol/service/lcmservice.py
+@@ -33,9 +33,29 @@ logger = setup_logger()
+ 
+ _DEFAULT_LCM_HOST = "239.255.76.67"
+ _DEFAULT_LCM_PORT = "7667"
++
++
++def _env_int(name: str, default: int) -> int:
++    try:
++        return int(os.environ.get(name, default))
++    except (TypeError, ValueError):
++        return default
++
++
++DEFAULT_LCM_RCVBUF_BYTES = _env_int("DIMOS_LCM_RCVBUF_BYTES", 67_108_864)
++
++
++def _append_udpm_recv_buf_size(url: str, recv_buf_bytes: int) -> str:
++    if recv_buf_bytes <= 0 or not url.startswith("udpm://") or "recv_buf_size=" in url:
++        return url
++    separator = "&" if "?" in url else "?"
++    return f"{url}{separator}recv_buf_size={recv_buf_bytes}"
++
++
+ # LCM_DEFAULT_URL is used by LCM (we didn't pick that env var name)
+-_DEFAULT_LCM_URL = os.getenv(
+-    "LCM_DEFAULT_URL", f"udpm://{_DEFAULT_LCM_HOST}:{_DEFAULT_LCM_PORT}?ttl=0"
++_DEFAULT_LCM_URL = _append_udpm_recv_buf_size(
++    os.getenv("LCM_DEFAULT_URL", f"udpm://{_DEFAULT_LCM_HOST}:{_DEFAULT_LCM_PORT}?ttl=0"),
++    DEFAULT_LCM_RCVBUF_BYTES,
+ )
+ 
+ 
+@@ -51,6 +71,7 @@ class LCMConfig(BaseConfig):
+     ttl: int = 0
+     url: str = _DEFAULT_LCM_URL
+     lcm: lcm_mod.LCM | None = None
++    recv_buf_size: int = DEFAULT_LCM_RCVBUF_BYTES
+ 
+ 
+ _LCM_LOOP_TIMEOUT = 50
+@@ -76,7 +97,8 @@ class LCMService(Service):
+         if self.config.lcm:
+             self.l = self.config.lcm
+         else:
+-            self.l = lcm_mod.LCM(self.config.url) if self.config.url else lcm_mod.LCM()
++            url = _append_udpm_recv_buf_size(self.config.url, self.config.recv_buf_size)
++            self.l = lcm_mod.LCM(url) if url else lcm_mod.LCM()
+ 
+         self._l_lock = threading.Lock()
+         self._stop_event = threading.Event()
+@@ -114,7 +136,8 @@ class LCMService(Service):
+             if self.config.lcm:
+                 self.l = self.config.lcm
+             else:
+-                self.l = lcm_mod.LCM(self.config.url) if self.config.url else lcm_mod.LCM()
++                url = _append_udpm_recv_buf_size(self.config.url, self.config.recv_buf_size)
++                self.l = lcm_mod.LCM(url) if url else lcm_mod.LCM()
+ 
+         self._stop_event.clear()
+         self._loop_running.clear()
+diff --git a/dimos/protocol/service/system_configurator/base.py b/dimos/protocol/service/system_configurator/base.py
+index 8c9e2b4..44e572e 100644
+--- a/dimos/protocol/service/system_configurator/base.py
++++ b/dimos/protocol/service/system_configurator/base.py
+@@ -77,6 +77,10 @@ class SystemConfigurator(ABC):
+ 
+ 
+ def configure_system(checks: list[SystemConfigurator], check_only: bool = False) -> None:
++    if os.environ.get("DIMOS_SKIP_SYSTEM_CONFIG"):
++        logger.info("DIMOS_SKIP_SYSTEM_CONFIG set: skipping system configuration.")
++        return
++
+     # Skip in test runs — we'd otherwise prompt for sudo from a non-
+     # interactive subprocess and kill the worker. The self-hosted CI
+     # runner has its host config baked in via the container image, so
+diff --git a/dimos/protocol/service/system_configurator/lcm.py b/dimos/protocol/service/system_configurator/lcm.py
+index 13538c5..0f37d05 100644
+--- a/dimos/protocol/service/system_configurator/lcm.py
++++ b/dimos/protocol/service/system_configurator/lcm.py
+@@ -47,7 +47,7 @@ def _save_sysctl_conf(data: dict[str, int]) -> None:
+ 
+ class MulticastConfiguratorLinux(SystemConfigurator):
+     critical = True
+-    MULTICAST_PREFIX = "224.0.0.0/4"
++    MULTICAST_PREFIX = "239.255.76.67/32"
+ 
+     def __init__(self, loopback_interface: str = "lo") -> None:
+         self.loopback_interface = loopback_interface
+@@ -66,7 +66,7 @@ class MulticastConfiguratorLinux(SystemConfigurator):
+         self.add_route_cmd = [
+             "ip",
+             "route",
+-            "add",
++            "replace",
+             self.MULTICAST_PREFIX,
+             "dev",
+             self.loopback_interface,
+diff --git a/dimos/utils/cli/agentspy/agentspy.py b/dimos/utils/cli/agentspy/agentspy.py
+index 685e5c0..8dbd41e 100644
+--- a/dimos/utils/cli/agentspy/agentspy.py
++++ b/dimos/utils/cli/agentspy/agentspy.py
+@@ -29,6 +29,7 @@ from textual.app import App, ComposeResult
+ from textual.binding import Binding
+ from textual.widgets import Footer, RichLog
+ 
++from dimos.agents.harness.display_content import content_to_display_text
+ from dimos.protocol.pubsub.impl.lcmpubsub import PickleLCM, Topic
+ from dimos.utils.cli import theme
+ 
+@@ -118,21 +119,21 @@ def get_message_type_and_style(msg: AnyMessage) -> tuple[str, str]:
+ def format_message_content(msg: AnyMessage) -> str:
+     """Format message content for display."""
+     if isinstance(msg, ToolMessage):
+-        return f"{msg.name}() -> {msg.content}"
++        return f"{msg.name}() -> {content_to_display_text(msg.content)}"
+     elif isinstance(msg, AIMessage) and msg.tool_calls:
+         # Include tool calls in content
+         tool_info = []
+         for tc in msg.tool_calls:
+-            args_str = str(tc.get("args", {}))
++            args_str = content_to_display_text(tc.get("args", {}))
+             tool_info.append(f"{tc.get('name')}({args_str})")
+-        content = msg.content or ""
++        content = content_to_display_text(msg.content) if msg.content else ""
+         if content and tool_info:
+             return f"{content}\n[Tool Calls: {', '.join(tool_info)}]"
+         elif tool_info:
+             return f"[Tool Calls: {', '.join(tool_info)}]"
+         return content  # type: ignore[return-value]
+     else:
+-        return str(msg.content) if hasattr(msg, "content") else str(msg)
++        return content_to_display_text(msg.content) if hasattr(msg, "content") else str(msg)
+ 
+ 
+ class AgentSpyApp(App):  # type: ignore[type-arg]
+diff --git a/dimos/utils/cli/human/humancli.py b/dimos/utils/cli/human/humancli.py
+index 45faef6..24c87ce 100644
+--- a/dimos/utils/cli/human/humancli.py
++++ b/dimos/utils/cli/human/humancli.py
+@@ -33,6 +33,13 @@ from textual.geometry import Size
+ from textual.strip import Strip
+ from textual.widgets import Input, RichLog, Static
+ 
++from dimos.agents.harness.display_content import content_to_display_text, redact_display_content
++from dimos.agents.harness.human_input_dispatch import (
++    HumanInputDispatcher,
++    HumanInputDispatchError,
++)
++from dimos.agents.harness.tool_status import ToolStatusMessage
++from dimos.agents.harness.tool_status_display import tool_status_context_lines
+ from dimos.agents.mcp import tool_stream
+ from dimos.core.transport import pLCMTransport
+ from dimos.utils.cli import theme
+@@ -97,6 +104,7 @@ class ToolPanel:
+         self.entries: deque[tuple[str, str, str]] = deque(maxlen=RECENT_LINES)
+         self.count = 0
+         self.static: Static | None = None
++        self.status_context: dict[str, Any] | None = None
+ 
+ 
+ class ToolPanelRegion:
+@@ -115,16 +123,26 @@ class ToolPanelRegion:
+         self._flush = flush_fn
+         self._panels: dict[str, ToolPanel] = {}
+ 
+-    def update(self, tool_name: str, text: str, kind: str, timestamp: str) -> None:
++    def update(
++        self,
++        tool_name: str,
++        text: str,
++        kind: str,
++        timestamp: str,
++        status_context: dict[str, Any] | None = None,
++    ) -> None:
+         panel = self._panels.get(tool_name)
+         if panel is None:
+             panel = ToolPanel(tool_name, datetime.now())
+             self._panels[tool_name] = panel
++            panel.status_context = status_context
+             panel.entries.append((timestamp, kind, text))
+             panel.count = 1
+             panel.static = Static(self._render(panel))
+             self._container.mount(panel.static)
+         else:
++            if status_context is not None:
++                panel.status_context = status_context
+             panel.entries.append((timestamp, kind, text))
+             panel.count += 1
+             assert panel.static is not None
+@@ -144,6 +162,9 @@ class ToolPanelRegion:
+         hidden = panel.count - len(panel.entries)
+         if hidden > 0:
+             body.append(f"(+{hidden} earlier)\n", style=theme.DIM)
++        for line in tool_status_context_lines(panel.status_context):
++            body.append(line, style=theme.DIM)
++            body.append("\n", style=theme.DIM)
+         for i, (timestamp, kind, text) in enumerate(panel.entries):
+             if i:
+                 body.append("\n")
+@@ -267,6 +288,7 @@ class HumanCLIApp(App):  # type: ignore[type-arg]
+     def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+         super().__init__(*args, **kwargs)
+         self._human_transport = pLCMTransport("/human_input")  # type: ignore[var-annotated]
++        self._human_input = HumanInputDispatcher(self._human_transport)
+         self._agent_transport = pLCMTransport("/agent")  # type: ignore[var-annotated]
+         self._agent_idle = pLCMTransport("/agent_idle")  # type: ignore[var-annotated]
+         self.chat_log: RichLog | None = None
+@@ -354,11 +376,11 @@ class HumanCLIApp(App):  # type: ignore[type-arg]
+                     self._add_message,
+                     timestamp,
+                     "system",
+-                    truncate_display_string(msg.content, 1000),
++                    truncate_display_string(content_to_display_text(msg.content), 1000),
+                     theme.YELLOW,
+                 )
+             elif isinstance(msg, AIMessage):
+-                content = msg.content or ""
++                content = content_to_display_text(msg.content) if msg.content else ""
+                 tool_calls = getattr(msg, "tool_calls", None) or msg.additional_kwargs.get(
+                     "tool_calls", []
+                 )
+@@ -397,6 +419,18 @@ class HumanCLIApp(App):  # type: ignore[type-arg]
+                     msg.content,
+                     getattr(msg, "tool_call_id", None),
+                 )
++            elif isinstance(msg, ToolStatusMessage):
++                self._reply_target = msg.tool_name
++                text = content_to_display_text(msg.content) if msg.content else ""
++                if text:
++                    self.call_from_thread(
++                        self._tool_panels.update,
++                        msg.tool_name,
++                        text,
++                        "tool",
++                        timestamp,
++                        msg.status_context,
++                    )
+             elif isinstance(msg, HumanMessage):
+                 # Tool-stream updates arrive here as `[tool:NAME] <text>`. Route
+                 # the update into the tool's box and remember the tool so the
+@@ -408,12 +442,20 @@ class HumanCLIApp(App):  # type: ignore[type-arg]
+                     self._reply_target = name
+                     if text:
+                         self.call_from_thread(
+-                            self._tool_panels.update, name, text, "tool", timestamp
++                            self._tool_panels.update,
++                            name,
++                            content_to_display_text(text),
++                            "tool",
++                            timestamp,
+                         )
+                     return
+                 self._reply_target = None
+                 self.call_from_thread(
+-                    self._add_message, timestamp, "human", msg.content, theme.HUMAN
++                    self._add_message,
++                    timestamp,
++                    "human",
++                    content_to_display_text(msg.content),
++                    theme.HUMAN,
+                 )
+                 # Keep the spinner up while this turn is processed (also re-shows
+                 # it in the rare case a stale idle signal hid it post-submit).
+@@ -491,7 +533,7 @@ class HumanCLIApp(App):  # type: ignore[type-arg]
+     def _format_tool_call(self, tool_call: ToolCall) -> str:
+         """Format a tool call for display."""
+         name = tool_call.get("name", "unknown")
+-        args = tool_call.get("args", {})
++        args = redact_display_content(tool_call.get("args", {}))
+         args_str = json.dumps(args, separators=(",", ":"))
+         return f"{TOOL_CALL_MARKER} {name}({args_str})"
+ 
+@@ -500,8 +542,8 @@ class HumanCLIApp(App):  # type: ignore[type-arg]
+         if call_id and strips:
+             self._tool_call_anchors[call_id] = strips
+ 
+-    def _write_tool_result(self, timestamp: str, content: str, call_id: str | None) -> None:
+-        text = f"{TOOL_RESULT_MARKER} {content}"
++    def _write_tool_result(self, timestamp: str, content: Any, call_id: str | None) -> None:
++        text = f"{TOOL_RESULT_MARKER} {content_to_display_text(content)}"
+         anchor = self._tool_call_anchors.pop(call_id, None) if call_id else None
+         if anchor is None:
+             # No matching call on screen (e.g. a lookout continuation) -> append.
+@@ -641,7 +683,18 @@ Tool calls are displayed in cyan with ▶ prefix"""
+         # agent first drains any queued tool-stream updates.
+         if self._thinking is not None:
+             self._thinking.show()
+-        self._human_transport.publish(message)
++        try:
++            result = self._human_input.send(message)
++        except HumanInputDispatchError as e:
++            if self._thinking is not None:
++                self._thinking.hide()
++            self._add_system_message(f"Failed to send input through DimOS MCP: {e}")
++            return
++        if result.route == "lcm_fallback" and not result.authority_preemption_supported:
++            self._add_system_message(
++                "MCP agent_send was unavailable; sent through LCM fallback, so "
++                "server-side movement authority preemption was not confirmed."
++            )
+ 
+     def action_clear(self) -> None:
+         """Clear the chat log."""
+diff --git a/dimos/utils/safe_thread_map.py b/dimos/utils/safe_thread_map.py
+index 3ae8308..c057f69 100644
+--- a/dimos/utils/safe_thread_map.py
++++ b/dimos/utils/safe_thread_map.py
+@@ -16,6 +16,7 @@ from __future__ import annotations
+ from collections.abc import Callable, Sequence
+ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+ import sys
++import traceback
+ from typing import Any, TypeVar
+ 
+ if sys.version_info < (3, 11):
+@@ -81,6 +82,8 @@ def safe_thread_map(
+         if on_errors is not None:
+             zipped = [(items[i], outcomes[i]) for i in range(len(items))]
+             return on_errors(zipped, successes, errors)  # type: ignore[no-any-return]
++        for error in errors:
++            traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
+         raise ExceptionGroup("safe_thread_map failed", errors)
+ 
+     return [outcomes[i] for i in range(len(items))]  # type: ignore[misc]

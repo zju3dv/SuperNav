@@ -1,0 +1,28 @@
+name: supernav-cartographer
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - cmake>=3.20
+  - make
+  - ninja
+  - pkg-config
+  - gxx_linux-64
+  - libboost-devel
+  # Cartographer requires the SuiteSparse component. Newer CPU and GPU Ceres
+  # variants either omit it or bind the build to a host CUDA toolkit.
+  - ceres-solver=2.2.0=h417fa77_5
+  - eigen=3.4
+  - libabseil
+  - cairo
+  - zlib
+  - freetype
+  - expat
+  - gflags
+  - glog
+  - gtest
+  # The pinned Cartographer FindLuaGoogle module enumerates Lua 5.2 and 5.3.
+  - lua=5.3
+  - libprotobuf
+  - protobuf

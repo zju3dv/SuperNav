@@ -1,0 +1,612 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ef2fcb3..1d79210 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -273,6 +273,8 @@ target_link_libraries(${PROJECT_NAME} PUBLIC ${PROTOBUF_LIBRARY}
+   absl::base
+   absl::debugging
+   absl::flat_hash_map
++  absl::check
++  absl::log
+   absl::memory
+   absl::meta
+   absl::numeric
+@@ -282,6 +284,19 @@ target_link_libraries(${PROJECT_NAME} PUBLIC ${PROTOBUF_LIBRARY}
+   absl::time
+   absl::utility
+ )
++target_compile_definitions(${PROJECT_NAME} PUBLIC
++  GUARDED_BY=ABSL_GUARDED_BY
++  PT_GUARDED_BY=ABSL_PT_GUARDED_BY
++  LOCKS_EXCLUDED=ABSL_LOCKS_EXCLUDED
++  EXCLUSIVE_LOCKS_REQUIRED=ABSL_EXCLUSIVE_LOCKS_REQUIRED
++  SHARED_LOCKS_REQUIRED=ABSL_SHARED_LOCKS_REQUIRED
++  LOCK_RETURNED=ABSL_LOCK_RETURNED
++  LOCKABLE=ABSL_LOCKABLE
++  SCOPED_LOCKABLE=ABSL_SCOPED_LOCKABLE
++  EXCLUSIVE_LOCK_FUNCTION=ABSL_EXCLUSIVE_LOCK_FUNCTION
++  SHARED_LOCK_FUNCTION=ABSL_SHARED_LOCK_FUNCTION
++  UNLOCK_FUNCTION=ABSL_UNLOCK_FUNCTION
++  NO_THREAD_SAFETY_ANALYSIS=ABSL_NO_THREAD_SAFETY_ANALYSIS)
+ if (NOT WIN32)
+   target_link_libraries(${PROJECT_NAME} PUBLIC pthread)
+ endif()
+diff --git a/cartographer/mapping/internal/2d/local_trajectory_builder_2d.cc b/cartographer/mapping/internal/2d/local_trajectory_builder_2d.cc
+index 5bda793..7f59421 100644
+--- a/cartographer/mapping/internal/2d/local_trajectory_builder_2d.cc
++++ b/cartographer/mapping/internal/2d/local_trajectory_builder_2d.cc
+@@ -44,7 +44,10 @@ LocalTrajectoryBuilder2D::LocalTrajectoryBuilder2D(
+       real_time_correlative_scan_matcher_(
+           options_.real_time_correlative_scan_matcher_options()),
+       ceres_scan_matcher_(options_.ceres_scan_matcher_options()),
+-      range_data_collator_(expected_range_sensor_ids) {}
++      range_data_collator_(expected_range_sensor_ids) {
++  CHECK(!options_.authoritative_odometry() || !options_.use_imu_data())
++      << "authoritative_odometry currently requires use_imu_data = false";
++}
+
+ LocalTrajectoryBuilder2D::~LocalTrajectoryBuilder2D() {}
+
+@@ -125,6 +128,20 @@ LocalTrajectoryBuilder2D::AddRangeData(
+     return nullptr;
+   }
+
++  absl::optional<transform::Rigid3d> authoritative_pose;
++  if (options_.authoritative_odometry()) {
++    authoritative_pose = GetAuthoritativeOdometryPose(time);
++    if (!authoritative_pose.has_value()) {
++      // Cartographer's sensor collator can release the first range packet at
++      // the shared queue start before the equal-time odometry packet. Treat
++      // that one-packet synchronization warm-up as expected, not a mapping
++      // failure. No scan matching is performed without an authoritative pose.
++      LOG(INFO) << "Waiting for authoritative odometry at range data time "
++                << time;
++      return nullptr;
++    }
++  }
++
+   CHECK(!synchronized_data.ranges.empty());
+   // TODO(gaschler): Check if this can strictly be 0.
+   CHECK_LE(synchronized_data.ranges.back().point_time.time, 0.f);
+@@ -151,7 +168,9 @@ LocalTrajectoryBuilder2D::AddRangeData(
+       time_point = extrapolator_->GetLastExtrapolatedTime();
+     }
+     range_data_poses.push_back(
+-        extrapolator_->ExtrapolatePose(time_point).cast<float>());
++        options_.authoritative_odometry()
++            ? authoritative_pose.value().cast<float>()
++            : extrapolator_->ExtrapolatePose(time_point).cast<float>());
+   }
+
+   if (num_accumulated_ == 0) {
+@@ -203,7 +222,7 @@ LocalTrajectoryBuilder2D::AddRangeData(
+         TransformToGravityAlignedFrameAndFilter(
+             gravity_alignment.cast<float>() * range_data_poses.back().inverse(),
+             accumulated_range_data_),
+-        gravity_alignment, sensor_duration);
++        gravity_alignment, sensor_duration, authoritative_pose);
+   }
+   return nullptr;
+ }
+@@ -213,18 +232,13 @@ LocalTrajectoryBuilder2D::AddAccumulatedRangeData(
+     const common::Time time,
+     const sensor::RangeData& gravity_aligned_range_data,
+     const transform::Rigid3d& gravity_alignment,
+-    const absl::optional<common::Duration>& sensor_duration) {
++    const absl::optional<common::Duration>& sensor_duration,
++    const absl::optional<transform::Rigid3d>& authoritative_pose) {
+   if (gravity_aligned_range_data.returns.empty()) {
+     LOG(WARNING) << "Dropped empty horizontal range data.";
+     return nullptr;
+   }
+
+-  // Computes a gravity aligned pose prediction.
+-  const transform::Rigid3d non_gravity_aligned_pose_prediction =
+-      extrapolator_->ExtrapolatePose(time);
+-  const transform::Rigid2d pose_prediction = transform::Project2D(
+-      non_gravity_aligned_pose_prediction * gravity_alignment.inverse());
+-
+   const sensor::PointCloud& filtered_gravity_aligned_point_cloud =
+       sensor::AdaptiveVoxelFilter(gravity_aligned_range_data.returns,
+                                   options_.adaptive_voxel_filter_options());
+@@ -232,20 +246,35 @@ LocalTrajectoryBuilder2D::AddAccumulatedRangeData(
+     return nullptr;
+   }
+
+-  // local map frame <- gravity-aligned frame
+-  std::unique_ptr<transform::Rigid2d> pose_estimate_2d =
+-      ScanMatch(time, pose_prediction, filtered_gravity_aligned_point_cloud);
+-  if (pose_estimate_2d == nullptr) {
+-    LOG(WARNING) << "Scan matching failed.";
+-    return nullptr;
++  transform::Rigid3d pose_estimate;
++  transform::Rigid2d pose_estimate_2d;
++  if (options_.authoritative_odometry()) {
++    CHECK(authoritative_pose.has_value());
++    pose_estimate = authoritative_pose.value();
++    pose_estimate_2d =
++        transform::Project2D(pose_estimate * gravity_alignment.inverse());
++  } else {
++    // Computes a gravity aligned pose prediction.
++    const transform::Rigid3d non_gravity_aligned_pose_prediction =
++        extrapolator_->ExtrapolatePose(time);
++    const transform::Rigid2d pose_prediction = transform::Project2D(
++        non_gravity_aligned_pose_prediction * gravity_alignment.inverse());
++
++    // local map frame <- gravity-aligned frame
++    std::unique_ptr<transform::Rigid2d> matched_pose =
++        ScanMatch(time, pose_prediction, filtered_gravity_aligned_point_cloud);
++    if (matched_pose == nullptr) {
++      LOG(WARNING) << "Scan matching failed.";
++      return nullptr;
++    }
++    pose_estimate_2d = *matched_pose;
++    pose_estimate = transform::Embed3D(pose_estimate_2d) * gravity_alignment;
+   }
+-  const transform::Rigid3d pose_estimate =
+-      transform::Embed3D(*pose_estimate_2d) * gravity_alignment;
+   extrapolator_->AddPose(time, pose_estimate);
+
+   sensor::RangeData range_data_in_local =
+       TransformRangeData(gravity_aligned_range_data,
+-                         transform::Embed3D(pose_estimate_2d->cast<float>()));
++                         transform::Embed3D(pose_estimate_2d.cast<float>()));
+   std::unique_ptr<InsertionResult> insertion_result = InsertIntoSubmap(
+       time, range_data_in_local, filtered_gravity_aligned_point_cloud,
+       pose_estimate, gravity_alignment.rotation());
+@@ -307,6 +336,13 @@ void LocalTrajectoryBuilder2D::AddImuData(const sensor::ImuData& imu_data) {
+
+ void LocalTrajectoryBuilder2D::AddOdometryData(
+     const sensor::OdometryData& odometry_data) {
++  if (options_.authoritative_odometry()) {
++    if (!authoritative_odometry_data_.empty()) {
++      CHECK_GT(odometry_data.time, authoritative_odometry_data_.back().time)
++          << "Authoritative odometry timestamps must be strictly monotonic.";
++    }
++    authoritative_odometry_data_.push_back(odometry_data);
++  }
+   if (extrapolator_ == nullptr) {
+     // Until we've initialized the extrapolator we cannot add odometry data.
+     LOG(INFO) << "Extrapolator not yet initialized.";
+@@ -331,6 +367,20 @@ void LocalTrajectoryBuilder2D::InitializeExtrapolator(const common::Time time) {
+   extrapolator_->AddPose(time, transform::Rigid3d::Identity());
+ }
+
++absl::optional<transform::Rigid3d>
++LocalTrajectoryBuilder2D::GetAuthoritativeOdometryPose(
++    const common::Time time) {
++  while (authoritative_odometry_data_.size() > 1 &&
++         authoritative_odometry_data_[1].time <= time) {
++    authoritative_odometry_data_.pop_front();
++  }
++  if (authoritative_odometry_data_.empty() ||
++      authoritative_odometry_data_.front().time > time) {
++    return absl::nullopt;
++  }
++  return authoritative_odometry_data_.front().pose;
++}
++
+ void LocalTrajectoryBuilder2D::RegisterMetrics(
+     metrics::FamilyFactory* family_factory) {
+   auto* latency = family_factory->NewGaugeFamily(
+diff --git a/cartographer/mapping/internal/2d/local_trajectory_builder_2d.h b/cartographer/mapping/internal/2d/local_trajectory_builder_2d.h
+index faed1df..d76fa72 100644
+--- a/cartographer/mapping/internal/2d/local_trajectory_builder_2d.h
++++ b/cartographer/mapping/internal/2d/local_trajectory_builder_2d.h
+@@ -18,8 +18,10 @@
+ #define CARTOGRAPHER_MAPPING_INTERNAL_2D_LOCAL_TRAJECTORY_BUILDER_2D_H_
+
+ #include <chrono>
++#include <deque>
+ #include <memory>
+
++#include "absl/types/optional.h"
+ #include "cartographer/common/time.h"
+ #include "cartographer/mapping/2d/submap_2d.h"
+ #include "cartographer/mapping/internal/2d/scan_matching/ceres_scan_matcher_2d.h"
+@@ -80,7 +82,8 @@ class LocalTrajectoryBuilder2D {
+   std::unique_ptr<MatchingResult> AddAccumulatedRangeData(
+       common::Time time, const sensor::RangeData& gravity_aligned_range_data,
+       const transform::Rigid3d& gravity_alignment,
+-      const absl::optional<common::Duration>& sensor_duration);
++      const absl::optional<common::Duration>& sensor_duration,
++      const absl::optional<transform::Rigid3d>& authoritative_pose);
+   sensor::RangeData TransformToGravityAlignedFrameAndFilter(
+       const transform::Rigid3f& transform_to_gravity_aligned_frame,
+       const sensor::RangeData& range_data) const;
+@@ -98,6 +101,8 @@ class LocalTrajectoryBuilder2D {
+
+   // Lazily constructs a PoseExtrapolator.
+   void InitializeExtrapolator(common::Time time);
++  absl::optional<transform::Rigid3d> GetAuthoritativeOdometryPose(
++      common::Time time);
+
+   const proto::LocalTrajectoryBuilderOptions2D options_;
+   ActiveSubmaps2D active_submaps_;
+@@ -108,6 +113,7 @@ class LocalTrajectoryBuilder2D {
+   scan_matching::CeresScanMatcher2D ceres_scan_matcher_;
+
+   std::unique_ptr<PoseExtrapolator> extrapolator_;
++  std::deque<sensor::OdometryData> authoritative_odometry_data_;
+
+   int num_accumulated_ = 0;
+   sensor::RangeData accumulated_range_data_;
+diff --git a/cartographer/mapping/internal/2d/local_trajectory_builder_options_2d.cc b/cartographer/mapping/internal/2d/local_trajectory_builder_options_2d.cc
+index 434da3d..eefee4e 100644
+--- a/cartographer/mapping/internal/2d/local_trajectory_builder_options_2d.cc
++++ b/cartographer/mapping/internal/2d/local_trajectory_builder_options_2d.cc
+@@ -41,6 +41,8 @@ proto::LocalTrajectoryBuilderOptions2D CreateLocalTrajectoryBuilderOptions2D(
+       parameter_dictionary->GetDouble("voxel_filter_size"));
+   options.set_use_online_correlative_scan_matching(
+       parameter_dictionary->GetBool("use_online_correlative_scan_matching"));
++  options.set_authoritative_odometry(
++      parameter_dictionary->GetBool("authoritative_odometry"));
+   *options.mutable_adaptive_voxel_filter_options() =
+       sensor::CreateAdaptiveVoxelFilterOptions(
+           parameter_dictionary->GetDictionary("adaptive_voxel_filter").get());
+diff --git a/cartographer/mapping/internal/3d/rotation_parameterization.h b/cartographer/mapping/internal/3d/rotation_parameterization.h
+index 4ce0055..5f828af 100644
+--- a/cartographer/mapping/internal/3d/rotation_parameterization.h
++++ b/cartographer/mapping/internal/3d/rotation_parameterization.h
+@@ -26,7 +26,7 @@ namespace mapping {
+
+ struct YawOnlyQuaternionPlus {
+   template <typename T>
+-  bool operator()(const T* x, const T* delta, T* x_plus_delta) const {
++  bool Plus(const T* x, const T* delta, T* x_plus_delta) const {
+     const T clamped_delta = common::Clamp(delta[0], T(-0.5), T(0.5));
+     T q_delta[4];
+     q_delta[0] = ceres::sqrt(1. - clamped_delta * clamped_delta);
+@@ -36,11 +36,25 @@ struct YawOnlyQuaternionPlus {
+     ceres::QuaternionProduct(q_delta, x, x_plus_delta);
+     return true;
+   }
++
++  template <typename T>
++  bool Minus(const T* y, const T* x, T* y_minus_x) const {
++    const T x_inverse[4] = {x[0], -x[1], -x[2], -x[3]};
++    T delta[4];
++    ceres::QuaternionProduct(y, x_inverse, delta);
++    y_minus_x[0] = common::Clamp(delta[3], T(-0.5), T(0.5));
++    return true;
++  }
++
++  template <typename T>
++  bool operator()(const T* x, const T* delta, T* x_plus_delta) const {
++    return Plus(x, delta, x_plus_delta);
++  }
+ };
+
+ struct ConstantYawQuaternionPlus {
+   template <typename T>
+-  bool operator()(const T* x, const T* delta, T* x_plus_delta) const {
++  bool Plus(const T* x, const T* delta, T* x_plus_delta) const {
+     const T delta_norm =
+         ceres::sqrt(common::Pow2(delta[0]) + common::Pow2(delta[1]));
+     const T sin_delta_over_delta =
+@@ -59,6 +73,21 @@ struct ConstantYawQuaternionPlus {
+     ceres::QuaternionProduct(x, q_delta, x_plus_delta);
+     return true;
+   }
++
++  template <typename T>
++  bool Minus(const T* y, const T* x, T* y_minus_x) const {
++    const T x_inverse[4] = {x[0], -x[1], -x[2], -x[3]};
++    T delta[4];
++    ceres::QuaternionProduct(x_inverse, y, delta);
++    y_minus_x[0] = delta[1];
++    y_minus_x[1] = delta[2];
++    return true;
++  }
++
++  template <typename T>
++  bool operator()(const T* x, const T* delta, T* x_plus_delta) const {
++    return Plus(x, delta, x_plus_delta);
++  }
+ };
+
+ }  // namespace mapping
+diff --git a/cartographer/mapping/internal/3d/scan_matching/ceres_scan_matcher_3d.cc b/cartographer/mapping/internal/3d/scan_matching/ceres_scan_matcher_3d.cc
+index 5aab1fd..4a53828 100644
+--- a/cartographer/mapping/internal/3d/scan_matching/ceres_scan_matcher_3d.cc
++++ b/cartographer/mapping/internal/3d/scan_matching/ceres_scan_matcher_3d.cc
+@@ -98,11 +98,9 @@ void CeresScanMatcher3D::Match(
+   optimization::CeresPose ceres_pose(
+       initial_pose_estimate, nullptr /* translation_parameterization */,
+       options_.only_optimize_yaw()
+-          ? std::unique_ptr<ceres::LocalParameterization>(
+-                absl::make_unique<ceres::AutoDiffLocalParameterization<
+-                    YawOnlyQuaternionPlus, 4, 1>>())
+-          : std::unique_ptr<ceres::LocalParameterization>(
+-                absl::make_unique<ceres::QuaternionParameterization>()),
++          ? optimization::CreateAutoDiffParameterization<
++                YawOnlyQuaternionPlus, 4, 1>()
++          : optimization::CreateQuaternionParameterization(),
+       &problem);
+
+   CHECK_EQ(options_.occupied_space_weight_size(),
+diff --git a/cartographer/mapping/internal/imu_based_pose_extrapolator.cc b/cartographer/mapping/internal/imu_based_pose_extrapolator.cc
+index ddb88ea..41a1b7d 100644
+--- a/cartographer/mapping/internal/imu_based_pose_extrapolator.cc
++++ b/cartographer/mapping/internal/imu_based_pose_extrapolator.cc
+@@ -137,7 +137,7 @@ ImuBasedPoseExtrapolator::ExtrapolatePosesWithGravity(
+   // we can estimate the gravity alignment of the current pose.
+   optimization::CeresPose gravity_from_local(
+       gravity_from_local_, nullptr,
+-      absl::make_unique<ceres::QuaternionParameterization>(), &problem);
++      optimization::CreateQuaternionParameterization(), &problem);
+   // Use deque so addresses stay constant during problem formulation.
+   std::deque<optimization::CeresPose> nodes;
+   std::vector<common::Time> node_times;
+@@ -162,13 +162,13 @@ ImuBasedPoseExtrapolator::ExtrapolatePosesWithGravity(
+
+     if (is_last) {
+       nodes.emplace_back(gravity_from_node, nullptr,
+-                         absl::make_unique<ceres::AutoDiffLocalParameterization<
+-                             ConstantYawQuaternionPlus, 4, 2>>(),
++                         optimization::CreateAutoDiffParameterization<
++                             ConstantYawQuaternionPlus, 4, 2>(),
+                          &problem);
+       problem.SetParameterBlockConstant(nodes.back().translation());
+     } else {
+       nodes.emplace_back(gravity_from_node, nullptr,
+-                         absl::make_unique<ceres::QuaternionParameterization>(),
++                         optimization::CreateQuaternionParameterization(),
+                          &problem);
+     }
+   }
+@@ -200,7 +200,7 @@ ImuBasedPoseExtrapolator::ExtrapolatePosesWithGravity(
+           &imu_it_prev_prev)
+           .pose;
+   nodes.emplace_back(initial_estimate, nullptr,
+-                     absl::make_unique<ceres::QuaternionParameterization>(),
++                     optimization::CreateQuaternionParameterization(),
+                      &problem);
+   node_times.push_back(time);
+
+@@ -222,8 +222,9 @@ ImuBasedPoseExtrapolator::ExtrapolatePosesWithGravity(
+
+   std::array<double, 4> imu_calibration{{1., 0., 0., 0.}};
+
+-  problem.AddParameterBlock(imu_calibration.data(), 4,
+-                            new ceres::QuaternionParameterization());
++  problem.AddParameterBlock(imu_calibration.data(), 4);
++  optimization::SetQuaternionParameterization(&problem,
++                                              imu_calibration.data());
+   problem.SetParameterBlockConstant(imu_calibration.data());
+
+   auto imu_it = imu_data_.begin();
+diff --git a/cartographer/mapping/internal/optimization/ceres_pose.cc b/cartographer/mapping/internal/optimization/ceres_pose.cc
+index 807a67d..4a23933 100644
+--- a/cartographer/mapping/internal/optimization/ceres_pose.cc
++++ b/cartographer/mapping/internal/optimization/ceres_pose.cc
+@@ -29,8 +29,8 @@ CeresPose::Data FromPose(const transform::Rigid3d& pose) {
+
+ CeresPose::CeresPose(
+     const transform::Rigid3d& pose,
+-    std::unique_ptr<ceres::LocalParameterization> translation_parametrization,
+-    std::unique_ptr<ceres::LocalParameterization> rotation_parametrization,
++    std::unique_ptr<CeresPoseParameterization> translation_parametrization,
++    std::unique_ptr<CeresPoseParameterization> rotation_parametrization,
+     ceres::Problem* problem)
+     : data_(std::make_shared<CeresPose::Data>(FromPose(pose))) {
+   problem->AddParameterBlock(data_->translation.data(), 3,
+diff --git a/cartographer/mapping/internal/optimization/ceres_pose.h b/cartographer/mapping/internal/optimization/ceres_pose.h
+index d852d80..80cd8e6 100644
+--- a/cartographer/mapping/internal/optimization/ceres_pose.h
++++ b/cartographer/mapping/internal/optimization/ceres_pose.h
+@@ -19,21 +19,70 @@
+
+ #include <array>
+ #include <memory>
++#include <vector>
+
+ #include "Eigen/Core"
+ #include "cartographer/transform/rigid_transform.h"
+ #include "ceres/ceres.h"
++#include "ceres/version.h"
+
+ namespace cartographer {
+ namespace mapping {
+ namespace optimization {
+
++#if CERES_VERSION_MAJOR >= 2
++using CeresPoseParameterization = ceres::Manifold;
++
++inline std::unique_ptr<CeresPoseParameterization> CreateQuaternionParameterization() {
++  return std::make_unique<ceres::QuaternionManifold>();
++}
++
++inline std::unique_ptr<CeresPoseParameterization> CreateSubsetParameterization(
++    const int size, const std::vector<int>& constant_parameters) {
++  return std::make_unique<ceres::SubsetManifold>(size, constant_parameters);
++}
++
++template <typename Functor, int kAmbientSize, int kTangentSize>
++std::unique_ptr<CeresPoseParameterization> CreateAutoDiffParameterization() {
++  return std::make_unique<ceres::AutoDiffManifold<Functor, kAmbientSize,
++                                                  kTangentSize>>();
++}
++
++inline void SetQuaternionParameterization(ceres::Problem* const problem,
++                                          double* const values) {
++  problem->SetManifold(values, new ceres::QuaternionManifold());
++}
++#else
++using CeresPoseParameterization = ceres::LocalParameterization;
++
++inline std::unique_ptr<CeresPoseParameterization> CreateQuaternionParameterization() {
++  return std::make_unique<ceres::QuaternionParameterization>();
++}
++
++inline std::unique_ptr<CeresPoseParameterization> CreateSubsetParameterization(
++    const int size, const std::vector<int>& constant_parameters) {
++  return std::make_unique<ceres::SubsetParameterization>(size,
++                                                        constant_parameters);
++}
++
++template <typename Functor, int kAmbientSize, int kTangentSize>
++std::unique_ptr<CeresPoseParameterization> CreateAutoDiffParameterization() {
++  return std::make_unique<ceres::AutoDiffLocalParameterization<
++      Functor, kAmbientSize, kTangentSize>>();
++}
++
++inline void SetQuaternionParameterization(ceres::Problem* const problem,
++                                          double* const values) {
++  problem->SetParameterization(values, new ceres::QuaternionParameterization());
++}
++#endif
++
+ class CeresPose {
+  public:
+   CeresPose(
+       const transform::Rigid3d& rigid,
+-      std::unique_ptr<ceres::LocalParameterization> translation_parametrization,
+-      std::unique_ptr<ceres::LocalParameterization> rotation_parametrization,
++      std::unique_ptr<CeresPoseParameterization> translation_parametrization,
++      std::unique_ptr<CeresPoseParameterization> rotation_parametrization,
+       ceres::Problem* problem);
+
+   const transform::Rigid3d ToRigid() const;
+diff --git a/cartographer/mapping/internal/optimization/optimization_problem_2d.cc b/cartographer/mapping/internal/optimization/optimization_problem_2d.cc
+index 3faf255..4c7322c 100644
+--- a/cartographer/mapping/internal/optimization/optimization_problem_2d.cc
++++ b/cartographer/mapping/internal/optimization/optimization_problem_2d.cc
+@@ -145,7 +145,7 @@ void AddLandmarkCostFunctions(
+         C_landmarks->emplace(
+             landmark_id,
+             CeresPose(starting_point, nullptr /* translation_parametrization */,
+-                      absl::make_unique<ceres::QuaternionParameterization>(),
++                      CreateQuaternionParameterization(),
+                       problem));
+         // Set landmark constant if it is frozen.
+         if (landmark_node.second.frozen) {
+diff --git a/cartographer/mapping/internal/optimization/optimization_problem_3d.cc b/cartographer/mapping/internal/optimization/optimization_problem_3d.cc
+index 246707b..de13c5a 100644
+--- a/cartographer/mapping/internal/optimization/optimization_problem_3d.cc
++++ b/cartographer/mapping/internal/optimization/optimization_problem_3d.cc
+@@ -161,7 +161,7 @@ void AddLandmarkCostFunctions(
+         C_landmarks->emplace(
+             landmark_id,
+             CeresPose(starting_point, nullptr /* translation_parametrization */,
+-                      absl::make_unique<ceres::QuaternionParameterization>(),
++                      CreateQuaternionParameterization(),
+                       problem));
+         // Set landmark constant if it is frozen.
+         if (landmark_node.second.frozen) {
+@@ -275,10 +275,9 @@ void OptimizationProblem3D::Solve(
+   ceres::Problem problem(problem_options);
+
+   const auto translation_parameterization =
+-      [this]() -> std::unique_ptr<ceres::LocalParameterization> {
++      [this]() -> std::unique_ptr<CeresPoseParameterization> {
+     return options_.fix_z_in_3d()
+-               ? absl::make_unique<ceres::SubsetParameterization>(
+-                     3, std::vector<int>{2})
++               ? CreateSubsetParameterization(3, std::vector<int>{2})
+                : nullptr;
+   };
+
+@@ -299,8 +298,8 @@ void OptimizationProblem3D::Solve(
+           submap_id_data.id,
+           CeresPose(submap_id_data.data.global_pose,
+                     translation_parameterization(),
+-                    absl::make_unique<ceres::AutoDiffLocalParameterization<
+-                        ConstantYawQuaternionPlus, 4, 2>>(),
++                    CreateAutoDiffParameterization<
++                        ConstantYawQuaternionPlus, 4, 2>(),
+                     &problem));
+       problem.SetParameterBlockConstant(
+           C_submaps.at(submap_id_data.id).translation());
+@@ -309,7 +308,7 @@ void OptimizationProblem3D::Solve(
+           submap_id_data.id,
+           CeresPose(submap_id_data.data.global_pose,
+                     translation_parameterization(),
+-                    absl::make_unique<ceres::QuaternionParameterization>(),
++                    CreateQuaternionParameterization(),
+                     &problem));
+     }
+     if (frozen) {
+@@ -325,7 +324,7 @@ void OptimizationProblem3D::Solve(
+     C_nodes.Insert(
+         node_id_data.id,
+         CeresPose(node_id_data.data.global_pose, translation_parameterization(),
+-                  absl::make_unique<ceres::QuaternionParameterization>(),
++                  CreateQuaternionParameterization(),
+                   &problem));
+     if (frozen) {
+       problem.SetParameterBlockConstant(C_nodes.at(node_id_data.id).rotation());
+@@ -362,8 +361,9 @@ void OptimizationProblem3D::Solve(
+       }
+       TrajectoryData& trajectory_data = trajectory_data_.at(trajectory_id);
+
+-      problem.AddParameterBlock(trajectory_data.imu_calibration.data(), 4,
+-                                new ceres::QuaternionParameterization());
++      problem.AddParameterBlock(trajectory_data.imu_calibration.data(), 4);
++      SetQuaternionParameterization(&problem,
++                                    trajectory_data.imu_calibration.data());
+       if (!options_.use_online_imu_extrinsics_in_3d()) {
+         problem.SetParameterBlockConstant(
+             trajectory_data.imu_calibration.data());
+@@ -551,8 +551,7 @@ void OptimizationProblem3D::Solve(
+                         transform::GetYaw(fixed_frame_pose_in_map.rotation()),
+                         Eigen::Vector3d::UnitZ())),
+                 nullptr,
+-                absl::make_unique<ceres::AutoDiffLocalParameterization<
+-                    YawOnlyQuaternionPlus, 4, 1>>(),
++                CreateAutoDiffParameterization<YawOnlyQuaternionPlus, 4, 1>(),
+                 &problem));
+         fixed_frame_pose_initialized = true;
+       }
+diff --git a/cartographer/mapping/proto/local_trajectory_builder_options_2d.proto b/cartographer/mapping/proto/local_trajectory_builder_options_2d.proto
+index 6add120..92e9bdb 100644
+--- a/cartographer/mapping/proto/local_trajectory_builder_options_2d.proto
++++ b/cartographer/mapping/proto/local_trajectory_builder_options_2d.proto
+@@ -23,7 +23,7 @@ import "cartographer/mapping/proto/scan_matching/ceres_scan_matcher_options_2d.p
+ import "cartographer/mapping/proto/scan_matching/real_time_correlative_scan_matcher_options.proto";
+ import "cartographer/mapping/proto/submaps_options_2d.proto";
+
+-// NEXT ID: 22
++// NEXT ID: 23
+ message LocalTrajectoryBuilderOptions2D {
+   // Rangefinder points outside these ranges will be dropped.
+   float min_range = 14;
+@@ -74,4 +74,9 @@ message LocalTrajectoryBuilderOptions2D {
+
+   // True if IMU data should be expected and used.
+   bool use_imu_data = 12;
++
++  // If true, timestamp-matched odometry is the authoritative local SLAM pose.
++  // Range data is still inserted into submaps, but scan matching is skipped and
++  // cannot correct the local trajectory away from odometry.
++  bool authoritative_odometry = 22;
+ }
+diff --git a/cmake/functions.cmake b/cmake/functions.cmake
+index 8cfc05f..63c1f14 100644
+--- a/cmake/functions.cmake
++++ b/cmake/functions.cmake
+@@ -84,10 +84,12 @@ macro(google_initialize_cartographer_project)
+     # Turn some warnings into errors.
+     google_add_flag(GOOG_CXX_FLAGS "-Werror=format-security")
+     google_add_flag(GOOG_CXX_FLAGS "-Werror=missing-braces")
++    google_add_flag(GOOG_CXX_FLAGS "-Wno-error=missing-braces")
+     google_add_flag(GOOG_CXX_FLAGS "-Werror=reorder")
+     google_add_flag(GOOG_CXX_FLAGS "-Werror=return-type")
+     google_add_flag(GOOG_CXX_FLAGS "-Werror=switch")
+     google_add_flag(GOOG_CXX_FLAGS "-Werror=uninitialized")
++    google_add_flag(GOOG_CXX_FLAGS "-Wno-error=maybe-uninitialized")
+
+     if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID MATCHES "AppleClang")
+       google_add_flag(GOOG_CXX_FLAGS "-Wthread-safety")
+diff --git a/configuration_files/trajectory_builder_2d.lua b/configuration_files/trajectory_builder_2d.lua
+index 373b099..af3ac7b 100644
+--- a/configuration_files/trajectory_builder_2d.lua
++++ b/configuration_files/trajectory_builder_2d.lua
+@@ -35,6 +35,7 @@ TRAJECTORY_BUILDER_2D = {
+   },
+
+   use_online_correlative_scan_matching = false,
++  authoritative_odometry = false,
+   real_time_correlative_scan_matcher = {
+     linear_search_window = 0.1,
+     angular_search_window = math.rad(20.),
