@@ -2,21 +2,18 @@
 
 <h1>SuperNav</h1>
 
-<h3>智能体导航系统系列</h3>
+<h3>面向任意场景、任意任务的智能体导航系统</h3>
 
 <p><a href="README.md">English</a> | <strong>简体中文</strong></p>
 
 </div>
 
-本仓库收录 SuperNav 系列工作。每项工作位于独立、可单独安装的源码目录中，并提供各自的安装与使用文档。
+本仓库收录 SuperNav 系列工作，涵盖导航智能体框架（v1）与结构化空间记忆（v1.5）。
 
 | | [SuperNav-1.5](SuperNav_v1_5/README.zh-CN.md) | [SuperNav](SuperNav_v1/README.zh-CN.md) |
 | --- | --- | --- |
-| 重点 | 面向智能体导航的结构化空间记忆 | 基于工具调用的通用智能体导航 |
-| 持久空间状态 | 智能体编写、由统一度量地图定位的记忆节点 | 有界空间事实账本 |
-| 建图与定位 | 支持仿真器里程计和权威位姿的定制 Cartographer 2D SLAM | 仿真器原生导航状态 |
-| 视觉证据 | 可选 VLM 描述服务，将描述附加到记忆节点 | 实时观测与工具结果 |
-| 推荐目录 | `SuperNav_v1_5/` | `SuperNav_v1/` |
+| 重点 | 面向智能体导航的结构化空间记忆 | 通用智能体导航框架 |
+| 了解更多 | [代码与使用](SuperNav_v1_5/README.zh-CN.md) · [项目主页](https://zju3dv.github.io/SuperNav-1.5/) | [代码与使用](SuperNav_v1/README.zh-CN.md) · [项目主页](https://zju3dv.github.io/SuperNav/) |
 
 <div align="center">
 
@@ -26,9 +23,8 @@
 
 <p>
   <a href="https://zju3dv.github.io/SuperNav-1.5/"><img src="https://img.shields.io/badge/Project-SuperNav--1.5-e34b4b" alt="SuperNav-1.5 项目主页"></a>
-  <img src="https://img.shields.io/badge/Paper-Coming_Soon-lightgrey" alt="论文即将发布">
+  <a href="https://arxiv.org/abs/2611.29912"><img src="https://img.shields.io/badge/Paper-arXiv%3A2611.29912-2f6feb" alt="SuperNav-1.5 论文"></a>
   <a href="SuperNav_v1_5/README.zh-CN.md"><img src="https://img.shields.io/badge/Code-SuperNav--1.5-black?logo=github" alt="SuperNav-1.5 代码"></a>
-  <a href="https://raw.githubusercontent.com/bugByteMe/SuperNav-1.5-assets/main/assets/overview/supernav-1.5-overview.mp4"><img src="https://img.shields.io/badge/Demo-Overview_Video-c79a00" alt="SuperNav-1.5 概览视频"></a>
 </p>
 
 <p>
@@ -48,21 +44,22 @@
   <sup>3</sup> Shenzhen University
 </p>
 
-<video src="https://raw.githubusercontent.com/bugByteMe/SuperNav-1.5-assets/main/assets/overview/supernav-1.5-overview.mp4" poster="SuperNav_v1_5/docs/release/assets/supernav-1.5-overview.webp" controls muted loop width="920"></video>
+<a href="https://raw.githubusercontent.com/bugByteMe/SuperNav-1.5-assets/main/assets/overview/supernav-1.5-overview.mp4">
+  <img src="assets/supernav-1.5-overview.gif" alt="SuperNav-1.5 概览视频" width="90%" />
+</a>
 
 </div>
 
 SuperNav-1.5 为导航智能体提供结构化空间记忆：由分区占据地图与智能体维护的
-**记忆节点**组成。它将场景回忆连接到可执行路线，帮助智能体高效探索、连续到达
+记忆节点组成。它将场景回忆连接到可执行路线，帮助智能体高效探索、连续到达
 多个目标，并跨会话复用记忆。选择该方法后，空间记忆将独占实验的空间状态，原有
 的有界空间事实账本会被停用。
 
 [代码与使用](SuperNav_v1_5/README.zh-CN.md) ·
 [安装](SuperNav_v1_5/docs/release/zh/spatial-memory.md#安装与构建) ·
 [项目主页](https://zju3dv.github.io/SuperNav-1.5/) ·
-[概览视频](https://raw.githubusercontent.com/bugByteMe/SuperNav-1.5-assets/main/assets/overview/supernav-1.5-overview.mp4) ·
-[方法与结果](https://zju3dv.github.io/SuperNav-1.5/#method) ·
-[空间记忆指南](SuperNav_v1_5/docs/release/zh/spatial-memory.md)
+[空间记忆指南](SuperNav_v1_5/docs/release/zh/spatial-memory.md) ·
+[引用](SuperNav_v1_5/README.zh-CN.md#citation)
 
 <br>
 
@@ -76,7 +73,9 @@ SuperNav-1.5 为导航智能体提供结构化空间记忆：由分区占据地�
   <a href="https://zju3dv.github.io/SuperNav/"><img src="https://img.shields.io/badge/Project-SuperNav-e34b4b" alt="项目主页"></a>
   <a href="https://arxiv.org/abs/2610.12126v1"><img src="https://img.shields.io/badge/Paper-arXiv%3A2610.12126-2f6feb" alt="SuperNav 论文"></a>
   <a href="SuperNav_v1/README.zh-CN.md"><img src="https://img.shields.io/badge/Code-SuperNav-black?logo=github" alt="SuperNav 代码"></a>
-  <a href="https://github.com/user-attachments/assets/d415a2ec-89de-4f6d-a2e5-eeec8993d05d"><img src="https://img.shields.io/badge/Demo-Overview_Video-c79a00" alt="概览视频"></a>
+  <a href="SuperNav_v1/docs/release/assets/wechat.png">
+      <img src="https://img.shields.io/badge/%E5%BE%AE%E4%BF%A1-WeChat-green?logo=wechat&logoColor=green" alt="微信">
+    </a>
 </p>
 
 <p>
@@ -97,7 +96,9 @@ SuperNav-1.5 为导航智能体提供结构化空间记忆：由分区占据地�
   <sup>†</sup> 通讯作者
 </p>
 
-<video src="https://github.com/user-attachments/assets/d415a2ec-89de-4f6d-a2e5-eeec8993d05d" controls width="920"></video>
+<a href="https://github.com/user-attachments/assets/d415a2ec-89de-4f6d-a2e5-eeec8993d05d">
+  <img src="assets/supernav-overview.gif" alt="SuperNav 概览视频" width="90%" />
+</a>
 
 </div>
 
@@ -108,8 +109,6 @@ SuperNav-1.5 为导航智能体提供结构化空间记忆：由分区占据地�
 [代码与使用](SuperNav_v1/README.zh-CN.md) ·
 [安装](SuperNav_v1/README.zh-CN.md#installation) ·
 [项目主页](https://zju3dv.github.io/SuperNav/) ·
-[论文](https://arxiv.org/abs/2610.12126v1) ·
-[演示](https://github.com/user-attachments/assets/d415a2ec-89de-4f6d-a2e5-eeec8993d05d) ·
 [引用](SuperNav_v1/README.zh-CN.md#citation)
 
 ## 快速开始
@@ -126,6 +125,17 @@ cd SuperNav/SuperNav_v1_5  # 或 SuperNav_v1
 Cartographer 工具链，并使用文档中的 pip 命令安装 Python 运行时；原始 SuperNav
 使用其 README 中的 pip 安装方式。
 
-## 许可证
+## 🙏 致谢与许可证
 
-请参阅 [LICENSE](LICENSE) 以及各源码目录中的版本专用声明。
+SuperNav 使用 [Habitat-GS](https://github.com/zju3dv/habitat-gs)、
+[Habitat-Sim](https://github.com/facebookresearch/habitat-sim) 和
+[AI2-THOR](https://github.com/allenai/ai2thor) 作为仿真基础。
+感谢这些项目的作者，以及本项目使用的数据集和工具的贡献者。
+
+SuperNav 采用 [Project Registration License（PRL）v1.0](LICENSE)。
+仅用于学术研究、教育、评估或个人用途时，可免费使用且无需登记；发表研究结果也无需登记。
+
+组织项目使用同样免费，但须在使用前登记，包括商业与非商业项目、内部研发、测试、部署和生产。
+提交完整、准确的登记信息后自动获得许可，无需审批或付费；每个实质不同的项目分别登记一次。
+
+**项目使用登记：** [Google Forms](https://docs.google.com/forms/d/e/1FAIpQLSff5QjjANlJ2hnXYqBSAzKWxEM58gIxPLh17-t3j3-MqO1a5w/viewform)。

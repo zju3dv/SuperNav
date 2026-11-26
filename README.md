@@ -2,22 +2,18 @@
 
 <h1>SuperNav</h1>
 
-<h3>A Series of Agentic Navigation Systems</h3>
+<h3>An Agentic Navigation Systems For Any Task in Any Scene</h3>
 
 <p><strong>English</strong> | <a href="README.zh-CN.md">简体中文</a></p>
 
 </div>
 
-This repository collects the SuperNav series. Each work lives in its own
-self-contained source directory with separate installation and usage guidance.
+This repository collects the SuperNav series. From navigation agent harness (v1) to structured spatial memory (v1.5).
 
 | | [SuperNav-1.5](SuperNav_v1_5/README.md) | [SuperNav](SuperNav_v1/README.md) |
 | --- | --- | --- |
-| Focus | Structured spatial memory for agentic navigation | General agentic navigation through tool use |
-| Persistent spatial state | Agent-authored memory nodes grounded in a shared metric map | Bounded spatial-fact ledger |
-| Mapping and localization | Patched Cartographer 2D SLAM with simulator odometry and authoritative-pose support | Simulator-native navigation state |
-| Visual evidence | Optional VLM captions attached to memory nodes | Live observations and tool results |
-| Recommended directory | `SuperNav_v1_5/` | `SuperNav_v1/` |
+| Focus | Structured spatial memory for agentic navigation | A General agentic navigation framework for navigation |
+| Explore | [Code and usage](SuperNav_v1_5/README.md) · [Project](https://zju3dv.github.io/SuperNav-1.5/)| [Code and usage](SuperNav_v1/README.md) · [Project](https://zju3dv.github.io/SuperNav/)|
 
 <div align="center">
 
@@ -27,9 +23,8 @@ self-contained source directory with separate installation and usage guidance.
 
 <p>
   <a href="https://zju3dv.github.io/SuperNav-1.5/"><img src="https://img.shields.io/badge/Project-SuperNav--1.5-e34b4b" alt="SuperNav-1.5 project page"></a>
-  <img src="https://img.shields.io/badge/Paper-Coming_Soon-lightgrey" alt="Paper coming soon">
+  <a href="https://arxiv.org/abs/2611.29912"><img src="https://img.shields.io/badge/Paper-arXiv%3A2611.29912-2f6feb" alt="SuperNav-1.5 paper"></a>
   <a href="SuperNav_v1_5/README.md"><img src="https://img.shields.io/badge/Code-SuperNav--1.5-black?logo=github" alt="SuperNav-1.5 code"></a>
-  <a href="https://raw.githubusercontent.com/bugByteMe/SuperNav-1.5-assets/main/assets/overview/supernav-1.5-overview.mp4"><img src="https://img.shields.io/badge/Demo-Overview_Video-c79a00" alt="SuperNav-1.5 overview video"></a>
 </p>
 
 <p>
@@ -49,12 +44,14 @@ self-contained source directory with separate installation and usage guidance.
   <sup>3</sup> Shenzhen University
 </p>
 
-<video src="https://raw.githubusercontent.com/bugByteMe/SuperNav-1.5-assets/main/assets/overview/supernav-1.5-overview.mp4" poster="SuperNav_v1_5/docs/release/assets/supernav-1.5-overview.webp" controls muted loop width="920"></video>
+<a href="https://raw.githubusercontent.com/bugByteMe/SuperNav-1.5-assets/main/assets/overview/supernav-1.5-overview.mp4">
+  <img src="assets/supernav-1.5-overview.gif" alt="SuperNav-1.5 overview video" width="90%" />
+</a>
 
 </div>
 
 SuperNav-1.5 gives navigation agents structured spatial memory: an
-area-segmented occupancy map with agent-maintained **memory nodes**. It connects
+area-segmented occupancy map with agent-maintained memory nodes. It connects
 scene recall to executable routes, helping the agent explore efficiently, reach
 successive goals, and reuse memory across sessions. When this method is selected,
 it owns spatial state for the experiment and the original bounded spatial-fact
@@ -63,9 +60,8 @@ ledger is disabled.
 [Code and usage](SuperNav_v1_5/README.md) ·
 [Installation](SuperNav_v1_5/docs/release/en/spatial-memory.md#install-and-build) ·
 [Project](https://zju3dv.github.io/SuperNav-1.5/) ·
-[Overview video](https://raw.githubusercontent.com/bugByteMe/SuperNav-1.5-assets/main/assets/overview/supernav-1.5-overview.mp4) ·
-[Method and results](https://zju3dv.github.io/SuperNav-1.5/#method) ·
-[Spatial memory guide](SuperNav_v1_5/docs/release/en/spatial-memory.md)
+[Spatial memory guide](SuperNav_v1_5/docs/release/en/spatial-memory.md) ·
+[Citation](SuperNav_v1_5/README.md#citation)
 
 <br>
 
@@ -79,7 +75,9 @@ ledger is disabled.
   <a href="https://zju3dv.github.io/SuperNav/"><img src="https://img.shields.io/badge/Project-SuperNav-e34b4b" alt="Project page"></a>
   <a href="https://arxiv.org/abs/2610.12126v1"><img src="https://img.shields.io/badge/Paper-arXiv%3A2610.12126-2f6feb" alt="SuperNav paper"></a>
   <a href="SuperNav_v1/README.md"><img src="https://img.shields.io/badge/Code-SuperNav-black?logo=github" alt="SuperNav code"></a>
-  <a href="https://github.com/user-attachments/assets/d415a2ec-89de-4f6d-a2e5-eeec8993d05d"><img src="https://img.shields.io/badge/Demo-Overview_Video-c79a00" alt="Overview video"></a>
+  <a href="SuperNav_v1/docs/release/assets/wechat.png">
+      <img src="https://img.shields.io/badge/微信-WeChat-green?logo=wechat&logoColor=green">
+    </a>
 </p>
 
 <p>
@@ -100,7 +98,9 @@ ledger is disabled.
   <sup>†</sup> Corresponding author
 </p>
 
-<video src="https://github.com/user-attachments/assets/d415a2ec-89de-4f6d-a2e5-eeec8993d05d" controls width="920"></video>
+<a href="https://github.com/user-attachments/assets/d415a2ec-89de-4f6d-a2e5-eeec8993d05d">
+  <img src="assets/supernav-overview.gif" alt="SuperNav overview video" width="90%" />
+</a>
 
 </div>
 
@@ -113,8 +113,6 @@ requests across simulation and real-robot settings.
 [Code and usage](SuperNav_v1/README.md) ·
 [Installation](SuperNav_v1/README.md#installation) ·
 [Project](https://zju3dv.github.io/SuperNav/) ·
-[Paper](https://arxiv.org/abs/2610.12126v1) ·
-[Demo](https://github.com/user-attachments/assets/d415a2ec-89de-4f6d-a2e5-eeec8993d05d) ·
 [Citation](SuperNav_v1/README.md#citation)
 
 ## Getting Started
@@ -132,6 +130,20 @@ the same environment. SuperNav-1.5 uses `environment-cartographer.yml` for the
 native Cartographer toolchain and the documented pip installation for the
 Python runtime; original SuperNav uses the pip installation in its README.
 
-## License
+## 🙏 Acknowledgements and License
 
-See [LICENSE](LICENSE) and the version-specific notices in each source directory.
+SuperNav uses [Habitat-GS](https://github.com/zju3dv/habitat-gs),
+[Habitat-Sim](https://github.com/facebookresearch/habitat-sim), and
+[AI2-THOR](https://github.com/allenai/ai2thor) as simulator foundations. We thank
+their authors and the contributors to the datasets and tools used in this project.
+
+SuperNav is distributed under the [Project Registration License (PRL) v1.0](LICENSE).
+Use solely for academic research, education, evaluation, or personal purposes is
+free and does not require registration, including publication of research results.
+
+Organizational project use is free but requires registration before use, including
+commercial and non-commercial projects, internal R&D, testing, deployment, and
+production. Complete and accurate registration automatically grants permission;
+no approval or fee is required. Register each materially distinct project once.
+
+**Project use registration:** [Google Forms](https://docs.google.com/forms/d/e/1FAIpQLSff5QjjANlJ2hnXYqBSAzKWxEM58gIxPLh17-t3j3-MqO1a5w/viewform).

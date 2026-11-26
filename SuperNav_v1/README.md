@@ -45,15 +45,11 @@
 
 ## 📢 News
 
+> **[2026-10-23]** 🎉 [SuperNav-1.5](../SuperNav_v1_5/README.md) is released with structured spatial memory for navigation.
+
 > **[2026-10-21]** 🤖 The **Unitree Go2 deployment** is released, with four-view RGB and LiDAR-based map-backed PixelGoal navigation. See the [deployment guide](docs/release/en/go2.md) for Jetson installation and operation.
 
 > **[2026-10-13]** 🎉 The InteriorGS **ObjectNav and Multi-ObjectNav test episodes** (150 each, with reference trajectories) are released in [HabitatGS-Benchmark](https://huggingface.co/datasets/yyh929/HabitatGS-Benchmark). See the [benchmark guide](https://github.com/zju3dv/habitat-gs/blob/main/docs/benchmark/README.md) for data and evaluation.
-
-Download the original scene data from [InteriorGS](https://huggingface.co/datasets/spatialverse/InteriorGS).
-
-The public `habitat_gs/objectnav/v1` files need conversion before `supernav run`.
-See the [SuperNav GS workflow](docs/release/en/habitatgs-benchmark.md) for conversion,
-running, primitive-trace export and SR/SPL plus SR1–SR5 scoring.
 
 ## 🧭 What Is SuperNav?
 

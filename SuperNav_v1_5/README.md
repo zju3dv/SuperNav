@@ -8,7 +8,7 @@
 
 <p>
   <a href="https://zju3dv.github.io/SuperNav-1.5/"><img src="https://img.shields.io/badge/Project-SuperNav--1.5-e34b4b" alt="Project page"></a>
-  <img src="https://img.shields.io/badge/Paper-Coming_Soon-lightgrey" alt="Paper coming soon">
+  <a href="https://arxiv.org/abs/2611.29912"><img src="https://img.shields.io/badge/Paper-arXiv%3A2611.29912-2f6feb" alt="SuperNav-1.5 paper"></a>
   <a href="../README.md"><img src="https://img.shields.io/badge/Code-SuperNav--1.5-black?logo=github" alt="SuperNav-1.5 code"></a>
   <a href="https://raw.githubusercontent.com/bugByteMe/SuperNav-1.5-assets/main/assets/overview/supernav-1.5-overview.mp4"><img src="https://img.shields.io/badge/Demo-Overview_Video-c79a00" alt="Overview video"></a>
 </p>
@@ -36,15 +36,9 @@
 
 ## 📢 News
 
-> **[2026-10-21]** 🤖 The **Unitree Go2 deployment** is released, with four-view RGB and LiDAR-based map-backed PixelGoal navigation. See the [deployment guide](docs/release/en/go2.md) for Jetson installation and operation.
+> **[2026-10-21]** 🤖 The **Unitree Go2 deployment** is released, with structured spatial memory, four-view RGB, LiDAR-based map-backed PixelGoal navigation, area captions, and cross-session relocalization. See the [deployment guide](docs/release/en/go2.md) for Jetson installation and operation.
 
 > **[2026-10-13]** 🎉 The InteriorGS **ObjectNav and Multi-ObjectNav test episodes** (150 each, with reference trajectories) are released in [HabitatGS-Benchmark](https://huggingface.co/datasets/yyh929/HabitatGS-Benchmark). See the [benchmark guide](https://github.com/zju3dv/habitat-gs/blob/main/docs/benchmark/README.md) for data and evaluation.
-
-Download the original scene data from [InteriorGS](https://huggingface.co/datasets/spatialverse/InteriorGS).
-
-The public `habitat_gs/objectnav/v1` files need conversion before `supernav run`.
-See the [SuperNav GS workflow](docs/release/en/habitatgs-benchmark.md) for conversion,
-running, primitive-trace export and SR/SPL plus SR1–SR5 scoring.
 
 ## 🧭 What Is SuperNav-1.5?
 
@@ -70,9 +64,11 @@ With SuperNav-1.5, you can:
 
 See the [SuperNav-1.5 project page](https://zju3dv.github.io/SuperNav-1.5/) for
 real-world and simulation videos, the method overview, and research results.
-The [Unitree Go2 deployment source](docs/release/en/go2.md) provides four-view RGB
-and LiDAR-based map-backed PixelGoal navigation through a pinned public DimOS
-submodule. Further real-world demonstrations are on the project page.
+The [Unitree Go2 deployment source](docs/release/en/go2.md) provides the same
+structured spatial-memory workflow on a real robot: four-view RGB, annotated
+LiDAR occupancy maps, memory nodes, optional area captions, map-backed PixelGoal
+navigation, and cross-session relocalization. It is assembled on a pinned public
+DimOS submodule. Further real-world demonstrations are on the project page.
 
 ## 📖 Table of Contents
 
@@ -90,7 +86,7 @@ submodule. Further real-world demonstrations are on the project page.
 
 - [x] Agent runtime, navigation tools and Skills, experiment recipes, and evaluation
 - [x] Structured spatial memory, patched Cartographer worker, and stack lifecycle CLI
-- [] Unitree Go2 real-robot deployment: map-backed PixelGoal with four-view RGB and LiDAR
+- [ ] Unitree Go2 real-robot deployment: structured spatial memory, map-backed PixelGoal, four-view RGB, and LiDAR
 
 <a id="installation"></a>
 
@@ -156,23 +152,32 @@ Other workflows are documented separately:
 
 ## 🧠 Run with Structured Spatial Memory
 
-A SuperNav-1.5 experiment uses the same task preparation, manifests, selection,
-scoring, and evaluation workflow as [SuperNav v1](../SuperNav_v1/README.md#run-navigation-experiments).
-The experiment-level difference is a **paired-session snapshot**: an exploration
-session builds spatial memory, then a retrieval session starts from an immutable
-snapshot of that memory and its SLAM state.
+SuperNav-1.5 uses the same task manifests, task selection, repetitions, scoring,
+and evaluation workflow as
+[SuperNav v1](../SuperNav_v1/README.md#run-navigation-experiments). Structured
+spatial memory can be evaluated in two execution modes:
 
-Choose one of the two released recipes:
+| Execution mode | Purpose | Entry point |
+| --- | --- | --- |
+| **Single-session benchmark** | Run the usual Habitat benchmark suites—including single-object, multi-object, HM3D ObjectNav, and HM3D-OVON—with spatial memory built within each episode. Each episode starts with empty memory and a new SLAM map. | `supernav stack run` |
+| **Paired-session benchmark** | Evaluate memory reuse across sessions. An exploration session builds memory. A retrieval session then starts from an immutable snapshot of that memory and its SLAM state, optionally from a different pose. | `supernav stack run-paired` |
 
-| Experiment | Memory configuration |
+
+The execution mode is independent of the spatial-memory recipe:
+
+| Experiment recipe | Memory configuration |
 | --- | --- |
 | `habitat-spatial-memory` | Memory nodes, Cartographer 2D SLAM, occupancy navigation, and Qwen area captions |
 | `habitat-spatial-memory-slam-only` | The same memory-node and SLAM pipeline with area captioning disabled |
 
-First complete the [native Cartographer build and runtime installation](docs/release/en/spatial-memory.md#install-and-build)
-and the [Habitat-GS setup](docs/release/en/habitat.md). Prepare a Habitat task
-manifest using the [same format and data preparation workflow as SuperNav v1](../SuperNav_v1/README.md#quick-start).
-Then run from this directory with paths for your machine:
+### Common setup
+
+First complete the
+[native Cartographer build and runtime installation](docs/release/en/spatial-memory.md#install-and-build)
+and the [Habitat-GS setup](docs/release/en/habitat.md). Prepare the task manifest
+for the selected benchmark using the
+[same data preparation workflow as SuperNav v1](../SuperNav_v1/README.md#run-navigation-experiments).
+Then configure the runtime paths for your machine:
 
 ```bash
 export SUPERNAV_HABITAT_ROOT=/absolute/path/to/habitat-gs
@@ -180,15 +185,6 @@ export SUPERNAV_HABITAT_PYTHON=/absolute/path/to/habitat-environment/bin/python
 export SUPERNAV_SCENE_DATASET_CONFIG=/absolute/path/to/global_navigation.scene_dataset_config.json
 export HAB_GPU_DEVICE_ID=0
 export HAB_CARTOGRAPHER_WORKER_COMMAND="scripts/run_cartographer_worker.sh {input_fifo} {occupancy_path}"
-
-supernav config show --experiment habitat-spatial-memory
-
-supernav stack run-paired \
-  --experiment habitat-spatial-memory \
-  --instructions /absolute/path/to/tasks/habitat.json \
-  --task-ids example-task \
-  --arms default \
-  --output-dir data/runs/habitat-spatial-memory
 ```
 
 `SUPERNAV_HABITAT_PYTHON` is also the default interpreter for the managed Qwen
@@ -199,9 +195,64 @@ an existing local Qwen checkout instead of downloading the public model ID, set
 `SUPERNAV_CAPTION_PYTHON` and `HAB_CARTOGRAPHER_RELOCALIZER_COMMAND` variables
 remain available as advanced overrides.
 
+Inspect either recipe before running it:
+
+```bash
+supernav config show --experiment habitat-spatial-memory
+supernav config show --experiment habitat-spatial-memory-slam-only
+```
+
+The full recipe is used below. Substitute
+`habitat-spatial-memory-slam-only` in either mode when captions are not needed.
+
+### Mode 1: single-session benchmarks
+
+Use `stack run` for ordinary single-session benchmark manifests. The same entry
+point applies whether the selected manifest contains Habitat-GS single-object,
+multi-object, HM3D ObjectNav, or HM3D-OVON tasks:
+
+```bash
+supernav stack run \
+  --experiment habitat-spatial-memory \
+  --instructions /absolute/path/to/tasks/habitat.json \
+  --task-ids example-task \
+  --arms default \
+  --output-dir data/runs/habitat-spatial-memory
+```
+
 Replace `example-task` with a `task_id` from the manifest. The recipe already
 selects `gpt-6-astra` with medium reasoning; normal runner options such as
 `--model`, `--reps`, `--run-tag`, and `--dry-run` are forwarded unchanged.
+The stack starts the required support service, delegates to the normal
+experiment runner, and starts and stops the Habitat bridge for each episode.
+
+Use the SuperNav v1 guides to prepare each benchmark's data and task manifest;
+replace the v1 `supernav run` invocation with the `supernav stack run` command
+above so the spatial-memory services are available:
+
+| Benchmark workflow | Preparation and scoring guide |
+| --- | --- |
+| Habitat-GS single-object and multi-object | [HabitatGS-Benchmark](../SuperNav_v1/docs/release/en/habitatgs-benchmark.md) |
+| HM3D ObjectNav and HM3D-OVON | [HM3D v2 and OVON](../SuperNav_v1/docs/release/en/hm3d-and-ovon.md) |
+| Task selection, repetitions, arms, run tags, and output directories | [Run navigation experiments](../SuperNav_v1/README.md#run-navigation-experiments) |
+
+Every single-session episode starts with fresh memory. The spatial-memory recipe
+disables SuperNav v1's bounded spatial-fact ledger, so the agent sees one
+spatial-memory system rather than two competing memories.
+
+### Mode 2: paired-session benchmark
+
+Use `stack run-paired` only when the benchmark condition is intended to measure
+reuse of memory from a prior session:
+
+```bash
+supernav stack run-paired \
+  --experiment habitat-spatial-memory \
+  --instructions /absolute/path/to/tasks/habitat.json \
+  --task-ids example-task \
+  --arms default \
+  --output-dir data/runs/habitat-spatial-memory-paired
+```
 
 `run-paired` performs two runs of the selected task row:
 
@@ -232,16 +283,35 @@ runtime state differ. A task row may specify the two starts directly:
 
 The stack preflights the patched worker, starts and health-checks the caption
 service, and starts a fresh Habitat bridge and Cartographer worker for each
-session. It stops only the caption process it owns. The memory recipe disables
-SuperNav v1's bounded spatial-fact ledger, so the agent sees one spatial-memory
-system rather than two competing memories.
+session. It stops only the caption process it owns.
 
 The recipe binds a dedicated spatial-memory prompt and jointly requires the
 `memory-nodes`, `2d-slam`, and `spatial-memory-navigation` Skills. Visible local
 targets use immediate one-call visual-point movement; off-screen memory nodes
 and current SLAM-area frontiers use preview/confirmation occupancy routing.
 
-For a reusable machine-local configuration, create the ignored file
+Pair state is written below `<output-dir>/_pairs/<pair-id>/`. `pair.json`
+records both run IDs and status; `snapshot/manifest.json` records artifact
+hashes; normal episode artifacts live below `episodes/`. To retry retrieval
+without rerunning a valid exploration snapshot:
+
+```bash
+supernav stack run-paired \
+  --experiment habitat-spatial-memory \
+  --instructions /absolute/path/to/tasks/habitat.json \
+  --task-ids example-task --arms default --resume \
+  --output-dir data/runs/habitat-spatial-memory-paired
+```
+
+Resume fails closed if an immutable snapshot artifact is absent or its hash has
+changed. Use `--overwrite` to archive the prior pair under a timestamped stale
+directory and start a new pair. `--retrieve-spawn '{...}'` can override the
+retrieval start when exactly one task is selected.
+
+### Reusable configuration and services
+
+For either execution mode, a reusable machine-local configuration can keep the
+manifest and output paths out of the command. Create the ignored file
 `configs/local/habitat-spatial-memory.json`:
 
 ```json
@@ -254,56 +324,40 @@ For a reusable machine-local configuration, create the ignored file
 
 ```bash
 supernav config show --config configs/local/habitat-spatial-memory.json
+supernav stack run \
+  --config configs/local/habitat-spatial-memory.json \
+  --task-ids example-task --arms default
+```
+
+Use the same configuration with `run-paired` for the paired-session condition:
+
+```bash
 supernav stack run-paired \
   --config configs/local/habitat-spatial-memory.json \
   --task-ids example-task --arms default
 ```
 
-Pair state is written below `<output-dir>/_pairs/<pair-id>/`. `pair.json`
-records both run IDs and status; `snapshot/manifest.json` records artifact
-hashes; normal episode artifacts live below `episodes/`. To retry retrieval
-without rerunning a valid exploration snapshot:
-
-```bash
-supernav stack run-paired \
-  --config configs/local/habitat-spatial-memory.json \
-  --task-ids example-task --arms default --resume
-```
-
-Resume fails closed if an immutable snapshot artifact is absent or its hash has
-changed. Use `--overwrite` to archive the prior pair under a timestamped stale
-directory and start a new pair. `--retrieve-spawn '{...}'` can override the
-retrieval start when exactly one task is selected.
-
-To run without the caption model, change only the recipe:
-
-```bash
-supernav stack run-paired \
-  --experiment habitat-spatial-memory-slam-only \
-  --instructions /absolute/path/to/tasks/habitat.json \
-  --task-ids example-task \
-  --arms default \
-  --output-dir data/runs/habitat-spatial-memory-slam-only
-```
-
-For repeated experiments, retain the caption service between runs:
+By default, either entry point starts the required support service and cleans up
+the service process it owns after the benchmark finishes. For repeated
+experiments, retain the caption service across both single-session and paired
+runs:
 
 ```bash
 supernav stack up --experiment habitat-spatial-memory
 supernav stack status
-supernav stack run-paired \
+supernav stack run \
   --experiment habitat-spatial-memory \
   --instructions /absolute/path/to/tasks/habitat.json \
   --task-ids example-task \
   --arms default
+# Additional `stack run` or `stack run-paired` commands can reuse the service.
 supernav stack logs --follow
 supernav stack down
 ```
 
 `stack up` starts the long-lived caption service, not the Habitat bridge.
-`stack run-paired` starts each bridge through the paired experiment runner.
-`stack run` remains available for a one-session diagnostic, but it does not
-evaluate snapshot reuse. See the
+`stack run` starts a bridge for each ordinary episode; `stack run-paired` starts
+a fresh bridge for each of its exploration and retrieval sessions. See the
 [spatial-memory guide](docs/release/en/spatial-memory.md#run-with-the-service-stack)
 for external caption services, service ownership, logs, and shutdown behavior.
 
@@ -341,7 +395,7 @@ and [简体中文](docs/release/zh/README.md).
 | [HabitatGS-Benchmark](docs/release/en/habitatgs-benchmark.md) | Public GS dataset conversion, navigation, SR/SPL and stage SR |
 | [HM3D v2 and OVON](docs/release/en/hm3d-and-ovon.md) | Scene and episode data, task preparation, navigation, and offline scoring |
 | [AI2-THOR](docs/release/en/ai2thor.md) | Dataset, Unity build, observations, and execution |
-| [Unitree Go2](docs/release/en/go2.md) | Jetson installation, PixelGoal operation, source maintenance, and tests |
+| [Unitree Go2](docs/release/en/go2.md) | Jetson installation, spatial-memory operation, paired sessions, source maintenance, and tests |
 | [Web viewer](docs/release/en/web-viewer.md) | Live observation and recorded runs |
 | [Architecture](docs/release/en/architecture.md) | Runtime, methods, backends, experiments, and evaluation |
 | [Directory layout](docs/release/en/layout.md) | Source, configuration, asset, and output locations |
@@ -360,19 +414,17 @@ in a clean environment with only the base dependencies.
 
 ## 📄 Citation
 
-Citation metadata for SuperNav-1.5 will be published with its paper. For the
-original SuperNav system on which this work builds, please cite the
-[SuperNav paper](https://arxiv.org/abs/2610.12126v1):
+Please cite SuperNav-1.5 as follows:
 
 ```bibtex
-@misc{zhang2026supernav,
-  title={{SuperNav}: An Agentic Navigation System for Any Task in Any Scene},
-  author={Jinkai Zhang and Jingyi Xu and Yuanhong Yu and Jiarui Guo and Ruizhen Hu and Hujun Bao and Xiaowei Zhou and Sida Peng},
+@misc{guo2026supernav15structuredspatialmemory,
+  title={SuperNav-1.5: Structured Spatial Memory For Agentic Navigation Systems},
+  author={Jiarui Guo and Jinkai Zhang and Yuanhong Yu and Yongchen Zai and Futang Zhu and Ruizhen Hu and Sida Peng and Xiaowei Zhou},
   year={2026},
-  eprint={2610.12126},
+  eprint={2611.29912},
   archivePrefix={arXiv},
   primaryClass={cs.RO},
-  url={https://arxiv.org/abs/2610.12126v1}
+  url={https://arxiv.org/abs/2611.29912},
 }
 ```
 
@@ -397,5 +449,5 @@ no approval or fee is required. Register each materially distinct project once.
 **Project use registration:** [Google Forms](https://docs.google.com/forms/d/e/1FAIpQLSff5QjjANlJ2hnXYqBSAzKWxEM58gIxPLh17-t3j3-MqO1a5w/viewform).
 
 Third-party code and bundled fonts retain their original licenses and copyright
-notices; see [Third-party notices](THIRD_PARTY_NOTICES.md). External simulators,
+notices. See [Third-party notices](THIRD_PARTY_NOTICES.md). External simulators,
 datasets, and model weights retain their respective licenses.

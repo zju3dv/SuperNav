@@ -9,6 +9,9 @@
   <a href="https://arxiv.org/abs/2610.12126v1"><img src="https://img.shields.io/badge/arXiv-2610.12126-b31b1b" alt="arXiv: 2610.12126"></a>
   <a href="https://huggingface.co/papers/2610.12126"><img src="https://img.shields.io/badge/Hugging_Face-Paper-FFD21E?logo=huggingface&amp;logoColor=FFD21E" alt="Hugging Face Paper"></a>
   <a href="https://zju3dv.github.io/SuperNav/"><img src="https://img.shields.io/badge/Project_Page-SuperNav-orange" alt="Project Page"></a>
+  <a href="docs/release/assets/wechat.png">
+    <img src="https://img.shields.io/badge/%E5%BE%AE%E4%BF%A1-WeChat-green?logo=wechat&logoColor=green" alt="微信">
+  </a>
 </p>
 
 <p><a href="README.md">English</a> | <strong>简体中文</strong></p>
@@ -42,15 +45,11 @@
 
 ## 📢 News
 
+> **[2026-10-23]** 🎉 [SuperNav-1.5](../SuperNav_v1_5/README.zh-CN.md) 已发布，为导航系统带来结构化空间记忆。
+
 > **[2026-10-21]** 🤖 **Unitree Go2 真机部署**已发布，提供四路 RGB 与 LiDAR 支持的 map-backed PixelGoal 导航。Jetson 安装与使用方法见[部署教程](docs/release/zh/go2.md)。
 
 > **[2026-10-13]** 🎉 InteriorGS **ObjectNav 与 Multi-ObjectNav 测试回合**（各 150 个，含参考轨迹）已在 [HabitatGS-Benchmark](https://huggingface.co/datasets/yyh929/HabitatGS-Benchmark) 发布，数据与评测方式见 [benchmark 指南](https://github.com/zju3dv/habitat-gs/blob/main/docs/benchmark/README.md)。
-
-原始场景数据请从 [InteriorGS](https://huggingface.co/datasets/spatialverse/InteriorGS) 下载。
-
-公开 `habitat_gs/objectnav/v1` 文件需要先转换才能交给 `supernav run`。
-转换、运行、逐动作轨迹导出及 SR/SPL、SR1～SR5 评分见
-[SuperNav GS benchmark 指南](docs/release/zh/habitatgs-benchmark.md)。
 
 ## 🧭 SuperNav 是什么？
 
