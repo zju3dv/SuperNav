@@ -14,14 +14,18 @@
 
 """Jetson-resident pixel-goal MAP-backend navigation module (four-way USB + SLAM).
 
-The agent marks a normalized point on any USB surround view; the clicked pixel is back-projected into a world ray at snapshot time
+Map-backend counterpart of the monocular ``pixel_goal_module.py`` (the
+``template`` backend): the agent marks a normalized point on any USB surround
+view; the clicked pixel is back-projected into a world ray at snapshot time
 (pinhole USB model + mount extrinsics composed with the odom/TF base pose),
 the ray's ROI is lifted out of the LiDAR global map (escalating radii,
 nearest-quartile front-surface heuristic), and the resulting front-edge
 contact goal is handed to the ReplanningAStarPlanner — real obstacle
-avoidance. Clicks without projected returns fall back to a single short
-costmap-directed exploration waypoint, then return fresh views to the agent.
-The agent-facing contract uses polling
+avoidance. Clicks without projected returns fall back to costmap-directed
+exploration waypoints, re-projecting the frozen ray against the refreshed map
+after every move. Algorithm ported from
+``feat/go2-visible-target-nav-stable:dimos/navigation/pixel_goal.py``; the
+agent-facing contract is the template backend's polling shape
 (``pixelgoal_navigate`` / ``pixelgoal_status`` / ``pixelgoal_stop``), and
 Rerun is only an optional visualization of the frozen goal frame and markers.
 
@@ -37,7 +41,6 @@ import json
 import math
 import os
 from pathlib import Path
-import queue
 import threading
 import time
 from typing import Any
@@ -54,6 +57,12 @@ from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
 from dimos.mapping.voxel_grid_mapper_spec import VoxelGridMapperSpec
 from dimos.mapping.occupancy.inflation import simple_inflate
+from dimos.mapping.occupancy.floor_plan import FloorPlanConfig
+from dimos.mapping.occupancy.room_segmentation import (
+    RoomSegmentationConfig,
+    render_room_segmentation,
+)
+from dimos.mapping.occupancy.habitat_area_segmentation import build_slam_area_nodes
 from dimos.msgs.geometry_msgs.PointStamped import PointStamped
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Quaternion import Quaternion
@@ -64,6 +73,7 @@ from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.navigation.replanning_a_star.module_spec import ReplanningAStarPlannerSpec
+from dimos.navigation.skill_metadata import pose_metadata
 from dimos.perception.detection.type.detection2d.bbox import Detection2DBBox
 from dimos.perception.detection.type.detection3d.pointcloud import Detection3DPC
 from dimos.robot.unitree.go2.surround_camera import (
@@ -71,16 +81,22 @@ from dimos.robot.unitree.go2.surround_camera import (
     RERUN_IMAGE_DOWNSAMPLE,
     surround_image_health,
 )
-from dimos.utils.logging_config import setup_logger
+from dimos.robot.unitree.go2.motion_recorder import (
+    HopMotionRecorder as _HopMotionRecorder,
+    MOTION_REC_DIR_ENV,
+    MOTION_REC_HZ_ENV,
+)
+from dimos.utils.logging_config import get_run_log_dir, setup_logger
 
 from .contracts import GoalSnapshot, LocalNavError, NormalizedPoint
 from .goal import build_goal_snapshot, decode_click_frame
 from .live_state import LiveStateWriter
-from .pixel_goal_support import GOAL_CACHE_SIZE, NavLiveSink, UnitreeMotionSpec, PixelGoalHopResult
+from .pixel_goal_support import GOAL_CACHE_SIZE, NavLiveSink, UnitreeMotionSpec
+from .pixel_goal_support import PixelGoalHopResult
 from .pixel_goal_map import (
     BASE_FRAME,
     ELEVATED_SURFACE_HEIGHT_M,
-    EXPLORATION_STEP_M,
+    MAX_CONSECUTIVE_EXPLORATION_FAILURES,
     MIN_RADIUS_PX,
     PixelGoalMapConfig,
     contact_goal,
@@ -94,9 +110,10 @@ from .pixel_goal_map import (
     projection_diagnostics,
     projection_search_radii,
     select_surface_candidate,
-    segment_crosses_obstacle,
     world_to_optical_from_odom,
 )
+from .pixel_goal_support import NomadStatusSpec
+from .area_captioning import Go2AreaCaptionWorker
 
 logger = setup_logger()
 
@@ -109,14 +126,14 @@ NEAR_CONTACT_PROGRESS_EPSILON_M = 0.03
 FINAL_PROGRESS_LOG_INTERVAL_S = 1.0
 EXPLORATION_FOOTPRINT_SCALE = 1.1
 STATUS_UPDATE_INTERVAL_S = 1.0
+FINAL_STALL_SECONDS = 10.0
+FINAL_STALL_PROGRESS_M = 0.2
 
 _SESSION_STATUS = {
     "completed": ("reached", True),
-    "exploration_complete": ("needs_agent", False),
-    "exploration_failed": ("needs_agent", False),
-    "no_progress": ("needs_agent", False),
     "movement_stopped": ("needs_agent", False),
     "final_goal_failed": ("needs_agent", False),
+    "final_goal_stalled": ("needs_agent", False),
     "blocked_pixel_target": ("needs_agent", False),
     "recovery_exhausted": ("needs_agent", False),
     "map_reset": ("needs_agent", False),
@@ -124,94 +141,8 @@ _SESSION_STATUS = {
     "deadline_exceeded": ("timeout", False),
 }
 
-MOTION_REC_HZ_ENV = "DIMOS_PIXELGOAL_MOTION_HZ"
-MOTION_REC_DIR_ENV = "DIMOS_PIXELGOAL_MOTION_DIR"
-MOTION_REC_JPEG_QUALITY = 80
-
-
-class _HopMotionRecorder:
-    """Best-effort four-way JPEG recorder gated to one hop's lifetime.
-
-    Recording must never slow or break navigation: offers are rate-limited per
-    direction and handed to a bounded queue drained by a daemon writer thread;
-    any write/encode failure disables the recorder with a single warning.
-    Layout: ``<root>/hop_<start_epoch>_<goal_tail8>/<direction>/<epoch_ms>.jpg``
-    plus a ``meta.json`` written by :meth:`finish`.
-    """
-
-    def __init__(self, root: Path, goal_id: str, hz: float) -> None:
-        tail = "".join(c for c in goal_id if c.isalnum())[-8:] or "nogoal"
-        self.dir = root / f"hop_{int(time.time())}_{tail}"
-        self.goal_id = goal_id
-        self.started_at = time.time()
-        self.saved = 0
-        self._interval = 1.0 / hz
-        self._last_ts: dict[str, float] = {}
-        self._queue: queue.Queue[tuple[str, float, np.ndarray] | None] = queue.Queue(maxsize=16)
-        self._disabled = False
-        self._thread = threading.Thread(
-            target=self._writer, name="pixelgoal-motion-rec", daemon=True
-        )
-
-    def start(self) -> None:
-        for direction in CAMERA_DIRECTIONS:
-            (self.dir / direction).mkdir(parents=True, exist_ok=True)
-        self._thread.start()
-
-    def offer(self, direction: str, image: Image) -> None:
-        if self._disabled:
-            return
-        ts = float(image.ts or time.time())
-        last = self._last_ts.get(direction)
-        if last is not None and ts - last < self._interval:
-            return
-        self._last_ts[direction] = ts
-        try:
-            rgb = np.asarray(image.to_rgb().data)
-        except Exception:
-            return
-        try:
-            self._queue.put_nowait((direction, ts, rgb))
-        except queue.Full:
-            pass
-
-    def _writer(self) -> None:
-        while True:
-            item = self._queue.get()
-            if item is None:
-                return
-            direction, ts, rgb = item
-            try:
-                ok, buf = cv2.imencode(
-                    ".jpg",
-                    cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
-                    [cv2.IMWRITE_JPEG_QUALITY, MOTION_REC_JPEG_QUALITY],
-                )
-                if not ok:
-                    raise ValueError("cv2.imencode returned False")
-                (self.dir / direction / f"{round(ts * 1000)}.jpg").write_bytes(buf.tobytes())
-                self.saved += 1
-            except Exception as exc:
-                self._disabled = True
-                logger.warning("pixel-goal motion recorder disabled: %s", exc)
-                return
-
-    def finish(self, meta: dict[str, Any]) -> None:
-        self._queue.put(None)
-        self._thread.join(timeout=5.0)
-        payload = {
-            "goal_id": self.goal_id,
-            "started_at": self.started_at,
-            "ended_at": time.time(),
-            "frames_saved": self.saved,
-            **meta,
-        }
-        try:
-            (self.dir / "meta.json").write_text(
-                json.dumps(payload, indent=1, default=str), encoding="utf-8"
-            )
-        except Exception as exc:
-            logger.warning("pixel-goal motion recorder meta write failed: %s", exc)
+CAPTION_KEYFRAME_DISTANCE_M = 0.5
+DEFAULT_CAPTION_ROUTE_FILE = Path.home() / ".local/state/dimos/.active-caption-dir"
 
 
 class PixelGoalMapNavConfig(ModuleConfig):
@@ -245,6 +176,7 @@ class PixelGoalMapNavModule(Module):
     _motion: UnitreeMotionSpec  # injected at blueprint build time
     _planner_spec: ReplanningAStarPlannerSpec  # injected at blueprint build time
     _mapper_spec: VoxelGridMapperSpec | None = None  # optional (map reset)
+    _nomad: NomadStatusSpec | None = None  # optional sibling probe
 
     def __init__(self, live_dir: str = "", **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -279,9 +211,14 @@ class PixelGoalMapNavModule(Module):
         self._snapshot_transform: Transform | None = None
         self._snapshot_frame_id = ""
         self._exploration_goals = 0
-        self._exploration_limit_m: float | None = None
+        self._exploration_failures = 0
+        self._failed_exploration_waypoints: list[np.ndarray] = []
+        self._active_exploration_waypoint: np.ndarray | None = None
         self._unknown_frontier_goal: np.ndarray | None = None
         self._unknown_frontier_map: OccupancyGrid | None = None
+        self._final_progress_at: float | None = None
+        self._final_progress_distance: float | None = None
+        self._exploration_limit_m: float | None = None
         self._final_target: np.ndarray | None = None
         self._final_stop: np.ndarray | None = None
         self._contact_completion_requested = False
@@ -299,15 +236,21 @@ class PixelGoalMapNavModule(Module):
         self._travelled_m = 0.0
         self._last_odom_xy: np.ndarray | None = None
         self._last_status_write = 0.0
-        self._progress_target: np.ndarray | None = None
-        self._progress_best_distance: float | None = None
-        self._progress_at = 0.0
         # --- hop motion recorder (demo replay frames; 0 Hz disables) ---
         self._motion_rec_hz = float(os.environ.get(MOTION_REC_HZ_ENV, "15.0") or 0.0)
         self._motion_rec_root = Path(
             os.environ.get(MOTION_REC_DIR_ENV) or str(Path(self._live_dir).parent / "motion")
         )
         self._motion_rec: _HopMotionRecorder | None = None
+        run_log_dir = get_run_log_dir()
+        caption_root = Path(
+            os.environ.get("GO2_SLAM_AREA_CAPTION_DIR")
+            or (run_log_dir / "captions" if run_log_dir is not None else Path(self._live_dir) / "captions")
+        )
+        self._caption_root = caption_root
+        self._caption_worker = Go2AreaCaptionWorker.from_environment(caption_root)
+        self._caption_last_xy: np.ndarray | None = None
+        self._caption_step = 0
 
     # ------------------------------------------------------------------ lifecycle
     @rpc
@@ -348,6 +291,8 @@ class PixelGoalMapNavModule(Module):
         self._finish_session("module_stopped")
         if thread is not None:
             thread.join(10.0)
+        if self._caption_worker is not None:
+            self._caption_worker.close()
         super().stop()
 
     # ------------------------------------------------------------------ inputs
@@ -369,6 +314,47 @@ class PixelGoalMapNavModule(Module):
     def _surround_snapshot(self) -> dict[str, Image]:
         with self._frame_lock:
             return dict(self._surround_images)
+
+    def _maybe_submit_caption_keyframe(self, odom: PoseStamped) -> None:
+        self._refresh_caption_root()
+        worker = self._caption_worker
+        if worker is None or self._camera_model() != "usb":
+            return
+        xy = odom.position.to_numpy()[:2].astype(np.float64)
+        moved = self._caption_last_xy is None or float(np.linalg.norm(xy - self._caption_last_xy)) >= CAPTION_KEYFRAME_DISTANCE_M
+        if not moved:
+            return
+        images = self._surround_snapshot()
+        if not images:
+            return
+        self._caption_step += 1
+        worker.submit(images, odom, self._caption_step)
+        self._caption_last_xy = xy
+
+    def _refresh_caption_root(self) -> None:
+        """Follow the active operator-console run published by its proxy."""
+        route_file = Path(
+            os.environ.get("GO2_SLAM_AREA_CAPTION_ROUTE_FILE")
+            or DEFAULT_CAPTION_ROUTE_FILE
+        )
+        try:
+            routed_root = Path(route_file.read_text(encoding="utf-8").strip()).resolve()
+        except (OSError, ValueError):
+            return
+        if routed_root == self._caption_root or routed_root.name != "captions":
+            return
+        if routed_root.parent.name == "logs":
+            run_dir = routed_root.parent.parent
+            if run_dir.parent.name != "operator-console":
+                return
+        new_worker = Go2AreaCaptionWorker.from_environment(routed_root)
+        if new_worker is None:
+            return
+        old_worker = self._caption_worker
+        self._caption_root = routed_root
+        self._caption_worker = new_worker
+        if old_worker is not None:
+            old_worker.close()
 
     def _on_pixel_click(self, point: PointStamped) -> None:
         parts = set(point.frame_id.strip("/").split("/"))
@@ -426,6 +412,17 @@ class PixelGoalMapNavModule(Module):
     def _camera_model(self) -> str:
         return (self.config.camera_model or "usb").strip().lower()
 
+    def _nomad_hop_running(self) -> bool:
+        nomad = self._nomad
+        if nomad is None:
+            return False
+        try:
+            raw = nomad.nomad_status(include_images=False)
+            payload = json.loads(raw) if isinstance(raw, str) else {}
+        except Exception:  # noqa: BLE001 — a dead sibling must not block the fallback
+            logger.warning("NoMaD status probe failed; assuming no NoMaD hop is running")
+            return False
+        return bool(payload.get("hop_running"))
 
     # ------------------------------------------------------------------ skills
     @skill(uses=[CAP_MOVEMENT])
@@ -445,14 +442,7 @@ class PixelGoalMapNavModule(Module):
         drives the dog so its front edge reaches the projected surface. Side
         and back clicks need no pre-turn: the ray lives in the map frame and
         the planner handles the heading. Clicks without LiDAR returns advance
-        through ray-aligned waypoints (at most 1.5 m per leg), with up to
-        0.5 m of unknown extension from reachable free space. Another unknown
-        leg requires new free evidence near the previous frontier,
-        rechecking the target after each successful leg. The whole hop defaults
-        to 60 seconds and a 10 m exploration budget. When exploration runs out,
-        return needs_agent / exploration_complete with fresh views.
-        Sustained lack of net approach ends the hop with no_progress.
-        Known obstacles before the stopping point yield blocked_pixel_target.
+        through costmap-known free waypoints along the frozen ray.
 
         Args:
             point: Normalized [x, y] target ((0,0)=top-left, (1,1)=bottom-right)
@@ -473,7 +463,7 @@ class PixelGoalMapNavModule(Module):
         Returns:
             JSON string: {"ok": true, "status": "started", "goal_id": ...} or
             an error code (invalid_point / invalid_direction / no_frame /
-            goal_not_found / hop_already_running).
+            goal_not_found / hop_already_running / nomad_hop_running).
         """
         goal_id = str(goal_id or "").strip()
         goal: GoalSnapshot | None = None
@@ -571,6 +561,14 @@ class PixelGoalMapNavModule(Module):
             if image is not None:
                 self.pixel_goal_image.publish(image)
 
+        if self._nomad_hop_running():
+            return json.dumps(
+                {
+                    "ok": False,
+                    "code": "nomad_hop_running",
+                    "error": "a NoMaD hop is running; call nomad_stop before pixelgoal_navigate",
+                }
+            )
         with self._hop_lock:
             if self._hop_cancel is not None:
                 return json.dumps(
@@ -610,6 +608,7 @@ class PixelGoalMapNavModule(Module):
             self._hop_thread = thread
             self._terminal_images_goal_id = None
         thread.start()
+        self._start_motion_recorder(goal)
         return json.dumps(
             {
                 "ok": True,
@@ -650,12 +649,17 @@ class PixelGoalMapNavModule(Module):
             return json.dumps(payload, default=str)
         goal_id = str(self._last_result.get("goal_id") or "")
         with self._hop_lock:
-            if goal_id and self._terminal_images_goal_id == goal_id:
+            if (
+                goal_id
+                and self._terminal_images_goal_id == goal_id
+                and not (self._caption_worker and self._caption_worker.has_pending())
+            ):
                 return json.dumps(payload, default=str)
         images = self._surround_snapshot()
         health = surround_image_health(images)
         payload["camera_health"] = health
         fresh = set(health["fresh"])
+        slam_map = self._terminal_2d_slam_map_content(payload)
         content: list[dict[str, Any]] = [{"type": "text", "text": json.dumps(payload, default=str)}]
         for direction in CAMERA_DIRECTIONS:
             image = images.get(direction)
@@ -663,10 +667,66 @@ class PixelGoalMapNavModule(Module):
                 continue
             content.append({"type": "text", "text": direction})
             content.extend(image.agent_encode())
+        if slam_map is not None:
+            content.append(slam_map)
         if health["ok"]:
             with self._hop_lock:
                 self._terminal_images_goal_id = goal_id
         return content
+
+    def _terminal_2d_slam_map_content(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        """Attach the current segmented 2D SLAM map to a terminal hop result."""
+
+        with self._state_lock:
+            costmap = self._latest_costmap
+            odom = self._latest_odom
+        metadata: dict[str, Any] = {
+            "status": "unavailable",
+            "source": "native_global_map_area_segmented",
+        }
+        if costmap is None:
+            payload["2d_slam_map"] = metadata
+            return None
+        # A PixelGoal odometry reading is not necessarily in the costmap's
+        # coordinates. Never draw or persist a robot anchor in another frame.
+        map_pose = (
+            odom
+            if odom is not None and costmap.frame_id and odom.frame_id == costmap.frame_id
+            else None
+        )
+        try:
+            rendered = render_room_segmentation(
+                costmap,
+                floor_plan_config=FloorPlanConfig(),
+                config=RoomSegmentationConfig(output_max_size_px=768),
+                pose=map_pose,
+            )
+        except Exception as exc:  # noqa: BLE001 — navigation result must remain available
+            metadata.update(
+                {
+                    "status": "render_failed",
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                }
+            )
+            payload["2d_slam_map"] = metadata
+            logger.exception("Failed to render PixelGoal terminal 2D SLAM map")
+            return None
+        metadata.update(rendered.metadata)
+        metadata["map_frame"] = costmap.frame_id
+        metadata["status"] = "current" if map_pose is not None else "pose_unavailable"
+        metadata["image_coordinate_convention"] = "world_x_right_world_y_up"
+        slam_area_nodes = build_slam_area_nodes(
+            rendered.occupancy_grid, rendered.region_labels
+        )
+        if self._caption_worker is not None:
+            slam_area_nodes = self._caption_worker.enrich_nodes(
+                slam_area_nodes, rendered.occupancy_grid, rendered.region_labels
+            )
+        metadata["slam_area_nodes"] = slam_area_nodes
+        if map_pose is not None:
+            metadata["pose"] = pose_metadata(map_pose)
+        payload["2d_slam_map"] = metadata
+        return rendered.image_block
 
     @skill
     def pixelgoal_stop(self) -> str:
@@ -688,7 +748,7 @@ class PixelGoalMapNavModule(Module):
         robot_stop = "sent"
         try:
             self._motion.stop_movement()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             robot_stop = f"failed: {type(exc).__name__}: {exc}"
         return json.dumps(
             {
@@ -729,7 +789,7 @@ class PixelGoalMapNavModule(Module):
         try:
             recorder = _HopMotionRecorder(self._motion_rec_root, goal.goal_id, self._motion_rec_hz)
             recorder.start()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — recording must never block navigation
             logger.warning("pixel-goal motion recorder unavailable: %s", exc)
             return
         self._motion_rec = recorder
@@ -756,19 +816,14 @@ class PixelGoalMapNavModule(Module):
             logger.info(
                 "pixel-goal motion recorder off: %s frames=%s", recorder.dir, recorder.saved
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — recording must never break the hop path
             logger.warning("pixel-goal motion recorder finish failed: %s", exc)
 
     def _run_hop(self, goal: GoalSnapshot, image: Image | None, cancel: threading.Event) -> None:
         started_at = time.monotonic()
         with self._state_lock:
             self._active_goal = goal
-            # A new hop can fail geometry validation before _start_session resets
-            # its state. Do not attach the previous hop's terminal metrics.
-            self._session_stats = {}
-            self._travelled_m = 0.0
         try:
-            self._start_motion_recorder(goal)
             self._start_session(goal, image, cancel)
             result = self._await_session(goal, cancel, started_at)
         except LocalNavError as exc:
@@ -782,7 +837,7 @@ class PixelGoalMapNavModule(Module):
                 error_code=exc.code,
                 error=exc.message,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — the module must stay alive
             result = PixelGoalHopResult(
                 ok=False,
                 status="error",
@@ -817,7 +872,7 @@ class PixelGoalMapNavModule(Module):
         """Base pose in the map frame: TF at the frame ts when available, else odom."""
         try:
             transform = self.tf.get(map_frame_id, BASE_FRAME, frame_ts, time_tolerance=0.75)
-        except Exception:
+        except Exception:  # noqa: BLE001 — TF is a best-effort refinement
             transform = None
         if transform is not None:
             return transform.to_pose()
@@ -945,8 +1000,13 @@ class PixelGoalMapNavModule(Module):
             self._snapshot_transform = world_to_optical
             self._snapshot_frame_id = map_frame_id
             self._exploration_goals = 0
+            self._exploration_failures = 0
+            self._failed_exploration_waypoints = []
+            self._active_exploration_waypoint = None
             self._unknown_frontier_goal = None
             self._unknown_frontier_map = None
+            self._final_progress_at = None
+            self._final_progress_distance = None
             self._final_target = None
             self._final_stop = None
             self._contact_completion_requested = False
@@ -959,6 +1019,8 @@ class PixelGoalMapNavModule(Module):
             self._snapshot_image = frame
             self._travelled_m = 0.0
             self._last_odom_xy = None
+            self._caption_last_xy = None
+            self._caption_step = 0
         if cancel.is_set():
             with self._state_lock:
                 self._goal_published = False
@@ -989,17 +1051,17 @@ class PixelGoalMapNavModule(Module):
         if resolved is not None:
             target, target_kind = resolved
             if self._resolved_goal_blocked(target):
-                self._finish_session("blocked_pixel_target", expected_generation=generation)
-                return
+                self._finish_session("blocked_pixel_target")
+                raise LocalNavError(
+                    "blocked_pixel_target", "clicked target is behind an occupied cell"
+                )
             if self._publish_resolved_goal(target, target_kind, generation=generation):
                 return
-        if self._publish_exploration_goal(expected_generation=generation):
+        if self._publish_exploration_goal():
             return
         with self._state_lock:
             self._goal_published = False
             self._phase = "idle"
-        if cancel.is_set():
-            raise LocalNavError("cancelled_by_agent", "cancelled during goal projection")
         raise LocalNavError(
             "no_reachable_target", "no projected surface or reachable free waypoint"
         )
@@ -1118,10 +1180,19 @@ class PixelGoalMapNavModule(Module):
         inflated = simple_inflate(
             costmap, self.config.g.robot_width * EXPLORATION_FOOTPRINT_SCALE / 2
         )
-        stop = contact_goal(
-            target, ray_origin, offset_m=self._loop_config().robot_front_offset_m
-        )
-        return segment_crosses_obstacle(inflated, ray_origin, stop)
+        stop = contact_goal(target, ray_origin, offset_m=self._loop_config().robot_front_offset_m)
+        start = np.asarray(ray_origin[:2], dtype=np.float64)
+        end = np.asarray(stop[:2], dtype=np.float64)
+        distance = float(np.linalg.norm(end - start))
+        samples = max(2, math.ceil(distance / (inflated.resolution / 2)) + 1)
+        for fraction in np.linspace(0.0, 1.0, samples):
+            xy = start + (end - start) * fraction
+            cell = inflated.world_to_grid(Vector3(float(xy[0]), float(xy[1]), 0.0))
+            x, y = int(cell.x), int(cell.y)
+            if 0 <= x < inflated.width and 0 <= y < inflated.height:
+                if inflated.grid[y, x] >= 50:
+                    return True
+        return False
 
     def _publish_goal(self, target: np.ndarray, *, phase: str, generation: int) -> bool:
         with self._state_lock:
@@ -1141,13 +1212,6 @@ class PixelGoalMapNavModule(Module):
             if generation != self._session_generation or not self._goal_published:
                 return False
             self._phase = phase
-            self._progress_target = target[:2].copy()
-            self._progress_best_distance = (
-                float(np.linalg.norm(target[:2] - self._latest_odom.position.to_numpy()[:2]))
-                if self._latest_odom is not None
-                else None
-            )
-            self._progress_at = time.monotonic()
             self._session_stats["goals_published"] = (
                 int(self._session_stats.get("goals_published", 0)) + 1
             )
@@ -1181,6 +1245,12 @@ class PixelGoalMapNavModule(Module):
             frame_id = self._snapshot_frame_id
             self._final_target = navigation_target.copy()
             self._final_stop = goal.copy()
+            self._final_progress_at = time.monotonic()
+            odom = self._latest_odom
+            self._final_progress_distance = (
+                float(np.linalg.norm(goal[:2] - odom.position.to_numpy()[:2]))
+                if odom is not None else None
+            )
             self._contact_completion_requested = False
             self._near_contact_started_at = None
             self._near_contact_reference_distance = None
@@ -1230,19 +1300,23 @@ class PixelGoalMapNavModule(Module):
         )
         return True
 
-    def _publish_exploration_goal(self, *, expected_generation: int | None = None) -> bool:
+    def _publish_exploration_goal(self) -> bool:
         with self._state_lock:
-            if not self._goal_published or (
-                expected_generation is not None and expected_generation != self._session_generation
-            ):
-                return False
             costmap = self._latest_costmap
             odom = self._latest_odom
             ray_origin = self._ray_origin
             ray_direction = self._ray_direction
+            failures = self._exploration_failures
+            failed_waypoints = [point.copy() for point in self._failed_exploration_waypoints]
             generation = self._session_generation
             exploration_limit_m = self._exploration_limit_m
         if costmap is None or ray_origin is None or ray_direction is None:
+            return False
+        if failures >= MAX_CONSECUTIVE_EXPLORATION_FAILURES:
+            logger.warning(
+                "Pixel exploration stopped after consecutive unreachable waypoints",
+                consecutive_failures=failures,
+            )
             return False
         origin = odom.position.to_numpy() if odom is not None else ray_origin
         horizontal = np.asarray(ray_direction[:2], dtype=np.float64)
@@ -1256,7 +1330,7 @@ class PixelGoalMapNavModule(Module):
         if exploration_limit_m is not None:
             max_forward_m = min(max_forward_m, exploration_limit_m)
         remaining = max_forward_m - travelled
-        step_m = min(config.exploration_step_m, remaining, EXPLORATION_STEP_M)
+        step_m = min(config.exploration_step_m, remaining)
         if step_m < 0.5:
             logger.info(
                 "Pixel exploration stopped because remaining forward distance is too short",
@@ -1271,33 +1345,37 @@ class PixelGoalMapNavModule(Module):
             ray_direction,
             max_step_m=step_m,
             footprint_diameter_m=footprint_diameter_m,
+            excluded_waypoints=failed_waypoints,
         )
         if waypoint is None:
             logger.warning("No body-reachable pixel exploration waypoint found")
             return False
-        unknown = costmap.cell_value(Vector3(*waypoint)) == CostValues.UNKNOWN
+        cell = costmap.world_to_grid(Vector3(float(waypoint[0]), float(waypoint[1]), 0.0))
+        wx, wy = int(cell.x), int(cell.y)
+        unknown = (
+            0 <= wx < costmap.width
+            and 0 <= wy < costmap.height
+            and costmap.grid[wy, wx] == CostValues.UNKNOWN
+        )
         with self._state_lock:
             previous_goal = self._unknown_frontier_goal
             previous_map = self._unknown_frontier_map
         if unknown and previous_goal is not None and previous_map is not None:
-            # Only new free evidence near the previous frontier permits another
-            # unknown step. A timestamp refresh or distant change is insufficient.
+            # Require actual new free evidence near the prior unknown goal;
+            # a fresh timestamp or an unrelated map update is insufficient.
+            px, py = previous_goal[:2]
+            xs, ys = np.meshgrid(
+                np.arange(-0.5, 0.51, costmap.resolution),
+                np.arange(-0.5, 0.51, costmap.resolution),
+            )
             expanded = False
-            if previous_map.frame_id == costmap.frame_id:
-                offsets = np.arange(-0.5, 0.51, costmap.resolution)
-                for dx in offsets:
-                    for dy in offsets:
-                        point = Vector3(
-                            float(previous_goal[0] + dx), float(previous_goal[1] + dy), 0.0
-                        )
-                        if (
-                            previous_map.cell_value(point) == CostValues.UNKNOWN
-                            and costmap.cell_value(point) == CostValues.FREE
-                        ):
-                            expanded = True
-                            break
-                    if expanded:
-                        break
+            for dx, dy in zip(xs.flat, ys.flat, strict=True):
+                world = Vector3(float(px + dx), float(py + dy), 0.0)
+                old = previous_map.cell_value(world)
+                new = costmap.cell_value(world)
+                if old == CostValues.UNKNOWN and new == CostValues.FREE:
+                    expanded = True
+                    break
             if not expanded:
                 logger.warning("Unknown frontier did not gain known-free coverage")
                 return False
@@ -1305,6 +1383,7 @@ class PixelGoalMapNavModule(Module):
             if generation != self._session_generation or not self._goal_published:
                 return False
             self._exploration_goals += 1
+            self._active_exploration_waypoint = waypoint.copy()
             self._unknown_frontier_goal = waypoint.copy() if unknown else None
             self._unknown_frontier_map = (
                 OccupancyGrid(
@@ -1341,6 +1420,7 @@ class PixelGoalMapNavModule(Module):
                 self._last_odom_xy = xy
         if not active:
             return
+        self._maybe_submit_caption_keyframe(odom)
         now = time.monotonic()
         if now - self._last_status_write >= STATUS_UPDATE_INTERVAL_S:
             self._last_status_write = now
@@ -1365,6 +1445,12 @@ class PixelGoalMapNavModule(Module):
         with self._state_lock:
             if generation != self._session_generation or self._phase != "final":
                 return
+            if stop_distance is not None and (
+                self._final_progress_distance is None
+                or self._final_progress_distance - stop_distance >= FINAL_STALL_PROGRESS_M
+            ):
+                self._final_progress_distance = stop_distance
+                self._final_progress_at = now
             contact_distance = max(
                 front_distance,
                 stop_distance if stop_distance is not None else front_distance,
@@ -1446,37 +1532,46 @@ class PixelGoalMapNavModule(Module):
             active = self._goal_published
             phase = self._phase
             generation = self._session_generation
-            if not active or phase not in ("explore", "final"):
-                return
-            # Claim this completion before spawning work, so duplicate callbacks
-            # cannot publish multiple continuation goals for the same leg.
-            self._phase = "resolving"
+        if not active or phase == "idle":
+            return
 
         def advance() -> None:
             with self._state_lock:
-                if generation != self._session_generation or not self._goal_published:
+                if generation != self._session_generation:
                     return
                 world_map = self._latest_map
-            if phase == "final":
-                self._finish_session(
-                    "completed" if result.data else "final_goal_failed",
-                    expected_generation=generation,
-                )
+                current_phase = self._phase
+                if current_phase == "explore":
+                    if result.data:
+                        self._exploration_failures = 0
+                        self._failed_exploration_waypoints = []
+                    else:
+                        self._exploration_failures += 1
+                        if self._active_exploration_waypoint is not None:
+                            self._failed_exploration_waypoints.append(
+                                self._active_exploration_waypoint.copy()
+                            )
+                    self._active_exploration_waypoint = None
+            if current_phase == "final":
+                if result.data:
+                    logger.info("Pixel goal navigation completed")
+                    self._finish_session("completed")
+                else:
+                    logger.warning("Final pixel goal failed; stopping without further exploration")
+                    self._finish_session("final_goal_failed")
                 return
-            if not result.data:
-                self._finish_session("exploration_failed", expected_generation=generation)
-                return
+
             resolved = self._resolve_pixel_target(world_map) if world_map is not None else None
-            if resolved is not None:
+            if current_phase == "explore" and resolved is not None:
                 target, target_kind = resolved
                 if self._resolved_goal_blocked(target):
-                    self._finish_session("blocked_pixel_target", expected_generation=generation)
+                    self._finish_session("blocked_pixel_target")
                     return
                 if self._publish_resolved_goal(target, target_kind, generation=generation):
                     return
-            if self._publish_exploration_goal(expected_generation=generation):
-                return
-            self._finish_session("exploration_complete", expected_generation=generation)
+            if not self._publish_exploration_goal():
+                logger.warning("Pixel goal recovery exhausted", planner_result=result.data)
+                self._finish_session("recovery_exhausted")
 
         threading.Thread(target=advance, daemon=True, name="pixel-goal-recovery").start()
 
@@ -1500,9 +1595,14 @@ class PixelGoalMapNavModule(Module):
             self._snapshot_frame_id = ""
             self._snapshot_image = None
             self._exploration_goals = 0
-            self._exploration_limit_m = None
+            self._exploration_failures = 0
+            self._failed_exploration_waypoints = []
+            self._active_exploration_waypoint = None
             self._unknown_frontier_goal = None
             self._unknown_frontier_map = None
+            self._final_progress_at = None
+            self._final_progress_distance = None
+            self._exploration_limit_m = None
             self._final_target = None
             self._final_stop = None
             self._contact_completion_requested = False
@@ -1510,47 +1610,21 @@ class PixelGoalMapNavModule(Module):
             self._near_contact_reference_distance = None
             self._last_final_progress_log = 0.0
             self._phase = "idle"
-            self._progress_target = None
-            self._progress_best_distance = None
-            self._progress_at = 0.0
         logger.info("Pixel goal map session reset", reason=reason)
 
-    def _finish_session(self, reason: str, *, expected_generation: int | None = None) -> None:
+    def _finish_session(self, reason: str) -> None:
         with self._state_lock:
-            if self._session_done.is_set() or (
-                expected_generation is not None and expected_generation != self._session_generation
-            ):
+            if self._session_done.is_set():
                 return
             self._session_end_reason = reason
-            # Freeze the center-to-stop distance before _reset_session clears
-            # the resolved goal. Later odometry must not change this result.
-            stop = self._final_stop
-            odom = self._latest_odom
-            if stop is not None and odom is not None:
-                distance = float(np.linalg.norm(stop[:2] - odom.position.to_numpy()[:2]))
-                if math.isfinite(distance):
-                    self._session_stats["final_distance_m"] = round(distance, 3)
-                    self._session_stats["final_distance_basis"] = "robot_center_to_stop_point_xy"
         self._reset_session(reason=reason)
         self._session_done.set()
 
     def _abort_session(self, reason: str) -> None:
-        # Invalidate callbacks before cancel_goal can emit goal_reached(False).
-        with self._state_lock:
-            if self._session_done.is_set():
-                return
-            self._goal_published = False
-            self._session_generation += 1
         try:
-            cancelled = self._planner_spec.cancel_goal()
-        except Exception as exc:
+            self._planner_spec.cancel_goal()
+        except Exception as exc:  # noqa: BLE001 — never block a stop path
             logger.warning("Planner cancel failed during %s: %s", reason, exc)
-            cancelled = False
-        if not cancelled:
-            try:
-                self._motion.stop_movement()
-            except Exception as exc:
-                logger.warning("Fallback stop failed during %s: %s", reason, exc)
         self._finish_session(reason)
 
     def _result_from_reason(
@@ -1561,7 +1635,6 @@ class PixelGoalMapNavModule(Module):
         with self._state_lock:
             travelled_m = self._travelled_m
             goals_published = int(self._session_stats.get("goals_published", 0))
-            final_distance_m = self._session_stats.get("final_distance_m")
         return PixelGoalHopResult(
             ok=ok,
             status=status,
@@ -1570,49 +1643,10 @@ class PixelGoalMapNavModule(Module):
             steps=goals_published,
             duration_s=time.monotonic() - started_at,
             travelled_m=travelled_m,
-            final_distance_m=final_distance_m,
             needs_agent_reason=None if ok else reason,
             error_code=error_code,
             error=None if ok else f"pixel-goal map session ended: {reason}",
         )
-
-    def _check_goal_progress(self, now: float) -> bool:
-        """Return True after sustained lack of net approach, even without new odom.
-
-        The reference is a best-so-far distance, so oscillation or walking away
-        and back cannot keep resetting the timer. Local replans cannot reset it.
-        Run this from the hop wait loop, not a sensor callback.
-        """
-        config = self._loop_config()
-        with self._state_lock:
-            if not self._goal_published or self._progress_target is None:
-                return False
-            odom = self._latest_odom
-            distance = (
-                float(np.linalg.norm(self._progress_target - odom.position.to_numpy()[:2]))
-                if odom is not None
-                else None
-            )
-            if distance is not None and math.isfinite(distance):
-                if self._progress_best_distance is None:
-                    self._progress_best_distance = distance
-                elif self._progress_best_distance - distance >= config.progress_epsilon_m:
-                    self._progress_best_distance = distance
-                    self._progress_at = now
-            stalled_s = now - self._progress_at
-            if stalled_s < config.no_progress_timeout_s:
-                return False
-            details = {
-                "phase": self._phase,
-                "goal": self._progress_target.tolist(),
-                "distance_m": distance,
-                "best_distance_m": self._progress_best_distance,
-                "no_progress_s": round(stalled_s, 3),
-            }
-            self._session_stats["no_progress"] = details
-        self._sink.event("no_progress", details)
-        logger.warning("Pixel goal has no net progress; ending hop", **details)
-        return True
 
     def _await_session(
         self, goal: GoalSnapshot, cancel: threading.Event, started_at: float
@@ -1628,8 +1662,22 @@ class PixelGoalMapNavModule(Module):
                 # The done flag is now set; the next loop iteration returns.
             elif time.monotonic() - started_at > config.deadline_s:
                 self._abort_session("deadline_exceeded")
-            elif self._check_goal_progress(time.monotonic()):
-                self._abort_session("no_progress")
+            else:
+                with self._state_lock:
+                    stalled = (
+                        self._goal_published
+                        and self._phase == "final"
+                        and self._final_progress_at is not None
+                        and time.monotonic() - self._final_progress_at >= FINAL_STALL_SECONDS
+                    )
+                if stalled:
+                    # Mark the session ended before cancelling: a synchronous
+                    # goal_reached(False) must not replace the stall reason.
+                    self._finish_session("final_goal_stalled")
+                    try:
+                        self._planner_spec.cancel_goal()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Planner cancel failed after final stall: %s", exc)
 
     def _write_nav_status(self) -> None:
         with self._state_lock:

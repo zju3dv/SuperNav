@@ -9,14 +9,15 @@ Run these commands from `SuperNav/robots/go2/`. The Go2 deployment uses its own 
 | Path | Purpose |
 | --- | --- |
 | `dimos/` | Public DimOS submodule |
-| `supernav/overlay/` | Added PixelGoal, operator, surround-camera, and GoPro bridge source |
+| `supernav/overlay/` | Audited SuperNav-1.5 source files, release adaptations, PixelGoal, operator, spatial memory, SLAM, cameras, and GoPro bridge |
 | `supernav/patches/` | Changes to existing upstream files |
-| `supernav/manifest.json` | Upstream version, file list, patch order, and SHA256 hashes |
+| `supernav/manifest.json` | Upstream version, approved implementation lineage, file list, audited replacements, patch order, and SHA256 hashes |
+| `supernav/audit_snapshot.py` | Independent source/asset and behavioral comparison with the approved implementation snapshot |
 | `deploy/` | Installers, launchers, configuration templates, dependency locks, and system configuration |
 | `runtime/dimos/` | Assembled runtime source |
 | `.venv/` | Deployment environment with an editable runtime installation |
 
-Maintain new files in `overlay/` and changes to existing upstream files in the corresponding patch. The assembly tool generates `runtime/dimos/`.
+Maintain new files in `overlay/` and ordinary upstream edits in the corresponding patch. A source-fidelity replacement may live in `overlay/` only when `update_manifest.py` lists it in `AUDITED_REPLACEMENTS`; the assembly tool then applies patches first and the audited replacement second. The assembly tool generates `runtime/dimos/`.
 
 ## Assemble the source
 
@@ -27,7 +28,7 @@ python3 -m supernav.prepare
 python3 -m supernav.prepare --check
 ```
 
-The assembly tool checks the submodule version, working tree, and input hashes. It exports the upstream source, applies patches and overlays, and generates the blueprint registry in `runtime/dimos/`. The upstream checkout stays unchanged. Overlay paths must be new files; edit existing paths through patches.
+The assembly tool checks the submodule version, working tree, and input hashes. It exports the upstream source, applies patches, applies new overlays and explicitly audited replacements, and generates the blueprint registry in `runtime/dimos/`. The upstream checkout stays unchanged.
 
 Running `prepare` again checks the existing output. After changing inputs, use `--rebuild`. Assembly and launch share a lock, so stop the stack before rebuilding.
 
@@ -58,14 +59,11 @@ Use `git apply --stat supernav/patches/*.patch` to inspect changes by layer:
 | `06-dependencies.patch` | Unitree WebRTC and runtime dependencies |
 | `07-skill-assets.patch` | Markdown resources in wheels and source distributions |
 
-## Change navigation rules
+## Change prompts and navigation rules
 
-Maintain navigation rules in `supernav/overlay/dimos/agents/skills/`:
+The Go2 prompt is assembled by `dimos/agents/mcp/external_harness_codex.py`. Its spatial-memory, 2D SLAM, and route-fusion skills load their canonical text and references from the assembled runtime's top-level `skills/` directory. Those assets are shipped verbatim in `supernav/overlay/skills/`; omitting them silently selects different embedded fallback text. PixelGoal and global-navigation skills use the module's embedded text. A PixelGoal task writes all five run-local skill snapshots and their references.
 
-- [go2-pixelgoal/SKILL.md](../../../robots/go2/supernav/overlay/dimos/agents/skills/go2-pixelgoal/SKILL.md): selecting points from four camera views, executing a hop, and handling its result.
-- [global-navigation-pixelgoal/SKILL.md](../../../robots/go2/supernav/overlay/dimos/agents/skills/global-navigation-pixelgoal/SKILL.md): target search, route selection, and completion. Its `references/` directory covers entrances, exploration and return, recovery, and stopping.
-
-The PixelGoal skill defines point-selection rules. After editing Markdown, update the manifest, rebuild, and reinstall as above. `mcp/skill_assets.py` copies the skills and references into each task's `workspace/.agents/skills/` directory for that task.
+Keep the canonical files and their loader together. Do not replace the snapshot's reference-reading or memory-node creation rules with rewritten release instructions. The supported deployment is the documented editable runtime installation. After any change, update the manifest, rebuild, reinstall, and compare generated prompts and skills with the approved snapshot using the [fidelity audit](go2-testing.md#compare-with-the-approved-snapshot). Input hashes detect packaging changes; they do not prove source fidelity on their own.
 
 ## Update dependencies and upstream
 

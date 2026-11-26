@@ -36,12 +36,6 @@ from dimos.robot.unitree.pixelgoal.pixel_goal_map_module import PixelGoalMapNavM
 from dimos.robot.unitree.unitree_skill_container import UnitreeSkillContainer
 from dimos.visualization.vis_module import vis_module
 
-
-
-
-
-
-
 def _pixel_target_marker(point: Any) -> Any:
     import rerun as rr
 
@@ -98,7 +92,7 @@ unitree_go2_pixelgoal = (
     autoconnect(
         unitree_go2,
         GO2Connection.blueprint(enable_video=False),
-        VoxelGridMapper.blueprint(emit_every=1, load_on_start="none", save_on_stop=False),
+        VoxelGridMapper.blueprint(emit_every=1),
         vis_module(global_config.viewer, rerun_config=_pixel_goal_rerun_config),
         McpServer.blueprint(),
         UnitreeSkillContainer.blueprint(),

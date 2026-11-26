@@ -26,7 +26,7 @@ from dimos.agents.harness.go2_harness_profiles import (
     resolve_go2_profile_axes,
 )
 
-ConsolePromptMode = Literal["default"]
+ConsolePromptMode = Literal["default", "long_instruction"]
 
 
 class StartupPolicy(str, Enum):
@@ -43,6 +43,7 @@ class AgentMode(str, Enum):
     READONLY = "readonly"
     AUTHORITY_PROXY = "authority-proxy"
     ADMIN_OVERRIDE_DEBUG = "admin-override-debug"
+    AGENT_LONG_INST = "agent-long-inst"
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,7 @@ class ConsoleConfig:
     model: str = "gpt-5.4"
     reasoning: str = "medium"
     run_root: Path | None = None
+    prior_run_root: Path | None = None
     viewer: str = "none"
     authority_tools: tuple[str, ...] = ()
 
@@ -69,13 +71,16 @@ class ConsoleConfig:
         if self.mcp_ready_timeout_s < 0:
             raise ValueError("mcp_ready_timeout_s must be non-negative")
         axes = resolve_go2_profile_axes(self.stack, self.control)
+        if self.mode is AgentMode.AGENT_LONG_INST and axes.tool_scope == "readonly":
+            raise ValueError("agent-long-inst requires movement-capable control, not inspect")
         object.__setattr__(self, "stack", axes.stack)
         object.__setattr__(self, "control", axes.control)
-        object.__setattr__(
-            self,
-            "authority_tools",
-            tuple(dict.fromkeys(tool.strip() for tool in self.authority_tools if tool.strip())),
+        authority_tools = tuple(
+            dict.fromkeys(tool.strip() for tool in self.authority_tools if tool.strip())
         )
+        if self.mode is AgentMode.AGENT_LONG_INST and not authority_tools:
+            authority_tools = (*axes.allowed_movement_tools, "go2_navigate_to_memory_node")
+        object.__setattr__(self, "authority_tools", authority_tools)
 
     @property
     def resolved_axes(self) -> Go2ProfileAxes:
@@ -116,10 +121,14 @@ class ConsoleConfig:
         """Return the existing Codex harness permission mode used under the UI mode."""
 
         resolved = self.resolved_agent_mode
+        if resolved is AgentMode.AGENT_LONG_INST:
+            return AgentMode.AUTHORITY_PROXY
         return resolved
 
     @property
     def prompt_mode(self) -> ConsolePromptMode:
         """Return the prompt policy variant for the prepared Codex run."""
 
+        if self.resolved_agent_mode is AgentMode.AGENT_LONG_INST:
+            return "long_instruction"
         return "default"

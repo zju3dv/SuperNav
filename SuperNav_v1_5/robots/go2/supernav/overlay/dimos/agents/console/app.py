@@ -116,6 +116,7 @@ class OperateApp(App[None]):
     BINDINGS = [
         Binding("f1", "manual_mode", "Manual"),
         Binding("f2", "agent_mode", "Agent"),
+        Binding("f4", "awm_mode", "AWM"),
         Binding("f7", "pixel_goal_mode", "Pixel Goal"),
         Binding("f3", "toggle_operator_help", "Help"),
         Binding("ctrl+c", "quit", "Quit", show=False, priority=True),
@@ -130,7 +131,6 @@ class OperateApp(App[None]):
     def __init__(self, config: ConsoleConfig) -> None:
         super().__init__()
         self._showing_operator_help = False
-        self._telemetry_poll_running = False
         self.manual_command_running = False
         self.pixel_goal_command_running = False
         self._manual_command_text = ""
@@ -199,8 +199,6 @@ class OperateApp(App[None]):
         self._refresh()
         self.command_input.focus()
         self.set_interval(0.5, self._poll_agent)
-        self.set_interval(2.0, self._poll_robot_status)
-        self._poll_robot_status()
 
     def on_resize(self, event: events.Resize) -> None:
         self._sync_layout(event.size.width)
@@ -234,6 +232,12 @@ class OperateApp(App[None]):
         self.controller.select_agent_mode()
         self._refresh()
 
+    def action_awm_mode(self) -> None:
+        if self.manual_command_running:
+            return
+        self._showing_operator_help = False
+        self.controller.select_awm_mode()
+        self._refresh()
 
     def action_pixel_goal_mode(self) -> None:
         if self.manual_command_running or self.pixel_goal_command_running:
@@ -307,6 +311,8 @@ class OperateApp(App[None]):
                 self.body.update("Agent task already running; wait for completion or press ESC.")
                 return
             await asyncio.to_thread(self.controller.submit_agent_task, command)
+        elif self.controller.state.ui_mode is UiMode.AWM:
+            await asyncio.to_thread(self.controller.submit_awm_command, command)
         elif self.controller.state.ui_mode is UiMode.PIXEL_GOAL:
             if command == "stop":
                 await asyncio.to_thread(self.controller.submit_pixel_goal_command, command)
@@ -358,19 +364,6 @@ class OperateApp(App[None]):
         self.controller.poll_agent_task()
         self._refresh()
 
-    def _poll_robot_status(self) -> None:
-        if not self._telemetry_poll_running:
-            self._telemetry_poll_running = True
-            self._read_robot_status()
-
-    @work(group="robot-status")
-    async def _read_robot_status(self) -> None:
-        try:
-            await asyncio.to_thread(self.controller.refresh_robot_status)
-            self._refresh()
-        finally:
-            self._telemetry_poll_running = False
-
     def _refresh(self) -> None:
         state = self.controller.state
         classes = [f"mcp-{state.mcp_state.value.lower()}"]
@@ -418,6 +411,9 @@ class OperateApp(App[None]):
                 else "agent task> find the door and return"
             )
             self.body.update(format_agent_panel(state))
+        elif state.ui_mode is UiMode.AWM:
+            self.command_input.placeholder = "AWM goal> describe a target"
+            self.body.update("AWM mode\n  Type a natural-language navigation goal and press Enter.")
         elif state.ui_mode is UiMode.PIXEL_GOAL:
             self.command_input.placeholder = (
                 "Pixel Goal command in progress - ESC stops motion"

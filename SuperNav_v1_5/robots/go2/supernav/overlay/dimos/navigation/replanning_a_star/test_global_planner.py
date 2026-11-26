@@ -14,12 +14,15 @@
 
 import math
 
+import numpy as np
 import pytest
 
 from dimos.core.global_config import GlobalConfig
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Quaternion import Quaternion
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
+from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
+from dimos.navigation.replanning_a_star import global_planner as global_planner_module
 from dimos.navigation.replanning_a_star.global_planner import GlobalPlanner
 
 
@@ -103,6 +106,24 @@ def test_missing_odom_records_failure_and_clears_goal() -> None:
 
     assert planner.get_last_failure() == "NO_ODOM"
     assert planner._current_goal is None
+
+
+def test_safe_goal_rejects_costs_at_or_above_50(monkeypatch) -> None:
+    planner = GlobalPlanner(GlobalConfig())
+    planner._navigation_map.update(
+        OccupancyGrid(np.zeros((10, 10), dtype=np.int8), resolution=1.0)
+    )
+    goal = Vector3(1.0, 1.0, 0.0)
+    captured: dict[str, object] = {}
+
+    def fake_find_safe_goal(*args: object, **kwargs: object) -> Vector3:
+        captured.update(kwargs)
+        return goal
+
+    monkeypatch.setattr(global_planner_module, "find_safe_goal", fake_find_safe_goal)
+
+    assert planner._find_safe_goal(goal) == goal
+    assert captured["cost_threshold"] == 50
 
 
 def test_record_motion_and_robot_status_store_latest_payloads() -> None:

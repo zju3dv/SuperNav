@@ -66,6 +66,21 @@ class PreparationTests(unittest.TestCase):
             prepare(self.root)
         self.assertFalse((self.root / "runtime/dimos").exists())
 
+    def test_audited_overlay_can_replace_an_upstream_file(self):
+        replacement = self.root / "supernav/overlay/value.txt"
+        replacement.write_text("source-faithful replacement\n")
+        self.manifest["overlay"].append(
+            {
+                "path": "value.txt",
+                "sha256": hashlib.sha256(replacement.read_bytes()).hexdigest(),
+                "executable": False,
+                "replace": True,
+            }
+        )
+        self.write_manifest()
+        runtime = prepare(self.root)
+        self.assertEqual((runtime / "value.txt").read_text(), "source-faithful replacement\n")
+
     def test_archive_ignores_local_lfs_smudge_filters(self):
         repo = self.root / "dimos"
         git = ["git", "-C", str(repo)]

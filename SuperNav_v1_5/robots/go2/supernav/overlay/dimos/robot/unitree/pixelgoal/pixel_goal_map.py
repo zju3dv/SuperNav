@@ -15,7 +15,9 @@
 """LiDAR-map pixel-goal geometry: ray back-projection, surface heuristics, A* goals.
 
 Pure functions and frozen data — no streams, no RPC, no threads — so the whole
-geometry stack can be tested without a robot. The Go2 PixelGoal stack uses:
+geometry stack is unit-tested without a robot. Ported from
+``feat/go2-visible-target-nav-stable:dimos/navigation/pixel_goal.py`` and adapted
+to the NoMaD edge stack:
 
 * the four surround cameras are modeled as pinhole with calibrated intrinsics
   or a fallback HFOV, plus per-direction mount extrinsics (yaw/height/pitch);
@@ -25,7 +27,7 @@ geometry stack can be tested without a robot. The Go2 PixelGoal stack uses:
   frame ``camera_optical``) is kept verbatim as the ``fisheye`` camera model;
 * everything else (ROI escalation, nearest-quartile front-surface heuristic,
   floor estimation, front-edge contact goal, costmap-directed exploration
-  waypoints) uses the same projection and exploration rules.
+  waypoints) is the -stable algorithm unchanged.
 """
 
 from __future__ import annotations
@@ -62,7 +64,7 @@ EXPLORATION_UNKNOWN_EXTENSION_M = 0.5
 EXPLORATION_FAILED_GOAL_CLEARANCE_M = 0.75
 MAX_CONSECUTIVE_EXPLORATION_FAILURES = 8
 PROJECTION_SEARCH_RADII_PX = (4, 8, 12, 16)
-# Focal length of the 1280x720 rectified Go2 camera. Its
+# Focal length of the stable branch's 1280x720 rectified Go2 camera. Its
 # pixel radii are scaled by fx so USB cameras retain the same angular ROI.
 PROJECTION_REFERENCE_FOCAL_PX = 548.4
 SURFACE_DEPTH_HYSTERESIS_M = 0.15
@@ -75,7 +77,8 @@ DEFAULT_USB_HEIGHT = 1200
 DEFAULT_MOUNT_HEIGHT_M = 0.60
 DEFAULT_BASE_HEIGHT_M = 0.30
 DEFAULT_MOUNT_PITCH_DEG = 0.0
-# Ideal 90°-apart USB mount headings (positive = CCW/left).
+# Ideal 90°-apart USB mount headings (positive = CCW/left, same convention as
+# nav_module._DIRECTION_YAW_DEG).
 DEFAULT_MOUNT_YAW_DEG = {"front": 0.0, "right": -90.0, "back": 180.0, "left": 90.0}
 
 BASE_FRAME = "base_link"
@@ -476,22 +479,6 @@ def projection_diagnostics(
     }
 
 
-def segment_crosses_obstacle(
-    costmap: OccupancyGrid, start: np.ndarray, end: np.ndarray
-) -> bool:
-    """Check a segment against known obstacles on an already inflated map."""
-    distance = float(np.linalg.norm(end[:2] - start[:2]))
-    samples = max(2, math.ceil(distance / (costmap.resolution / 2)) + 1)
-    for fraction in np.linspace(0.0, 1.0, samples):
-        xy = start[:2] + (end[:2] - start[:2]) * fraction
-        cell = costmap.world_to_grid(Vector3(float(xy[0]), float(xy[1]), 0.0))
-        x, y = math.floor(cell.x), math.floor(cell.y)
-        if 0 <= x < costmap.width and 0 <= y < costmap.height:
-            if costmap.grid[y, x] >= 50:
-                return True
-    return False
-
-
 def directed_waypoint(
     costmap: OccupancyGrid,
     origin: np.ndarray,
@@ -538,15 +525,7 @@ def directed_waypoint(
         delta = np.array([point.x - origin[0], point.y - origin[1]], dtype=np.float64)
         forward = float(delta @ horizontal)
         lateral = abs(float(delta[0] * horizontal[1] - delta[1] * horizontal[0]))
-        if not (
-            min_forward <= forward <= max_step_m
-            and lateral <= EXPLORATION_RAY_LATERAL_M + 1e-9
-            and np.linalg.norm(delta) <= max_step_m + 1e-9
-        ):
-            return
-        # A free detour found by the flood fill must not turn a click beyond a
-        # known wall into a sideways exploration route.
-        if segment_crosses_obstacle(planning_map, origin, np.array([point.x, point.y, 0.0])):
+        if not (min_forward <= forward <= max_step_m and lateral <= EXPLORATION_RAY_LATERAL_M):
             return
         if any(
             np.linalg.norm(np.array([point.x, point.y]) - np.asarray(candidate)[:2])
@@ -625,7 +604,7 @@ def directed_waypoint(
 
 # ---------------------------------------------------------------------- config
 DEFAULT_MAP_TIMEOUT_S = 4.0
-DEFAULT_DEADLINE_S = 60.0
+DEFAULT_DEADLINE_S = 180.0
 DEFAULT_RADIUS_PX = 8
 
 
@@ -642,14 +621,6 @@ class PixelGoalMapConfig:
     max_exploration_distance_m: float = MAX_EXPLORATION_DISTANCE_M
     map_timeout_s: float = DEFAULT_MAP_TIMEOUT_S
     deadline_s: float = DEFAULT_DEADLINE_S
-    no_progress_timeout_s: float = 15.0
-    progress_epsilon_m: float = 0.1
-
-    def __post_init__(self) -> None:
-        for name in ("no_progress_timeout_s", "progress_epsilon_m"):
-            value = getattr(self, name)
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"{name} must be finite and positive")
 
     @classmethod
     def from_env(cls) -> PixelGoalMapConfig:
@@ -670,8 +641,6 @@ class PixelGoalMapConfig:
             ),
             map_timeout_s=_env_float(f"{prefix}MAP_TIMEOUT_S", DEFAULT_MAP_TIMEOUT_S),
             deadline_s=_env_float(f"{prefix}DEADLINE_S", DEFAULT_DEADLINE_S),
-            no_progress_timeout_s=_env_float(f"{prefix}NO_PROGRESS_TIMEOUT_S", 15.0),
-            progress_epsilon_m=_env_float(f"{prefix}PROGRESS_EPSILON_M", 0.1),
         )
 
 

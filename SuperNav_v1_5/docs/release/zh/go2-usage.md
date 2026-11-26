@@ -22,7 +22,7 @@ source .venv/bin/activate
 
 启动器等待四路 GoPro bridge 就绪，再启动 `unitree-go2-pixelgoal`，固定使用 `mapping` 和 `local-planner`。GoPro 视频经 ffmpeg 写入 `/dev/video42–45`，MCP 使用端口 9990。
 
-默认关闭 Rerun。每次启动从空地图开始，PixelGoal 使用本次运行的实时地图执行导航。
+默认关闭 Rerun。默认设置下不传 `--prior-run-root` 时，每次启动从空地图开始；正常停止时保留快照默认启用的 voxel-map 保存行为。运行期间，SuperNav-1.5 会对占据地图进行区域分割，把带标注的地图附加到导航工具结果，并根据直接观测维护记忆节点。
 
 ## 启动操作端
 
@@ -35,7 +35,29 @@ source .venv/bin/activate
 ./deploy/bin/operate.sh
 ```
 
-操作端使用部署目录的 `.venv`，连接 `http://127.0.0.1:9990/mcp`。每个任务加载 DimOS MCP 和两份导航 skill：[PixelGoal 选点](../../../robots/go2/supernav/overlay/dimos/agents/skills/go2-pixelgoal/SKILL.md)负责单段选点，[全局导航](../../../robots/go2/supernav/overlay/dimos/agents/skills/global-navigation-pixelgoal/SKILL.md)负责搜索和路线选择。
+操作端使用部署目录的 `.venv`，连接 `http://127.0.0.1:9990/mcp`。每个任务会在工作区写入与实际源码一致的运行时 skill：PixelGoal 选点、全局导航、空间记忆层级、2D SLAM 解读，以及记忆与 SLAM 路线融合。任务审计会记录 prompt 与 skill 快照。
+
+SuperNav-1.5 的空间记忆独占本次运行的空间状态；原 SuperNav 的有界空间事实账本不会同时启用。
+
+## 第二次会话复用记忆
+
+正常关闭时，操作端会完成当前 SLAM 重定位 bundle。复用已完成的运行时，机器人栈和操作端必须传入同一个历史任务目录：
+
+```bash
+./deploy/bin/start-go2-pixel-goal.sh --prior-run-root /absolute/path/to/prior-run
+```
+
+在操作端终端运行：
+
+```bash
+./deploy/bin/operate.sh --prior-run-root /absolute/path/to/prior-run
+```
+
+历史运行必须包含 `logs/go2-graph-memory.json` 与 `slam/relocalization/manifest.json`。机器人栈加载已保存地图并启用重定位；操作端加载历史记忆节点，并可在视觉证据充分时把可信节点作为重定位先验。历史运行不完整时会明确报错，不会静默启动残缺的记忆会话。
+
+## 可选区域描述服务
+
+在 `deploy/config/robot.env` 中把 `GO2_SLAM_AREA_CAPTION_URL` 设置为兼容的 `/caption` 服务。关键帧异步入队，服务不可用或失败不会阻塞导航。留空即可关闭描述服务。
 
 ### 模型服务代理
 
@@ -66,7 +88,7 @@ ssh -N -L 9990:127.0.0.1:9990 user@jetson-host
 | --- | --- |
 | F2 | 进入 Agent 模式，输入导航任务 |
 | F7 | Pixel Goal 面板：`refresh`、`reset`、`stop`；图像显示和点击依赖 Rerun |
-| ESC / F8 | 请求停止运动，确认停止后按 Enter 继续 |
+| ESC / F8 | 仅操作者可用的停止操作；确认停止后按 Enter 继续 |
 
 Agent 从四向图像选择归一化目标点，每段导航完成后根据新图像继续。优先选择可通行地面；稳定不透明立面按 PixelGoal skill 的条件选择。
 
@@ -84,15 +106,33 @@ Agent 从四向图像选择归一化目标点，每段导航完成后根据新�
 | --- | --- |
 | `pixelgoal_navigate` | 提交归一化图像点 `[x, y]`（0–1）与 `direction`（front/right/back/left） |
 | `pixelgoal_status` | 查询导航状态和结果 |
-| `pixelgoal_stop` | 取消当前导航 |
+| `pixelgoal_stop` | 仅操作者可用，取消当前导航 |
 
-导航需要有效地图、位姿和新鲜图像。需要对应点击时刻的图像时，传入接口支持的冻结帧数据。每段结束后读取终态及返回的四向图像，再决定下一步。
+导航需要有效地图、位姿和新鲜图像。Agent-facing `pixelgoal_navigate` 只接受 `point` 与 `direction`，等待执行结束后返回终态，正常操作不轮询 status。冻结帧参数属于上游 operator 接口，不属于 agent schema。每段结束后读取终态及新鲜图像，再决定下一步。
 
 地图尚未覆盖目标时，每段探索最多 1.5 米，方向贴近点击方向。从可达已知自由区向未知区最多延伸 0.5 米；下一段进入未知区需要前次边界附近新增自由空间证据。
 
 已知障碍挡住目标接近线或停靠点时返回 `blocked_pixel_target`。默认 15 秒内净接近未累计达到 0.1 米时停止并返回 `no_progress`。遇到这些结果后，依据新图像重新选点。
 
 `final_distance_m` 是会话结束时机器人中心到最终停靠点的 XY 平面距离，单位米。结果在结束时冻结；尚未形成有效停靠点或缺少有效位姿时为 `null`。
+
+### 地图附件、记忆目标与工具可见性
+
+地图附件遵循实现快照，并受地图/位姿可用性限制；返回失败 metadata 不代表一定附图。
+
+| 工具/结果 | 地图图像 | 其他图像 |
+| --- | --- | --- |
+| Agent `pixelgoal_navigate` 终态 | 一张完整区域分割占据图，由代理叠加记忆标注 | 新鲜的前/右/后/左视图 |
+| `pixelgoal_status(include_images=true)` | 导航终态地图；运行中不附图。健康的终态图像通常每目标只返回一次，caption pending 时可刷新 | 新鲜四向视图 |
+| `go2_navigate_to_memory_node` | 一张 canonical 分割图；导航失败但地图/位姿有效时仍可返回 | 可用的最新相机图；代理还会请求新鲜四向视图 |
+| 普通运动（`drive`、`relative_move`、`rotate_in_place`） | 清理后的 floor plan、区域分割图和机器人中心占据图 | 可用的最新相机图 |
+| `go2_query_route_context` / `go2_report_graph_position` | 可用的最新缓存标注图；route query 先刷新地图 | 按请求返回存储节点全景；position report 包含全景 |
+| `go2_inspect_graph_node` | 不附 SLAM 图 | 按请求返回存储节点全景 |
+| Map-context/status 读取、graph 写入、普通观测 | 不额外附 SLAM 图 | 对应工具的观测 |
+
+Route query 的 `return_images=false` 只关闭存储全景，不关闭 SLAM 图。仅 operator 可用的 `go2_slam_map_snapshot` 和 `go2_report_relocalization_prior` 也可返回完整分割图；代理对 agent 隐藏这两个工具、地图重置、`pixelgoal_stop` 和 `stop_movement`。运动工具可见性受 operator 批准的当前 envelope 限制。
+
+持久记忆节点的数字 badge 固定在实测 SLAM 位姿，不为避让标签而移动；同一原生 grid 区域已有持久节点时，抑制临时 `A<N>` 标签。原生 grid 行只在显示时翻转。记忆节点导航解析存储节点或当前临时区域目标，要求地图/位姿当前有效且坐标系一致，调用原生规划器，不回退到模拟器 NavMesh。超时和规划拒绝会明确返回，不视为到达成功。
 
 ## 可选 Rerun
 
@@ -116,6 +156,8 @@ SUPERNAV_RERUN_CORS_ORIGIN=http://127.0.0.1:9878
 | `runtime/gopro-bridge/` | 相机桥状态 |
 | `runtime/state/` | 运行注册表 |
 | `runtime/operator-runs/` | 操作端任务产物 |
+| `runtime/operator-runs/<run>/logs/go2-graph-memory.json` | 空间记忆节点与观测记录 |
+| `runtime/operator-runs/<run>/slam/relocalization/` | 后续会话使用的地图与重定位清单 |
 | `runtime/dimos/logs/` | 使用源码默认路径生成的 DimOS 日志 |
 
 ## 故障定位

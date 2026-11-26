@@ -39,6 +39,17 @@ class UnitreeMotionSpec(Spec, Protocol):
     def stop_movement(self) -> Any: ...
 
 
+class NomadStatusSpec(Spec, Protocol):
+    """Optional legacy-policy status probe used by the source map backend.
+
+    The public SuperNav-1.5 profile does not ship or instantiate that policy;
+    retaining the protocol keeps the map implementation source-compatible
+    without adding the dormant backend to the release.
+    """
+
+    def nomad_status(self, include_images: bool = True) -> str | list[dict[str, Any]]: ...
+
+
 class NavLiveSink:
     """LiveStateWriter + in-memory status/events for the pixelgoal_status skill."""
 

@@ -49,6 +49,7 @@ def render_agent_occupancy_map(
     trace: list[PoseStamped] | tuple[PoseStamped, ...] = (),
     *,
     graph_nodes: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+    slam_area_nodes: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
     output_size_px: int = 768,
     view_size_m: float = 12.0,
 ) -> RenderedAgentOccupancyMap:
@@ -118,6 +119,9 @@ def render_agent_occupancy_map(
         scale_y,
         output_size_px,
     )
+    displayed_slam_areas = _draw_slam_area_badges(
+        draw, occupancy_grid, slam_area_nodes, crop, scale_x, scale_y, output_size_px
+    )
     _draw_facing_arrow(draw, robot_px, pose.yaw, output_size_px)
 
     data = _png_base64(image)
@@ -150,8 +154,41 @@ def render_agent_occupancy_map(
         "trace_points": len(visible_trace),
         "graph_nodes": displayed_graph_nodes,
         "graph_overlay": bool(displayed_graph_nodes),
+        "slam_area_nodes": displayed_slam_areas,
     }
     return RenderedAgentOccupancyMap(image_block=image_block, metadata=metadata)
+
+
+def _draw_slam_area_badges(
+    draw: ImageDraw.ImageDraw,
+    occupancy_grid: OccupancyGrid,
+    nodes: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    crop: tuple[int, int, int, int],
+    scale_x: float,
+    scale_y: float,
+    output_size_px: int,
+) -> list[dict[str, Any]]:
+    displayed: list[dict[str, Any]] = []
+    x0, y0, x1, y1 = crop
+    radius = max(10, output_size_px // 48)
+    for node in nodes:
+        pose = node.get("target_slam_pose") if isinstance(node, dict) else None
+        if not isinstance(pose, dict):
+            continue
+        try:
+            point = occupancy_grid.world_to_grid((float(pose["x"]), float(pose["y"]), 0.0))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (x0 <= point.x < x1 and y0 <= point.y < y1):
+            continue
+        px = (float(point.x) - x0 + 0.5) * scale_x
+        py = (y1 - float(point.y) - 0.5) * scale_y
+        draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=(255, 255, 255), outline=(20, 20, 20), width=max(2, radius // 5))
+        label = str(node.get("label") or node.get("id") or "A?")
+        bbox = draw.textbbox((0, 0), label)
+        draw.text((px - (bbox[2] - bbox[0]) / 2, py - (bbox[3] - bbox[1]) / 2), label, fill=(0, 0, 0))
+        displayed.append({"id": str(node.get("id") or ""), "label": label})
+    return displayed
 
 
 def _crop_bounds(

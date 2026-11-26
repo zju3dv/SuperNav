@@ -55,6 +55,16 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn("Move API: 1008", result.stdout)
         self.assertIn("--viewer rerun --rerun-open none --no-rerun-web", result.stdout)
 
+    def test_prior_run_is_forwarded_to_robot_stack(self):
+        result = self.preview("--prior-run-root", "/tmp/prior-go2-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--prior-run-root /tmp/prior-go2-run", result.stdout)
+
+    def test_prior_run_requires_a_path(self):
+        result = self.preview("--prior-run-root")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires a path", result.stderr)
+
     def test_invalid_arguments_fail_before_launch(self):
         for args in [("bogus",), ("joystick", "1008")]:
             result = self.preview(*args)
@@ -104,20 +114,25 @@ class DeploymentTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.splitlines(), [expected, str(ROOT / "runtime/state")])
 
-    def test_old_map_settings_cannot_enable_persistence(self):
+    def test_snapshot_map_persistence_defaults_and_explicit_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "robot.env"
-            config.write_text("DIMOS_VOXEL_MAP_LOAD_ON_START=latest\nDIMOS_VOXEL_MAP_SAVE_ON_STOP=1\n")
-            result = subprocess.run(
-                ["bash", "-c", 'source "$1"; load_config; printf "%s\\n%s\\n" "$DIMOS_VOXEL_MAP_LOAD_ON_START" "$DIMOS_VOXEL_MAP_SAVE_ON_STOP"',
-                 "test", str(ROOT / "deploy/lib/common.sh")],
-                env={**os.environ, "SUPERNAV_CONFIG": str(config),
-                     "SUPERNAV_SECRETS": str(Path(tmp) / "absent"),
-                     "DIMOS_VOXEL_MAP_LOAD_ON_START": "path", "DIMOS_VOXEL_MAP_SAVE_ON_STOP": "1"},
-                text=True, capture_output=True, timeout=20,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.splitlines(), ["none", "0"])
+            for settings, expected in [
+                ("", ["none", "1"]),
+                ("DIMOS_VOXEL_MAP_LOAD_ON_START=path\nDIMOS_VOXEL_MAP_SAVE_ON_STOP=0\n", ["path", "0"]),
+            ]:
+                config.write_text(settings)
+                env = {**os.environ, "SUPERNAV_CONFIG": str(config),
+                       "SUPERNAV_SECRETS": str(Path(tmp) / "absent")}
+                for name in ("DIMOS_VOXEL_MAP_LOAD_ON_START", "DIMOS_VOXEL_MAP_SAVE_ON_STOP"):
+                    env.pop(name, None)
+                result = subprocess.run(
+                    ["bash", "-c", 'source "$1"; load_config; printf "%s\\n%s\\n" "$DIMOS_VOXEL_MAP_LOAD_ON_START" "$DIMOS_VOXEL_MAP_SAVE_ON_STOP"',
+                     "test", str(ROOT / "deploy/lib/common.sh")],
+                    env=env, text=True, capture_output=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), expected)
 
     def test_release_interpreter_overrides_old_shell_and_config(self):
         with tempfile.TemporaryDirectory() as tmp:

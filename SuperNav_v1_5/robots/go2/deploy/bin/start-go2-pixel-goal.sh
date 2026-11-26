@@ -4,12 +4,20 @@ set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/../lib/common.sh"
 dry_run=0
 move_api=""
-for arg in "$@"; do
-  case "$arg" in
-    --dry-run) dry_run=1;;
-    --help|-h) echo 'Usage: start-go2-pixel-goal.sh [joystick|1008] [--dry-run]'; exit 0;;
-    joystick|1008) [[ -z "$move_api" ]] || die 'specify only one move API'; move_api="$arg";;
-    *) die "unknown argument: $arg";;
+prior_run_root=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) dry_run=1; shift;;
+    --prior-run-root)
+      [[ $# -ge 2 && -n "$2" ]] || die '--prior-run-root requires a path'
+      prior_run_root="$2"; shift 2;;
+    --help|-h)
+      echo 'Usage: start-go2-pixel-goal.sh [joystick|1008] [--prior-run-root PATH] [--dry-run]'
+      exit 0;;
+    joystick|1008)
+      [[ -z "$move_api" ]] || die 'specify only one move API'
+      move_api="$1"; shift;;
+    *) die "unknown argument: $1";;
   esac
 done
 verify_source
@@ -23,6 +31,9 @@ command_args=("$DIMOS_PYTHON" -m dimos.robot.cli.dimos
   --robot-ip "${UNITREE_GO2_IP:-CHANGE_ME}" "${viewer_args[@]}"
   --mcp-port 9990 --no-go2-auto-stand
   run unitree-go2-pixelgoal --stack mapping --control local-planner)
+if [[ -n "$prior_run_root" ]]; then
+  command_args+=(--prior-run-root "$prior_run_root")
+fi
 if [[ "$dry_run" == 1 ]]; then
   printf 'Runtime: %s\nMove API: %s\nRerun: %s\nPolicy: disabled\n' \
     "$DIMOS_REPO" "$DIMOS_GO2_MOVE_API" "$SUPERNAV_RERUN"

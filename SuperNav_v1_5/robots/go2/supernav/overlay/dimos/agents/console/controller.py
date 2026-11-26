@@ -50,7 +50,6 @@ class ConsoleController:
         startup_service: StartupService | None = None,
         manual_service_factory: ManualServiceFactory = ManualCommandService,
         mcp_client_factory: Callable[[str | None], ConsoleMcpClient] = ConsoleMcpClient.from_url,
-        telemetry_client_factory: Callable[[str | None], ConsoleMcpClient] | None = None,
         agent_runner_factory: AgentRunnerFactory | None = None,
         emergency_stop_factory: EmergencyStopFactory = EmergencyStopService,
     ) -> None:
@@ -58,10 +57,6 @@ class ConsoleController:
         self.startup_service = startup_service or StartupService()
         self._manual_service_factory = manual_service_factory
         self._mcp_client_factory = mcp_client_factory
-        self._telemetry_client_factory = telemetry_client_factory or (
-            lambda url: ConsoleMcpClient.from_url(url, timeout=2)
-        )
-        self._telemetry_client: ConsoleMcpClient | None = None
         self._agent_runner_factory = agent_runner_factory or _default_agent_runner_factory
         self._emergency_stop_factory = emergency_stop_factory
         self._state_lock = threading.RLock()
@@ -87,8 +82,6 @@ class ConsoleController:
             startup_messages=result.messages,
             last_error=result.error,
             robot_connection="mcp-ready" if result.ready else "unknown",
-            battery_percent=None,
-            robot_status_error=None,
             pending_start_confirmation=result.pending_confirmation,
             launch_attempted=result.launch_attempted,
             launch_pid=result.launch_pid,
@@ -102,7 +95,6 @@ class ConsoleController:
         self._agent_handle = None
         self._emergency_stop_service = None
         self._mcp_client = None
-        self._telemetry_client = None
         if result.ready:
             mcp_client = self._mcp_client_factory(result.mcp_url)
             self._mcp_client = mcp_client
@@ -116,30 +108,6 @@ class ConsoleController:
                 result.run_log_dir,
             )
             self._emergency_stop_service = self._emergency_stop_factory(mcp_client)
-            if "go2_robot_status" in self.state.tool_names:
-                self._telemetry_client = self._telemetry_client_factory(result.mcp_url)
-        return self.state
-
-    def refresh_robot_status(self) -> ConsoleState:
-        """Update telemetry without changing the current task or stop state."""
-        client = self._telemetry_client
-        if client is None:
-            return self.state
-        snapshot = client.robot_status_snapshot()
-        with self._state_lock:
-            # Discard an old response if F5 established a different connection.
-            if client is not self._telemetry_client:
-                return self.state
-            previous = self.state.robot_connection
-            connection = "status-ok" if snapshot.available else (
-                "stale" if previous in {"status-ok", "stale"} else "unavailable"
-            )
-            self.state = replace(
-                self.state,
-                robot_connection=connection,
-                battery_percent=snapshot.battery_percent if snapshot.available else None,
-                robot_status_error=snapshot.error,
-            )
         return self.state
 
     def confirm_start(self) -> ConsoleState:
@@ -249,6 +217,8 @@ class ConsoleController:
             pixel_goal_stop_result, pixel_goal_stop_error = self._call_pixel_goal_tool(
                 "pixelgoal_stop"
             )
+        else:
+            self._stop_awm()  # stop AWM emitting waypoints before the movement stop
         if self._emergency_stop_service is None:
             result = EmergencyStopResult(
                 dispatcher_attempted=False,
@@ -296,6 +266,8 @@ class ConsoleController:
                 last_error="acknowledge emergency stop with Enter before resuming",
             )
             return self.state
+        if self.state.ui_mode is UiMode.AWM:
+            self._stop_awm()
         self.state = replace(self.state, ui_mode=UiMode.MANUAL, last_error=None)
         return self.state
 
@@ -308,9 +280,22 @@ class ConsoleController:
                 last_error="acknowledge emergency stop with Enter before resuming",
             )
             return self.state
+        if self.state.ui_mode is UiMode.AWM:
+            self._stop_awm()
         self.state = replace(self.state, ui_mode=UiMode.AGENT, last_error=None)
         return self.state
 
+    def select_awm_mode(self) -> ConsoleState:
+        """Switch to AWM mode (the AWM world-action policy drives via waypoints)."""
+
+        if self._stop_requires_acknowledgement():
+            self.state = replace(
+                self.state,
+                last_error="acknowledge emergency stop with Enter before resuming",
+            )
+            return self.state
+        self.state = replace(self.state, ui_mode=UiMode.AWM, last_error=None)
+        return self.state
 
     def select_pixel_goal_mode(self) -> ConsoleState:
         """Switch to the four-way Pixel Goal operator mode."""
@@ -321,9 +306,28 @@ class ConsoleController:
                 last_error="acknowledge emergency stop with Enter before resuming",
             )
             return self.state
+        if self.state.ui_mode is UiMode.AWM:
+            self._stop_awm()
         self.state = replace(self.state, ui_mode=UiMode.PIXEL_GOAL, last_error=None)
         return self.state
 
+    def submit_awm_command(self, text: str) -> ConsoleState:
+        """Send a natural-language goal to the AWM policy via the set_instruction skill."""
+
+        if self._mcp_client is None:
+            self.state = replace(
+                self.state,
+                ui_mode=UiMode.AWM,
+                last_error="AWM requires an MCP-ready console session",
+            )
+            return self.state
+        error: str | None = None
+        try:
+            self._mcp_client.call_tool("set_instruction", {"text": text})
+        except Exception as exc:  # noqa: BLE001 — surface to the operator
+            error = f"AWM set_instruction failed: {exc}"
+        self.state = replace(self.state, ui_mode=UiMode.AWM, last_error=error)
+        return self.state
 
     def submit_pixel_goal_command(self, text: str) -> ConsoleState:
         """Run one four-way Pixel Goal session command."""
@@ -362,6 +366,15 @@ class ConsoleController:
             return f"{tool_name} failed: {exc}", True
         return _mcp_result_text(raw), bool(raw.get("isError"))
 
+    def _stop_awm(self) -> None:
+        """Best-effort: tell the AWM policy to stop emitting waypoints."""
+
+        if self._mcp_client is None:
+            return
+        try:
+            self._mcp_client.call_tool("stop_awm", {})
+        except Exception:  # noqa: BLE001 — AWM may not be in the running stack
+            pass
 
     def _stop_requires_acknowledgement(self) -> bool:
         result = self.state.emergency_stop_result

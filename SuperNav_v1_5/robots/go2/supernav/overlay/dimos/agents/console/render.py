@@ -22,19 +22,12 @@ from dimos.agents.console.log_stream import THINKING_PREFIX
 from dimos.agents.console.state import ConsoleState, McpConnectionState
 
 
-def _robot_status_label(state: ConsoleState) -> str:
-    return {
-        "mcp-ready": "UNVERIFIED", "status-ok": "STATUS OK",
-        "unavailable": "UNAVAILABLE", "stale": "STALE",
-    }.get(state.robot_connection, "UNKNOWN")
-
-
 def format_top_bar(state: ConsoleState) -> str:
     """Return a compact operator status header."""
 
     config = state.config
     battery = "--" if state.battery_percent is None else f"{state.battery_percent}%"
-    robot = _robot_status_label(state)
+    robot = "UNVERIFIED" if state.robot_connection == "mcp-ready" else "UNKNOWN"
     activity = "IDLE"
     if state.active_agent_run is not None:
         activity = f"AGENT {state.active_agent_run.status.value}"
@@ -93,7 +86,8 @@ def format_operator_help(state: ConsoleState) -> str:
             "Operator cheatsheet",
             "  Manual: forward/back <m> | left/right <deg> | strafe <m>",
             "          strafe left/right <m> | rotate <deg> | stop",
-            "  Modes: F1 Manual | F2 Agent | F7 Pixel Goal | F3 Close help",
+            "  Modes: F1 Manual | F2 Agent | F4 AWM | F7 Pixel Goal | F3 Close help",
+            "  AWM: F4 then type a navigation goal (AWM policy drives via waypoints)",
             "  Pixel Goal: F7 auto-refreshes; commands are refresh, reset, stop",
             "  Safety: F8 Exit Agent + stop | ESC Emergency stop | Enter acknowledges result",
             "  Connection: F5 Retry MCP (or confirm a pending start)",
@@ -109,12 +103,12 @@ def format_footer_note(state: ConsoleState, *, showing_help: bool = False) -> st
     if state.ui_mode.value == "STOPPED":
         return "ENTER  Acknowledge stop    ESC  Send stop again    CTRL+Q  Quit"
     if showing_help:
-        return "F3  Close help    F1  Manual    F2  Agent    F7  Pixel Goal    ESC  Emergency stop"
+        return "F3  Close help    F1  Manual    F2  Agent    F4  AWM    F7  Pixel Goal    ESC  Emergency stop"
     run = state.active_agent_run
     if run is not None and run.running:
         return "PGUP/PGDN  Activity    F8  Exit Agent + Stop    ESC  Emergency stop"
-    if state.ui_mode.value in ("AGENT", "MANUAL", "PIXEL_GOAL"):
-        return "F1  Manual    F2  Agent    F7  Pixel Goal    F3  Help    ESC  Emergency stop"
+    if state.ui_mode.value in ("AGENT", "MANUAL", "AWM", "PIXEL_GOAL"):
+        return "F1  Manual    F2  Agent    F4  AWM    F7  Pixel Goal    F3  Help    ESC  Emergency stop"
     return "F5  Retry MCP    F3  Help    CTRL+Q  Quit"
 
 
@@ -158,7 +152,7 @@ def format_manual_pending(state: ConsoleState, command: str) -> str:
 def format_context_panel(state: ConsoleState) -> str:
     """Render stable session, quick-command, and safety context."""
 
-    robot = _robot_status_label(state)
+    robot = "UNVERIFIED" if state.robot_connection == "mcp-ready" else "UNKNOWN"
     battery = "--" if state.battery_percent is None else f"{state.battery_percent}%"
     endpoint = state.mcp_url or state.config.mcp_url or "active run"
     return "\n".join(

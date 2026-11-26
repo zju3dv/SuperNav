@@ -51,7 +51,7 @@ class FloorPlanConfig:
     min_component_area_m2: float = 0.35
     free_space_closing_radius_m: float = 0.25
     max_fill_hole_area_m2: float = 2.5
-    boundary_wall_width_m: float = 0.0
+    boundary_wall_width_m: float = 0.05
     structural_wall_min_length_m: float = 4.0
     structural_wall_width_m: float = 0.05
     simplify_structural_walls: bool = True

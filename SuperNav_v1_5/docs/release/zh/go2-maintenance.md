@@ -9,14 +9,15 @@
 | 路径 | 用途 |
 | --- | --- |
 | `dimos/` | 公开 DimOS submodule |
-| `supernav/overlay/` | PixelGoal、操作端、四向相机和 GoPro bridge 等新增源码 |
+| `supernav/overlay/` | 经审计的 SuperNav-1.5 源码、release 适配、PixelGoal、操作端、空间记忆、SLAM、相机与 GoPro bridge |
 | `supernav/patches/` | 对上游已有文件的补丁 |
-| `supernav/manifest.json` | 上游版本、文件清单、补丁顺序和 SHA256 |
+| `supernav/manifest.json` | 上游版本、批准的实现来源、文件清单、经审计的替换项、补丁顺序和 SHA256 |
+| `supernav/audit_snapshot.py` | 与批准实现快照独立比较源码、skill 资源和行为 |
 | `deploy/` | 安装与启动脚本、配置模板、依赖锁和系统配置 |
 | `runtime/dimos/` | 组装后的运行源码 |
 | `.venv/` | 部署环境，以 editable 方式安装运行源码 |
 
-新增文件维护在 `overlay/`，上游已有文件的修改维护在对应 patch。`runtime/dimos/` 由组装工具生成。
+新增文件维护在 `overlay/`；普通上游修改维护在对应 patch。只有 `update_manifest.py` 的 `AUDITED_REPLACEMENTS` 明确列出的源码保真替换才可覆盖上游路径。组装时先应用 patch，再应用经审计的替换，最终生成 `runtime/dimos/`。
 
 ## 组装源码
 
@@ -27,7 +28,7 @@ python3 -m supernav.prepare
 python3 -m supernav.prepare --check
 ```
 
-组装工具检查 submodule 版本、工作区状态及输入哈希，导出上游源码，依次应用补丁和 overlay，再生成 blueprint 注册表。结果写入 `runtime/dimos/`，上游 submodule 保持原样。overlay 的路径应为新增文件；已有路径通过 patch 修改。
+组装工具检查 submodule 版本、工作区状态及输入哈希，导出上游源码，依次应用补丁、新增 overlay 和显式审计的替换，再生成 blueprint 注册表。结果写入 `runtime/dimos/`，上游 submodule 保持原样。
 
 重复执行 `prepare` 会检查已有输出。修改输入后使用 `--rebuild` 重建；构建与启动共用锁，重建前需停止栈。
 
@@ -58,14 +59,11 @@ uv pip install --python .venv/bin/python --reinstall-package dimos \
 | `06-dependencies.patch` | Unitree WebRTC 和运行依赖 |
 | `07-skill-assets.patch` | wheel 和 sdist 的 Markdown 资源 |
 
-## 修改导航规则
+## 修改 prompt 与导航规则
 
-导航规则维护在 `supernav/overlay/dimos/agents/skills/`：
+Go2 prompt 由 `dimos/agents/mcp/external_harness_codex.py` 组装。空间记忆、2D SLAM 和路线融合的 canonical skill 文本及引用文件，从运行源码顶层的 `skills/` 加载。`supernav/overlay/skills/` 原样提供这些资源；遗漏它们会静默启用不同的内嵌 fallback 文本。PixelGoal 和全局导航 skill 使用模块内嵌文本。PixelGoal 任务会写入全部五份运行时 skill 快照及引用文件。
 
-- [go2-pixelgoal/SKILL.md](../../../robots/go2/supernav/overlay/dimos/agents/skills/go2-pixelgoal/SKILL.md)：四向图像选点、单段导航和结果处理。
-- [global-navigation-pixelgoal/SKILL.md](../../../robots/go2/supernav/overlay/dimos/agents/skills/global-navigation-pixelgoal/SKILL.md)：目标搜索、路线选择和结束判定；配套的 `references/` 包含入口搜索、探索返回、恢复停止规则。
-
-选点以 PixelGoal skill 为准。修改 Markdown 后，按上述步骤更新 manifest、重建并重新安装。`mcp/skill_assets.py` 将 skill 及参考文件复制到每次任务的 `workspace/.agents/skills/`；运行目录中的副本用于当次任务。
+canonical 文件与加载器必须一起维护，不要用重新编写的 release 说明替换快照的引用文件读取规则或记忆节点创建规则。支持的部署方式是文档中的 editable runtime 安装。修改后更新 manifest、重建、重新安装，并按[保真审计](go2-testing.md#与批准快照比较)比较实际生成的 prompt 与 skill。输入哈希只能检测打包改动，本身不能证明源码保真。
 
 ## 更新依赖与上游
 

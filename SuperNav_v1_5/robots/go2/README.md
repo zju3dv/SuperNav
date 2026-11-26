@@ -1,6 +1,8 @@
-# SuperNav · Go2 PixelGoal
+# SuperNav-1.5 on Unitree Go2
 
-Four-view GoPro observations, live LiDAR mapping, and local planning for Unitree Go2.
+Structured spatial memory for Unitree Go2, with four-view GoPro observations,
+live LiDAR mapping, memory nodes, area captions, relocalization, and map-backed
+PixelGoal local planning.
 
 | Guide | English | 简体中文 |
 | --- | --- | --- |

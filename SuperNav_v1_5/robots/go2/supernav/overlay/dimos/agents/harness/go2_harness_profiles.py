@@ -128,15 +128,22 @@ GO2_HARNESS_TOOL_PROFILES: dict[str, Go2HarnessToolProfile] = {
         tool_scope="vision_lidar_only",
         description=(
             "Current visual/lidar evidence plus bounded local odometry movement; "
-            "no prebuilt map, frontier, patrol, tags, or semantic navigation."
+            "plus supervised navigation to explicitly recorded SLAM memory nodes; "
+            "no frontier, patrol, tags, or semantic navigation."
         ),
-        allowed_strategy="observe/status/drive/rotate_in_place/relative_move/stop/safe posture",
-        disallowed_strategy="frontier, map-backed navigation, semantic memory, tags, patrol, speech",
+        allowed_strategy=(
+            "observe/status/drive/rotate_in_place/relative_move/"
+            "go2_navigate_to_memory_node/stop/safe posture"
+        ),
+        disallowed_strategy="frontier, semantic navigation, tags, patrol, speech",
         default_authority_movement_tools=(
             "drive",
             "relative_move",
             "rotate_in_place",
+            "execute_velocity_chunk",
+            "nomad_local_navigate",
             "pixelgoal_navigate",
+            "go2_navigate_to_memory_node",
             "full_lie_down",
             "lie_down",
         ),
@@ -149,11 +156,13 @@ GO2_HARNESS_TOOL_PROFILES: dict[str, Go2HarnessToolProfile] = {
             "Current visual/lidar evidence plus direct drive/rotation movement; "
             "no planner-backed relative_move."
         ),
-        allowed_strategy="observe/status/drive/rotate_in_place/stop/safe posture",
+        allowed_strategy="observe/status/drive/rotate_in_place/execute_velocity_chunk/stop/safe posture",
         disallowed_strategy="relative_move, frontier, map-backed navigation, semantic memory, tags, patrol, speech",
         default_authority_movement_tools=(
             "drive",
             "rotate_in_place",
+            "execute_velocity_chunk",
+            "nomad_local_navigate",
             "pixelgoal_navigate",
             "full_lie_down",
             "lie_down",
@@ -218,8 +227,11 @@ GO2_HARNESS_TOOL_PROFILES: dict[str, Go2HarnessToolProfile] = {
             "drive",
             "relative_move",
             "rotate_in_place",
+            "execute_velocity_chunk",
+            "nomad_local_navigate",
             "pixelgoal_navigate",
             "begin_exploration",
+            "go2_navigate_to_memory_node",
             "start_patrol",
             "full_lie_down",
             "lie_down",

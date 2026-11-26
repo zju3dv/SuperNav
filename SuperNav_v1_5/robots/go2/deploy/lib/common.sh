@@ -44,10 +44,13 @@ load_config() {
   export PATH="$SUPERNAV_ROOT/.venv/bin:$PATH"
   export XDG_STATE_HOME="$SUPERNAV_ROOT/runtime/state"
   export DIMOS_PIXELGOAL_LIVE_DIR="$SUPERNAV_ROOT/runtime/pixelgoal-live"
+  export GO2_SLAM_AREA_CAPTION_ROUTE_FILE="$SUPERNAV_ROOT/runtime/state/.active-caption-dir"
   export DIMOS_GOPRO_STATE_DIR="$SUPERNAV_ROOT/runtime/gopro-bridge"
   export DIMOS_SKIP_SYSTEM_CONFIG=1
   export DIMOS_GO2_AUTO_STAND=false
-  export DIMOS_VOXEL_MAP_LOAD_ON_START=none DIMOS_VOXEL_MAP_SAVE_ON_STOP=0
+  # Match snapshot defaults; an explicit prior run is resolved by the CLI.
+  export DIMOS_VOXEL_MAP_LOAD_ON_START="${DIMOS_VOXEL_MAP_LOAD_ON_START:-none}"
+  export DIMOS_VOXEL_MAP_SAVE_ON_STOP="${DIMOS_VOXEL_MAP_SAVE_ON_STOP:-1}"
   export DIMOS_GO2_CAMERA_BACKEND=gopro
   export DIMOS_GOPRO_VIDEO_NRS="42 43 44 45"
   export DIMOS_GO2_CAMERA_FRONT_DEVICE=/dev/video42
@@ -60,6 +63,7 @@ load_config() {
   export USE_TF=0 USE_FLAX=0 TRANSFORMERS_NO_TF=1 TRANSFORMERS_NO_FLAX=1
   unset DIMOS_EDGE_PROFILE DIMOS_DISABLE_MODULES
   export SUPERNAV_RERUN="${SUPERNAV_RERUN:-0}"
+  export GO2_SLAM_AREA_CAPTION_URL="${GO2_SLAM_AREA_CAPTION_URL:-}"
   export DIMOS_GO2_MOVE_API="${DIMOS_GO2_MOVE_API:-joystick}"
   export NO_PROXY="${NO_PROXY:-${no_proxy:-}},127.0.0.1,localhost,${UNITREE_GO2_IP:-}"
   export no_proxy="$NO_PROXY"

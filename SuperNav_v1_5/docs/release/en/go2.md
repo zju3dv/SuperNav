@@ -2,7 +2,7 @@
 
 # Unitree Go2 installation
 
-SuperNav's map-backed PixelGoal executes image goals using four GoPro views, a live LiDAR map, and a local planner. After installation, follow the [operation guide](go2-usage.md); see [maintenance](go2-maintenance.md) for source changes and [testing](go2-testing.md) for functional checks.
+SuperNav-1.5 on Go2 combines four GoPro views, live LiDAR mapping, Habitat-style area segmentation, annotated occupancy maps, memory nodes, and agent-guided cross-session relocalization. PixelGoal and the local planner execute short navigation hops; structured spatial memory remains the experiment's only spatial-memory system. After installation, follow the [operation guide](go2-usage.md); see [maintenance](go2-maintenance.md) for source changes and [testing](go2-testing.md) for functional checks.
 
 Use a Jetson aarch64 device with L4T R36.4, Python 3.12, four GoPro HERO8 USB network cameras, and NVIDIA ffmpeg. Create a dedicated deployment directory and Python environment. The running stack needs exclusive access to the cameras, MCP port, and robot LCM channel.
 
@@ -37,7 +37,7 @@ python3 -m supernav.prepare
 ./deploy/bin/check.sh --static
 ```
 
-DimOS HEAD should be `79c9ed163ec6b1abd278a9161f0c74f4562f1231`. `prepare` combines the pinned public source, patches, and new files in `runtime/dimos/`, then generates the blueprint registry. LFS demo assets can remain as pointers.
+DimOS HEAD should be `79c9ed163ec6b1abd278a9161f0c74f4562f1231`. `prepare` combines the pinned public source with the audited SuperNav-1.5 implementation files in `runtime/dimos/`, then generates the blueprint registry. The transferred implementation is based on DimOS commit `ae8160cc9c7ea0494b18a47395799e2698d6c891` plus the three audited backports recorded in `supernav/manifest.json`. SuperNav-2.0 XYTheta navigation is not included. LFS demo assets can remain as pointers.
 
 **Run all remaining commands from `SuperNav/robots/go2/`; paths are relative to this deployment root.**
 

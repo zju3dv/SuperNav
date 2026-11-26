@@ -31,7 +31,6 @@ import re
 import shlex
 import shutil
 import subprocess
-import sys
 import time
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -48,6 +47,10 @@ from dimos.agents.harness.go2_harness_profiles import (
     go2_harness_profile_prompt_lines,
     go2_harness_tool_profile,
 )
+from dimos.agents.harness.go2_prior_run import (
+    resolve_go2_prior_run,
+    seed_go2_prior_graph_memory,
+)
 from dimos.agents.mcp.external_harness_authority_proxy import (
     DEFAULT_AUTHORITY_PROXY_AREA,
     DEFAULT_AUTHORITY_PROXY_DURATION_S,
@@ -56,15 +59,15 @@ from dimos.agents.mcp.external_harness_authority_proxy import (
     DEFAULT_MIN_START_BATTERY_PERCENT,
 )
 from dimos.agents.mcp.mcp_adapter import McpAdapter
-from dimos.agents.mcp.skill_assets import copy_skill, read_references, read_skill
 
 CodexHarnessMode = Literal["readonly", "authority-proxy", "admin-override-debug"]
-CodexHarnessPromptMode = Literal["default"]
+CodexHarnessPromptMode = Literal["default", "long_instruction"]
 
 DEFAULT_AUTHORITY_PROXY_URL = "http://127.0.0.1:9992/mcp"
 DEFAULT_AUTHORITY_PROXY_MOVEMENT_TOOLS = (
     "relative_move",
     "rotate_in_place",
+    "go2_navigate_to_memory_node",
     "full_lie_down",
     "lie_down",
 )
@@ -75,49 +78,842 @@ DEFAULT_MCP_SMOKE_REQUIRED_TOOLS = (
     "rotate_in_place",
     "relative_move",
     "last_motion_diagnostics",
-    "stop_movement",
 )
 DEFAULT_MCP_SMOKE_REQUIRED_CALL_TOOLS = (
     "observe",
     "go2_robot_status",
     "motion_safety_status",
     "last_motion_diagnostics",
+    "go2_list_graph_nodes",
+    "go2_relocalization_status",
+)
+LONG_INSTRUCTION_MCP_SMOKE_REQUIRED_TOOLS = (
+    "go2_list_graph_nodes",
+    "go2_grep_graph_node",
+    "go2_inspect_graph_node",
+    "go2_query_route_context",
+    "go2_report_graph_position",
+    "go2_apply_graph_mutations",
+    "go2_graph_map_nodes",
+    "go2_navigate_to_memory_node",
+    "go2_relocalization_status",
+    "go2_known_slam_map",
+    "go2_navigation_map_context",
+    "go2_start_navigation_episode",
+    "go2_save_relocalization_bundle",
 )
 DEFAULT_MCP_SMOKE_TIMEOUT_S = 300.0
 DEFAULT_MCP_SMOKE_ATTEMPTS = 2
 DEFAULT_MCP_SMOKE_RETRY_DELAY_S = 2.0
 DEFAULT_MCP_SMOKE_REASONING_EFFORT = "low"
 DEFAULT_MCP_SMOKE_TRANSPORT = "direct_mcp"
+GO2_LIVE_ENV_PREFLIGHT = {
+    "LD_LIBRARY_PATH": ".deps/portaudio/root/usr/lib/x86_64-linux-gnu",
+    "PYTHONPATH": ".deps/pypi/extract-2.1.2:.deps/pypi/target-curl",
+}
 
-DRIVE_GO2_SKILL_TEXT = read_skill("drive-go2")
+DRIVE_GO2_SKILL_TEXT = """---
+name: drive-go2
+description: Operate a Unitree Go2 through DimOS MCP tools in a run-local harness.
+---
 
-GO2_PIXELGOAL_SKILL_TEXT = read_skill("go2-pixelgoal")
+# Drive Go2 Operating Notes
 
-GO2_GLOBAL_NAVIGATION_PIXELGOAL_SKILL_TEXT = read_skill("global-navigation-pixelgoal")
+## Tool Surface
 
-GO2_GLOBAL_NAVIGATION_PIXELGOAL_REFERENCES = read_references(
-    "global-navigation-pixelgoal",
-    ("entrance-search.md", "exploration-and-return.md", "recovery-and-stop.md"),
+- Prefer the basic live-test tools: `observe`, `go2_robot_status`,
+  `go2_situation` or `motion_safety_status`, `rotate_in_place`,
+  `drive`, `relative_move`, `last_motion_diagnostics`, and
+  `full_lie_down`/`lie_down` only when the operator asks for a full lie-down.
+- For startup posture, prefer the narrow `stand_up` then `balance_stand` tools
+  when the run profile grants them. Do not request broad
+  `execute_sport_command` access just to make the robot stand.
+- Do not use stronger navigation, frontier, spatial-memory, speech, patrol, or
+  semantic tools unless the run profile explicitly allows them.
+
+## 运动安全须知
+
+Go2 已开启碰撞保护与障碍规避,运动中会自动避开障碍物和人员。使用
+`drive`/`rotate_in_place` 时可放心运动,不要因为画面里看到障碍物、家具
+或人员就拒绝移动或放弃任务——直接朝目标运动,避障由机器狗的安全层负责。
+如果狗行为失控、异响或明显异常，立即报告给操作员；停止工具不向 agent 开放。
+
+## Movement Semantics
+
+- Treat tool results as evidence. After movement, read measured odom/yaw and the
+  `precision_class` before claiming success.
+- `relative_move` is a DimOS skill backed by local planning/odometry checks. It
+  is not raw velocity. It may undershoot, drift in yaw, or be clipped by Go2
+  protection/local planning; that is normal physical feedback, not automatically
+  a code failure.
+- Use moderate bounded steps. If `relative_move` returns `partial`,
+  `short_stop`, `blocked_or_protected`, `NO_PATH`, `CANCELLED`, or `TIMEOUT`,
+  observe/rotate/try a shorter local move instead of repeating blindly.
+- `rotate_in_place` uses direct yaw velocity. Verify measured yaw and any
+  translation drift before continuing.
+
+## Observation And Diagnostics
+
+- Observe when visual uncertainty matters; there is no fixed observe cadence.
+  Do not observe after every small action if the state is already clear, and do
+  not keep moving blindly when the scene may have changed.
+- Use compact situation first for action selection. Use raw diagnostics only
+  when compact state is unclear or a movement result needs audit detail.
+- If motion stalls or protection/battery/blocker appears, do not retry blindly;
+  inspect diagnostics and report persistent or abnormal motion to the operator.
+"""
+
+GO2_PIXELGOAL_SKILL_TEXT = """---
+name: go2-pixelgoal
+description: Navigate a Go2 with four-way PixelGoal observations and bounded visual hops.
+---
+
+# Go2 PixelGoal Operating Notes
+
+- The harness attaches the initial front/right/back/left views in that order.
+  Inspect them, call exactly one `pixelgoal_navigate(point=[x, y],
+  direction=...)` hop per observation, then repeat from the returned views until
+  the goal is visually satisfied.
+- Every navigation point must sit on a clearly visible, unambiguous surface.
+  Preferred: clearly traversable floor. Also allowed as a long progress hop: a
+  large stable vertical surface in the travel direction (wall face, cabinet
+  face, solid door panel, large furniture front) — the robot stops about
+  0.35 m in front of the marked surface, so a distant stable surface is a safe
+  way to cross open space efficiently.
+- When the travel direction is clear, choose the farthest clearly visible safe
+  option: the farthest traversable floor, or a stable vertical surface farther
+  along the route when floor runs out of view. Use a shorter local hop only
+  when farther choices are occluded, ambiguous, or unsafe.
+- Never click glass, windows, mirrors/reflections, transparent doors or
+  anything seen through them; thin structures (chair/table legs, cables, bags,
+  stands); the floor-wall boundary line itself; sky, ceiling, the horizon, or
+  empty space. Keep a safety margin from obstacles and floor boundaries.
+- For a find/search task, never click the target object itself; stop only when
+  it is close enough for human-verifiable identity, not merely visible far away.
+- Never select glass, windows, mirrors/reflections, transparent doors, anything
+  visible through them, sky, ceiling, the horizon, or empty space.
+- Keep the robot still between observation and navigation so the normalized
+  point still matches the latest camera frame used by PixelGoal.
+- `pixelgoal_navigate` waits for the hop to finish and returns its terminal
+  status, camera freshness metadata, and fresh front/right/back/left views. Do
+  not navigate from a missing or stale view. Call `observe_surround` or
+  `pixelgoal_status` only to recover from missing/stale images or diagnose an
+  abnormal result.
+- For a find/search task, finish only when the target is clearly visible in a
+  fresh returned view, close enough for human-verifiable identity, and the
+  requested location condition is satisfied. If it is only small or distant,
+  approach via safe visible floor proxies while keeping a safety margin. Stop
+  and cite the direction and visual evidence once close enough.
+- In the normal path, do not call `server_status`, `robot_protection_status`, or
+  `motion_safety_status`; the authority proxy checks authority and battery on
+  every movement call. Use diagnostics only after a refusal or abnormal result.
+- Do not start a second hop while one is running. On operator stop or abnormal
+  motion, stop issuing navigation calls and report it; stop tools are operator-only.
+  `reset_pixel_goal_map` is operator-only.
+
+## Tool Invocation Discipline
+
+- Call the navigation tool directly as `pixelgoal_navigate` on the `dimos`
+  MCP server. There is no namespace lookup step and no warmup or test call;
+  never probe the tool surface with placeholder commands.
+- The shell exists only to read skill files. Never use it for no-op or
+  placeholder commands (`echo`, `true`, `printf`, redirections to /dev/null),
+  and never for navigation, perception, or note-taking. Every action is
+  either a real `dimos` MCP tool call or a message to the operator.
+"""
+
+GO2_GLOBAL_NAVIGATION_PIXELGOAL_SKILL_TEXT = """---
+name: global-navigation-pixelgoal
+description: Long-horizon Go2 PixelGoal navigation for searching across rooms, tracking openings, recovering from stalls, and stopping on fresh visual evidence.
+---
+
+# Global Navigation (Go2 PixelGoal)
+
+This is the Go2 adaptation of the Habitat-GS `global-navigation-nomad` skill.
+Use MUST, MUST NOT, SHOULD, and MAY literally. Rule IDs remain stable audit labels.
+
+## Load the Needed Rules
+
+- Before leaving the local area, taking a long return, or committing to a long hop,
+  read [references/exploration-and-return.md](references/exploration-and-return.md)
+  completely.
+- When the target or its room is visible only through glass, or no passable entrance is
+  visible near the start, read [references/entrance-search.md](references/entrance-search.md)
+  completely before searching the perimeter or reporting blocked.
+- At the first stall, or before reporting blocked, read
+  [references/recovery-and-stop.md](references/recovery-and-stop.md) completely.
+
+## Go2 Contract
+
+- **NM-LIFE-001 — One initialization.** The harness supplies one initial fresh
+  front/right/back/left surround. MUST NOT call observation tools just to repeat it.
+- **NM-LIFE-002 — PixelGoal rules.** MUST read the complete run-local
+  `go2-pixelgoal/SKILL.md` before the first `pixelgoal_navigate`. That skill owns safe
+  point selection and result handling; this skill owns global search decisions.
+- **NM-LIFE-003 — Evidence boundary.** MUST perceive and act only through the
+  whitelisted DimOS MCP tools and their latest returned images. MUST NOT use shell,
+  Python, files, artifacts, maps, coordinates, trajectories, or hidden robot state for
+  navigation decisions.
+- **NM-LIFE-004 — Formal finish.** There is no session-close tool. MUST answer only
+  after the achieved gate holds on the latest surround, or after writing the complete
+  blocked audit required by the recovery reference. On operator stop or abnormal
+  motion, MUST stop issuing navigation calls and report the condition before answering.
+
+## Target and Observation Gate
+
+- **NM-OBS-001 — Complete target hypothesis.** MUST keep a compact hypothesis containing
+  the requested object/region, distinguishing appearance or material, required relations,
+  room context, and final visual evidence. A category match alone is insufficient.
+- **NM-OBS-002 — Observe-decide-act.** After initialization and every hop, MUST inspect
+  front, right, back, and left, including both horizontal edges; test the full target
+  hypothesis; census every visible transition; choose one bounded action; and repeat on
+  the returned surround. A successful `pixelgoal_navigate` already returns the full
+  surround, so `observe_surround` is only for missing/stale-image recovery.
+- **NM-OBS-003 — Census before decision.** MUST classify each doorway, side opening,
+  corridor continuation, and room interior as traversed, meaningfully inspected, or
+  new/uncertain. MUST list new/uncertain choices before selecting a proxy using:
+
+  `census: front=...; right=...; back=...; left=... | new=... | frontier=... | next=... | why=...`
+
+Current pixels outrank earlier notes. An empty noted list is not exhaustion. A hop that
+empties the list may expose the next junction. MUST NOT report blocked or begin a return
+in the same decision as a successful hop; first census its fresh surround.
+
+## Core Navigation Decisions
+
+- **NM-MOVE-001 — Relevance before novelty.** SHOULD prefer current target evidence or a
+  target-relevant current route, then a safe unfamiliar opening, a current unentered
+  sibling, and finally a bounded return to one exact older noted opening. A clearly
+  mismatched room MAY be deferred while a stronger route exists, but MUST stay noted.
+- **NM-MOVE-002 — Visible bounded movement.** All locomotion is one
+  `pixelgoal_navigate(point=[x, y], direction=...)` call on a clearly traversable floor
+  point visible in the selected latest view. Reaching a proxy is not completion. Every
+  hop or refresh expires old image points.
+- **NM-MOVE-003 — Hop gate.** SHOULD choose the farthest clearly safe floor that advances
+  through the selected transition without skipping a more relevant local choice or an
+  unrecorded opening. Otherwise use an intermediate visible proxy. Read the exploration
+  reference before leaving the local area or committing to a long return.
+- **NM-MOVE-004 — Information gain when nothing matches.** When no current view shows
+  target evidence, MUST place the point where the hop buys the most new information:
+  through the most promising new/uncertain census opening, far enough past the threshold
+  that the next surround reveals new area. MUST NOT spend a hop re-showing the same room
+  while an unentered opening is visible.
+
+## Real-World Adaptation (0.6 m Go2 rig)
+
+- The cameras sit about 0.6 m above the floor. Chair legs, cables, thresholds,
+  and bag straps are real collisions even when they look small; give them
+  margin. You cannot see over desks, shelves, or cubicle walls — a blocked
+  high view does not mean the floor is blocked; judge floor from the lower
+  half of every view.
+- Offices have glass partitions and polished floors. Glass shows unreachable
+  space (follow entrance-search); floor glare and reflections are not
+  obstacles. Dark glass can look like open space — confirm with the other
+  three views before marking near it.
+- Crossing a doorway: mark a point clearly past the threshold on the far-side
+  floor, not on the threshold strip itself.
+- People may walk through the scene; if legs or moving objects cover the
+  intended point, wait one observation cycle instead of marking near them.
+
+## Stop Gates
+
+- **NM-TERM-001 — Achieved.** MUST finish achieved only when the latest fresh surround
+  shows the complete target, distinguishing attributes, required relations, and matching
+  context at human-verifiable distance. Reaching a waypoint is never success by itself.
+- **NM-TERM-002 — Blocked.** MUST read the recovery reference and exhaust its bounded gate
+  before reporting blocked. MUST write its blocked audit with every clause true before
+  answering.
+"""
+
+GO2_GLOBAL_NAVIGATION_PIXELGOAL_REFERENCES = {
+    "entrance-search.md": """# Entrance Search
+
+Read this file completely when the target or its room is visible only through glass, or
+when no passable entrance is visible near the start.
+
+## Detect the Facade Trap
+
+- **NM-ENTRY-010 — Glass is evidence, not a route.** Treat a target, room, or furniture
+  visible through a window or glass wall as useful evidence but not as a passable
+  opening. After one failed or visually impassable approach, MUST stop approaching that
+  pane and search for an entrance elsewhere on the same structure.
+- **NM-ENTRY-011 — Stable facade anchor.** Retain one distinctive visible part of the
+  facade as the return anchor. Choose a visible wall end, corner, walkway continuation,
+  fence gap, or other open-floor proxy that advances laterally; do not mark a point on
+  the hidden entrance or an off-screen destination.
+
+## Two-Sided Perimeter Search
+
+- **NM-ENTRY-020 — Audit both directions.** From the facade anchor, choose one safe
+  lateral direction and follow visible bounded floor proxies to the next corner or
+  meaningful facade change. Inspect all four views after every hop. If that side yields
+  no passable opening, reacquire the anchor and inspect the opposite direction.
+- **NM-ENTRY-021 — Turn corners deliberately.** At each reached wall end or corner, move
+  only enough to expose the adjoining facade, then census doors, archways, gaps,
+  walkways, and open interior transitions. A corner reached without seeing around it is
+  not audited.
+- **NM-ENTRY-022 — Entrance outranks the window target.** Once a plausible passable
+  opening appears, prefer it over further target-visible glass. Approach with a bounded
+  floor hop, inspect the returned surround, and cross only with fresh visual evidence.
+
+## Exit Condition
+
+- **NM-ENTRY-030 — Bounded completion.** Leave perimeter-search mode when a passable
+  entrance is entered or both directions from the retained anchor have been meaningfully
+  inspected. MUST NOT report blocked for `no entrance` while either side is unaudited, a
+  reached corner has not been viewed around, or a visible continuation remains untested.
+""",
+    "exploration-and-return.md": """# Exploration, Return, and Movement
+
+Read this file completely before leaving the local area, taking a long return, or
+committing to a long hop.
+
+## Exploration Order
+
+- **NM-MOVE-010 — Relevant novelty.** Prefer, in order: current complete target evidence;
+  a target-relevant current route; a safe unfamiliar room or side opening; a current
+  observed-but-unentered sibling; a bounded return to an older noted-but-unresolved
+  opening; familiar space only as a route to one specific unresolved opening.
+- **NM-MOVE-011 — Inspect enough.** Crossing a doorway or touching a threshold does not
+  inspect a room. Current pixels decide whether main contents and side exits are exposed.
+  If not, hop to an interior viewpoint; if they are, do not approach an irrelevant object
+  merely to clear follow-up. A threshold touch is not an exhaustion test.
+- **NM-MOVE-012 — Guesses are revisable.** Do not reject a passable unfamiliar room or
+  opening only because its guessed function seems low value. When pixels clearly show a
+  mismatch and a stronger route exists, defer it but keep it noted. If no stronger choice
+  remains or blocked is being considered, inspect it.
+
+## Directed Return
+
+- **NM-MOVE-020 — Nearest unresolved opening.** After a wrong room, return only far
+  enough to reacquire the nearest noted-but-unresolved opening. Hop between visible floor
+  proxies and verify against the fresh surround after each hop.
+- **NM-MOVE-021 — Familiarity brake.** When familiar public or starting-area context
+  appears, state that recognition and stop advancing through it. Reorient toward the
+  nearest recent view that exposed an unfamiliar side opening. Familiar space is not
+  exhaustion.
+- **NM-MOVE-022 — Named destination.** An aimless return is forbidden. Keep the exact
+  destination phrase in mind. A long return is a chain of visible bounded proxy hops;
+  re-verify the direction against noted openings after each hop.
+
+## Long Hops
+
+- **NM-MOVE-030 — Current-census gate.** Before a long hop, compare it with the named
+  siblings and current census. Take a shorter floor proxy instead whenever a more
+  relevant local sibling, shorter reacquisition, or unrecorded side opening exists.
+- **NM-MOVE-031 — Passed-opening audit.** If a returned surround shows an unrecorded or
+  unentered opening was passed, note it before moving on. A long hop does not label a
+  room or prove failure.
+
+## Visual Movement
+
+- **NM-MOVE-040 — Surround directions.** The latest front/right/back/left surround covers
+  360 degrees, and every view is legal for `pixelgoal_navigate`. Do not spend an action
+  turning to relabel a side/back view; pass its direction directly.
+- **NM-MOVE-041 — Point choice.** Follow `go2-pixelgoal`: mark only clearly traversable
+  floor with a safety margin. When the travel direction is clear, MUST choose the
+  farthest clearly visible safe floor in that direction; use a shorter proxy hop only
+  when farther floor is occluded, ambiguous, unsafe, or a more relevant local opening
+  would be skipped. Never mark the target, obstacle, threshold edge, glass, or empty
+  space.
+- **NM-MOVE-042 — Chained hops.** Room-to-room travel is a chain of bounded hops through
+  visible proxies. After a failed threshold hop, use fresh pixels to change the point or
+  route; do not repeat the same point without new visual information.
+- **NM-MOVE-043 — Information-gain brake.** After any action that yields no new visual
+  information, MUST change the point, viewing seam, route, or recovery method. A nominally
+  successful micro-hop does not justify repetition.
+- **NM-MOVE-050 — Loop brake.** If the fresh surround after a hop shows a place already
+  visited from a similar heading, MUST NOT reverse direction on the next decision.
+  Choose one recorded unentered opening and chain two to three hops through it before
+  re-evaluating. A turnaround needs fresh visual evidence that the forward route is
+  blocked or exhausted; a familiar-looking view is not evidence of exhaustion.
+""",
+    "recovery-and-stop.md": """# Recovery and Stop Rules
+
+Read this file completely at the first stall and before reporting blocked.
+
+## Bounded Recovery
+
+- **NM-TERM-010 — Escalation ladder.** When progress stalls: stop repeating the same
+  point/room; inspect all four returned views and image edges; enter a visible unfamiliar
+  room far enough to expose it; inspect a current unentered sibling; use one bounded point
+  adjustment if it reveals a new view; return to the strongest exact older noted opening;
+  then re-identify the current location and note materially new siblings.
+- **NM-TERM-011 — Continue on information gain.** Continue while bounded actions yield
+  new visual information. Do not call a corridor cyclic while any view exposes an
+  uninspected room. Empty frontier only means no observed-but-unentered opening is noted;
+  leave a terminal room and inspect the nearest multi-opening corridor and image edges.
+- **NM-TERM-012 — Standoff recovery before rejection.** If a result leaves the target
+  wall or feature filling the view, too close or oblique to verify, regain readable
+  standoff with one bounded safe-floor hop in a back or side view, then inspect again.
+  Never reject a feature from an unreadable close-up.
+
+## Pre-finish Audit
+
+- **NM-TERM-020 — Trace audit.** Before reporting blocked, first write an NM-OBS-003
+  census from the latest result, then state:
+
+  `blocked audit: latest hop censused; current openings none; frontier audited; remembered alternatives tested`
+
+  Every clause MUST be true. The audit cannot be the first message after movement. If the
+  latest hop just entered a new opening, inspect its returned surround before this audit.
+- **NM-TERM-021 — Evidence, not likelihood.** Semantic likelihood cannot mark an opening
+  tested. Relevant bounded alternatives must be exhausted, unsafe, visibly impassable,
+  freshly verified duplicates, or attempted and unreachable. One arbitrary retreat is
+  not an exhaustion test.
+
+## Blocked Finish
+
+- **NM-TERM-030 — Finish only after the audit.** There is no close-session tool. Answer
+  blocked only after the audit is written and every clause holds. If an operator stop or
+  abnormal motion is involved, stop issuing navigation calls and report it first.
+- **NM-TERM-031 — No silent give-up.** Do not stop calling tools and answer blocked while
+  safe bounded exploration remains. The terminal states are fresh visual achievement,
+  a completed blocked audit, or an explicit operator/safety stop.
+""",
+}
+
+GO2_GRAPH_MEMORY_SKILL_TEXT = """---
+name: go2-graph-memory-hierarchy
+description: Build and reuse concise node-only area/door memory, with detailed rules in references.
+---
+
+# Graph Memory Navigation
+
+Graph memory is your own fallible node-only exploration record. It contains only
+facts you explicitly write through MCP tools, not a ground-truth map or stored
+topology. Use it after `go2_start_navigation_episode`.
+
+MUST DO: At skill startup, before any navigation action or graph-memory write,
+read every file listed in `References`. These references are part of the skill,
+not optional background. After reading them, follow both this concise file and
+the referenced details for the rest of the episode.
+
+## Ownership
+
+This skill owns semantic memory facts, area/door node creation and update rules,
+node schema, graph-memory tool usage, mutation batching, startup memory reads,
+target-query memory reads, door panorama thresholds, segmentation-gated
+area-node creation, and memory-node relocation priors.
+
+When `go2-2d-slam` is active, it owns map legend, map status, geometry limits, and
+frontier definitions. When `go2-graph-slam-navigation` is active, provide semantic
+anchors to its route-fusion workflow; it owns final route choice, route
+commitment, and replans.
+
+## Core Rules
+
+- ALWAYS be conscious of which area or door node you are currently in. MUST
+  state your current node after every movement.
+- Record only directly observed facts. Never invent room identity, adjacency,
+  routes, unseen contents, or door connections.
+- Use only two node types: `area` and `door`. Every node has an explicit `kind`.
+- An area is a semantically distinct place with a different observed function,
+  such as a kitchen, dining room, bedroom, office, bathroom, or corridor. Open
+  pathways and viewpoint changes do not create a node, but an open-plan space
+  with directly observed distinct functions may contain separate area nodes.
+- A door is an observed semantic door, open or closed, that separates two areas.
+  Do not create door nodes for open passages, hallway openings, or transitions
+  without a semantic door.
+- Store objects, target evidence, and search observations in area `records`, not
+  as graph nodes.
+- Store doorway visibility, destination clues, and explored/unexplored state in
+  node `records`. Do not write adjacency lists or remembered paths.
+- Existing memory may contain ambiguous descriptions or wrong notes. Use the
+  memory as guidance, and update memory when you have better evidence.
+
+## Direct Observation
+
+Explore using target-oriented visual heuristics and inference, not a goal of
+exhaustively capturing panoramas or completing the graph. If a room is visible
+from its doorway or another viewpoint and the observation gives only a weak
+possibility that the target is inside, do not enter solely to capture panorama
+evidence or create a graph node. Record the visible doorway clue, then
+prioritize routes with stronger target evidence. Enter when direct evidence, a
+useful unexplored frontier, or a materially plausible target hypothesis
+justifies the movement.
+
+## Door Panoramas
+
+A door node may contain `pano_images` ONLY WHEN the robot is physically centered
+in that doorway/threshold and has a clear threshold view. Seeing a door from an
+area, corridor, room center, or another doorway is not enough, even when the
+door is large, clear, or visually identifiable.
+
+When a door is only visible from the current area, create/update its node
+without `pano_images`. After you later reach and center in that exact threshold,
+update the same node with door panorama evidence.
+
+## Segmentation-Gated Area Creation
+
+When `go2-2d-slam` / `go2-graph-slam-navigation` provides a colored segmentation map,
+use colored regions as the geometric gate for area-node creation, not as final
+semantic rooms. Create an area node ONLY after the robot has entered a colored
+region that has no numbered graph-memory area marker on it, and ONLY when
+current RGB/panorama directly supports a useful area description that is
+functionally different from nearby marked areas. Because segmentation may be too
+fragmented, do not create a node for an unmarked colored fragment when a nearby
+marked node describes the same function, landmarks, and semantic place. Do not
+create duplicate area nodes inside a colored region that already has a numbered
+area marker. Do not create area nodes for colored regions, frontiers, or rooms
+seen only from a distance before entering them.
+
+## Relocation Prior
+
+In graph-memory/SLAM relocation runs, if you can identify the current stored
+area or door node at episode start, call `go2_report_graph_position(id)` before the
+first navigation action. This report gives DimOS SLAM an agentic relocation
+prior; it is not merely a memory read.
+
+If relocation status remains `collecting` after later movement and the current
+RGB/panorama evidence newly identifies a stored node, call
+`go2_report_graph_position(id)` again before the next navigation action.
+
+## Required Workflow
+
+1. Immediately after `go2_start_navigation_episode`, inspect the current surround. If graph
+   memory is empty and the current place is functionally distinct, create its
+   area node before the next navigation action.
+2. At the start of each navigation task, if memory is not empty, use
+   `go2_query_route_context()` to search target/context terms and inspect
+   candidate nodes from one snapshot. This read is mandatory before any graph
+   mutation or navigation action.
+3. Match the initial surround to an existing area before creating anything;
+   never create a replacement start-area or doorway node merely because the
+   current session has a new panorama ID.
+4. Inspect each candidate node with `go2_inspect_graph_node(id, return_images=true)`
+   and use its stable landmarks, panoramas, and records to identify semantic
+   anchors.
+5. If the current stored node is identifiable in a graph-memory/SLAM relocation
+   run, call `go2_report_graph_position(id)` before the first navigation action.
+6. While executing a committed path, do not additionally query graph memory at
+   intended intermediate nodes if you are following the path correctly.
+   Navigate and identify doors/areas from current visual evidence.
+7. Graph-memory reads are allowed only after an accidental or unexpected
+   encounter, a visual route mismatch, or a blocked/missing intended door.
+8. After every movement, create/update directly observed area, semantic door,
+   visible-door, and target-evidence facts before the next navigation action.
+   Apply the segmentation-gated area creation rule when a colored SLAM
+   segmentation map is available.
+9. Before close, update target evidence and correct wrong memory.
+10. Prefer one `go2_apply_graph_mutations(mutations=[...])` call for independent
+    graph creates, upserts, and updates that are already fully specified. Do not
+    batch mutations whose facts or IDs depend on an earlier mutation result.
+
+## Clear Viewpoint Rules
+
+- Keep clear of walls, corners, furniture, and door frames when observing.
+- Update area `pano_images` when you have a better centered view of the area.
+- Movement results automatically save fresh labeled panorama images and return
+  an exact `pano_images` mapping. Copy that mapping into the node mutation; do
+  not invent or rename references. Later graph reads with `return_images=true`
+  hydrate the references back into image blocks.
+- For door `pano_images`, stand centered in the exact doorway/threshold with
+  both sides visible. Never copy the current area panorama into a door node.
+- In long narrow hallways, stand near the centerline, inspect both sides, and
+  choose the most promising semantic doors to explore.
+- If many semantic doors are close together, add each door node separately with
+  a note that identifies it by stable visual anchors, destination clue, and
+  exploration state.
+
+## References
+
+- MUST READ `references/node-schema.md`: exact node-only schema rules.
+- MUST READ `references/workflows.md`: startup, exploration, hallway, dense-doorway, and
+  target-query workflows.
+- MUST READ `references/examples.md`: compact area/door node examples.
+- MUST READ `references/tool-interface.md`: graph-memory MCP tool usage.
+
+Do not navigate, create nodes, or update nodes until all four reference files
+have been read in the current episode. Do not read files outside this skill for
+scene perception.
+"""
+
+GO2_2D_SLAM_SKILL_TEXT = """---
+name: go2-2d-slam
+description: Read and use the live DimOS SLAM 2D occupancy map returned after movement.
+---
+
+# Live 2D SLAM Map
+
+When this skill is active, movement responses include `2d_slam_map` and inline
+one image titled **Latest 2D SLAM occupancy map** or **Latest 2D SLAM area
+segmentation map**. It is a scan-derived local map for orientation and
+short-horizon exploration, not a semantic object map.
+
+This skill owns map interpretation only. When graph memory is active, apply
+`go2-graph-memory-hierarchy` for memory reads/writes and
+`go2-graph-slam-navigation` for final route choice, route commitment, and replans.
+
+## Reading the Map
+
+- The red arrow with a yellow outline is the current odometry-projected robot
+  pose rendered into the latest DimOS SLAM map frame. Its tip is the
+  estimated forward heading; its base is the current estimated position. When
+  this pose exists on a `current` map, prioritize it as the agent's location on
+  the SLAM map.
+- Map-up is an arbitrary SLAM coordinate direction, not the direction you are
+  facing. Determine forward, left, right, and behind from the red arrow,
+  geometry, and graph nodes; do not treat the top edge of the image as forward.
+- In graph-memory/SLAM runs, the attached map may be a colored
+  area-segmentation overlay. Solid colored regions are SLAM-segmented
+  traversability/evidence areas. They may be well explored or only scanned from
+  a distance with incomplete shape. Treat one colored region as a geometric area
+  candidate for exploration bookkeeping, not as proof that the agent has
+  inspected it in detail. A color is not a semantic room label by itself; use
+  RGB/panorama evidence to name or describe it.
+- Large black numbers with a white outline are graph-memory node IDs. The text
+  response's `2d_slam_map.graph_nodes` field maps each displayed ID to its full
+  node name. Only nodes that have both saved panorama evidence and a
+  scan-matched SLAM pose are numbered on the map.
+- White `A<N>` labels with a black outline are live unmarked SLAM area targets.
+  The text response's `2d_slam_map.slam_area_nodes` field maps each displayed
+  label to an ephemeral `slam_area_<N>` node id. These are geometric
+  free-space targets regenerated from the latest segmentation, not semantic
+  graph-memory nodes. If the area center is blocked in the planning occupancy
+  map, the listed target is snapped to a nearby clear planning cell.
+  `A<N>` labels are temporary and are subject to change after every movement.
+  Do not assume that an `A<N>` label is the same area as a previously seen `A<N>` label.
+- `slam_area_nodes` may include async `captions` selected from past observations,
+  which serves as visual hint for what area `A<N>` looks like.
+  The caption can help you to decide which area to explore next.
+- A colored region that already contains a numbered graph-memory area node is
+  represented in memory. Do not create another area node for that same colored
+  region merely because the viewpoint changed. A colored region with an `A<N>`
+  label is only a possible navigation/exploration target until RGB/panorama
+  evidence supports creating or updating semantic memory. Segmentation can be
+  too fragmented; an unmarked colored region is only a possible new area.
+- Each label is sized for a map footprint. Labels can overlap local geometry,
+  so use the surrounding map structure to identify the stored anchor point or
+  generated area center.
+- Black cells are occupied evidence: walls, furniture, or other depth returns.
+  Do not plan to move through them.
+- Light gray cells are unknown or unclassified space. They are not evidence of
+  traversable space and should be explored from a visible safe approach.
+- Frontiers are unmarked or unexplored geometric areas/open boundaries adjacent
+  to observed traversable space. They may have no special color marker.
+- White lines are segmentation boundaries between colored regions. They are not
+  frontiers by themselves.
+- Use the red arrow and nearby geometry; never infer absolute coordinates from
+  pixels.
+
+## Map Status
+
+- `current`: use the red arrow, segmented nearby geometry, unmarked or
+  unexplored frontier candidates, numbered anchors, and `A<N>` area targets.
+  Treat the red-arrow pose as the map-route origin.
+- `static`: trust the persisted numbered geometry, but no real-time robot pose
+  marker is available. If graph memory is active, infer the current numbered
+  node from current RGB/panorama evidence plus graph-node panoramas, stable
+  landmarks, names, and records.
+- `pending`: no map image is attached. Use current RGB/depth and wait for a
+  later movement response instead of inventing map geometry.
+- `collecting`, `matching`, or `anchoring`: relocation has not finished. Use
+  the static-map workflow and do not wait solely for a live pose marker. If
+  graph memory is active and current RGB/panorama evidence identifies the stored
+  node you are in, `go2-graph-memory-hierarchy` owns the
+  `go2_report_graph_position(id)` relocation-prior rule.
+
+## Frontiers
+
+A frontier is a reachable unmarked or unexplored area/open boundary where
+observed traversable space leads into unknown, unclassified, or not-yet-audited
+space. Examples include map-edge openings, unlabeled corridors, unentered
+colored regions, and visible open passages without graph-memory markers. It may
+have no special color marker. Black wall-like lines, gray unknown space by
+itself, and white segmentation boundaries are not frontiers.
+
+Treat a frontier as active exploration debt until it is entered, seen to be
+blocked/unsafe in RGB/depth, or explicitly superseded by a closer frontier. If
+you skip a visible frontier, state the concrete reason: `blocked`, `unsafe`,
+`not reachable from current pose`, `already audited`, or `lower priority than
+<specific frontier>`.
+
+## Geometry Limits
+
+- Do not invent semantic destinations from occupancy pixels. The map has no
+  object labels, room names, or door semantics.
+- Confirm all semantic targets, doorways, and final-task evidence in RGB
+  panorama images. Use depth/current observation for immediate traversability.
+- Treat black/white boundaries and the red arrow as estimates. If the map and
+  current RGB/depth observation disagree, trust the current observation and
+  proceed cautiously.
+- If the red-arrow pose conflicts with a location guess from RGB or
+  graph-memory descriptions, trust the red-arrow map position for route
+  geometry and treat the semantic match as uncertain. Do not override a live
+  SLAM pose with an RGB-only or graph-description-only match unless direct
+  movement evidence confirms the map pose is wrong.
+"""
+
+GO2_GRAPH_SLAM_NAVIGATION_SKILL_TEXT = """---
+name: go2-graph-slam-navigation
+description: Fuse graph-memory semantics with 2D SLAM geometry into one committed navigation route.
+---
+
+# Graph-SLAM Navigation
+
+Use this skill only with `go2-graph-memory-hierarchy` and `go2-2d-slam`. It is the sole
+owner of final route choice, route commitment, and route replanning when both
+semantic graph memory and 2D SLAM are available.
+
+Read `references/route-fusion.md` completely before navigation. Also obey the
+provider skills: `go2-graph-memory-hierarchy` owns graph facts and mutation rules;
+`go2-2d-slam` owns map legend, status meanings, geometry limits, and frontier
+definitions. Do not override their evidence limits.
+
+## Ownership
+
+- Graph memory supplies semantic area/door candidates, stable landmarks,
+  panoramas, target evidence, and node-level relocalization anchors.
+- 2D SLAM supplies current or static geometric context, local free-space
+  feasibility, blocked paths, unexplored boundaries, and shortcut candidates.
+- RGB/depth confirms current semantic identity and safe traversability.
+- When the SLAM map has a current red-arrow agent pose, that pose is the
+  primary evidence for the agent's location on the map. Use RGB/graph-memory
+  semantic matching as supporting evidence, not as a replacement for the live
+  SLAM pose.
+- In unknown-target exploration, active SLAM frontiers are navigation goals.
+  Numbered graph nodes are anchors for orientation and semantic recall, not
+  places to revisit by default.
+
+## Required Post-Movement Observation
+
+State your current status from RGB observation, graph memory, and graph-node
+overlayed SLAM geometry after EACH movement tool before deciding the next
+navigation action.
+
+Use this format:
+
+```text
+front: <RGB semantic evidence> + <explored/unexplored> + <graph-memory node/unknown>
+left: ...
+right: ...
+back: ...
+```
+
+Also state whether the current red-arrow pose is in a colored segmented area
+that already has a numbered memory node, or in an unmarked colored area.
+You need to re-identify the area node you currently in, since area segmentations and markers are subject to change on each movement.
+For an unmarked colored area, state whether it is semantically distinct from nearby
+marked areas; apply `go2-graph-memory-hierarchy` before the next movement when the
+area-node creation rule is satisfied.
+
+If the SLAM map shows a reachable unmarked or unexplored area/open boundary in
+any direction, include it in this status even when no graph node or semantic
+description names it. When an `A<N>` target includes captions, use them only as optional supporting evidence; captions may be absent in DimOS. Identify `A<N>` areas with the latest SLAM map, not by old `A<N>` labels from previous versions.
+Do not omit a frontier because it appears at the bottom side, or edge of the map image. Describe it by direction from the red arrow, not
+by screen position.
+
+## Route Workflow
+
+1. Before any navigation action, satisfy graph-memory startup reads and any
+   direct-observation write required by `go2-graph-memory-hierarchy`.
+2. Obtain a semantic candidate route through graph-memory tools and inspect the
+   relevant area nodes as required by `go2-graph-memory-hierarchy`.
+3. Read the latest SLAM map. For `static`, infer the current numbered node by
+   comparing current RGB with graph-node panoramas, landmarks, names, and
+   records. For `current`, use the red-arrow pose as the route origin even if
+   RGB seems to match a different graph node.
+4. Compare the semantic graph candidate with SLAM geometric candidates and state
+   one committed route or one committed exploration frontier.
+5. For known target navigation, state one committed route as
+   `start ID -> ... -> final ID`. Prefer to navigate directly by
+   `go2_navigate_to_memory_node`, if available, to the farthest node,
+   usually the final one, along the route. Use
+   `go2_navigate_to_memory_node` only as a navmesh-backed comparison/fallback.
+6. For unknown target exploration, choose among safe active frontiers, unentered
+   doorway approaches, and shortcuts toward unmapped space. Prefer to navigate directly by `go2_navigate_to_memory_node`, if available, to a chosen frontier `A<N>`. Fallback to available native visual/relative navigation tools if your frontier is unmarked or far from the marked positions.
+7. After every movement, first satisfy graph-memory direct-observation writes,
+   then use the post-movement observation to update local direction. Do not
+   create an independent competing route plan unless a replan trigger fires.
+
+## Replan Triggers
+
+This replan rule ONLY APPLIES when you are navigating to a clear target node.
+DO NOT use it when you are exploring for an unknown target.
+
+Replan only when the intended semantic transition is blocked or missing, current
+RGB contradicts the expected landmarks, the SLAM map marks the next route as
+blocked or unsafe, an unexpected area is reached, or a clearer SLAM shortcut is
+available. State the trigger, obtain the minimum graph-memory read needed, then
+make one new route commitment.
+
+When a live red-arrow pose exists and it disagrees with an RGB-only or
+graph-description-based location guess, do not jump to the RGB-matched graph
+node. Keep the SLAM pose as the current map origin and treat the semantic match
+as uncertain until direct movement or observation resolves it.
+"""
+
+GO2_GRAPH_MEMORY_REFERENCES = {
+    'node-schema.md': '# Node Schema\n\nEvery graph-memory node has this public shape:\n\n```json\n{\n  "id": "stable-node-id",\n  "kind": "area",\n  "name": "human readable exact name",\n  "description": "Area node. ... or Door node. ...",\n  "records": ["Directly observed facts, target evidence, and transition clues."],\n  "pano_images": {"front": "pano:...:front"}\n}\n```\n\nRules:\n\n- `id` is stable, lowercase, descriptive, and never changed after creation.\n- `kind` is exactly `area` or `door`. Use `area` for a functionally distinct\n  observed place and `door` only for observed semantic doors that divide areas.\n- Do not write `adjacents`, routes, paths, edge lists, or connectivity fields.\n- Put target evidence, object observations, search results, doorway visibility,\n  destination clues, and explored/unexplored state in `records`.\n- Do not create object/furniture/target nodes.\n- Do not put episode- or task-specific facts in `records`, such as "I start\n  from this area." Prefer durable navigation evidence, such as "Kitchen doorway\n  visible beside the marble island; unexplored."\n\nPanorama evidence:\n\n- Area panoramas should come from near the area center when reachable.\n- Door panoramas should come from the center of the exact traversable threshold.\n- If the doorway is visible only from an area, hall, or another doorway, omit\n  `pano_images` from that door write. Add it only after physically reaching and\n  centering in the exact threshold.\n- Do not replace a useful centered panorama with a worse wall-hugging or corner\n  view.\n',
+    'workflows.md': "# Graph Workflows\n\n## Startup\n\n1. If memory is empty, bootstrap it from the initial surround: create the current\n   functionally distinct area before the next navigation action and preserve any\n   directly visible semantic-door clue in `records`. If the current place cannot\n   yet be classified, take one move to a clearer viewpoint, then create/update it.\n2. If memory has nodes, call `go2_query_route_context()` before any graph write or\n   navigation action. Use the initial surround to match the current area or door\n   to an existing node; a new session's panorama references do not make a new\n   area. Create a node only after this read establishes that no existing node\n   matches the directly observed place.\n3. If current RGB/panorama evidence identifies the current stored node in a\n   graph-memory/SLAM relocation run, call `go2_report_graph_position(id)` before the\n   first navigation action. This gives DimOS SLAM a node prior.\n4. When candidate IDs are already known, call `go2_query_route_context()` once with\n   target/landmark `terms` and `inspect_ids`. It returns matching node summaries\n   and requested node details from one memory snapshot.\n5. Use full landmarks, records, and panoramas from candidate nodes to identify\n   semantic anchors. Inspect a door node only when an area's details cannot\n   distinguish the intended semantic doorway.\n6. State the relevant semantic anchors and visual clues. When\n   `go2-graph-slam-navigation` is active, provide those anchors and wait for SLAM/RGB\n   route fusion before entering committed-path mode.\n\n## Committed-Path Execution\n\nWhile following the route chosen from current RGB/depth and SLAM geometry, do not\nmake graph-memory reads at intended intermediate areas or doors. Follow live\nvisual landmarks and the committed route. Writes for direct new observations\nremain allowed.\n\nRead memory only when an accidental/unexpected encounter, route mismatch, missing\nor blocked intended door requires a replan or relocalization check. State the\nexception, make the minimum node read needed, decide a new movement route from\ncurrent visual/SLAM evidence, and resume committed-path execution.\n\n## Exploration\n\nAfter each movement, decide whether you are in an existing area, existing door,\nnew area, new door, or uncertain location.\n\nBefore the next navigation action, write memory whenever direct observation\nrevealed a new functional area, a semantic door threshold, a visible semantic\ndoor missing from the current area's records, or newly verified target evidence.\nThis write obligation is not optional route replanning and remains active with\n`go2-graph-slam-navigation`. If none of those facts were observed, state that no\ngraph write is due and continue.\n\nChoose exploration moves from visual heuristics and target-oriented inference.\nDo not treat graph coverage or panorama collection as an objective. When a room\ncan already be observed from its doorway or another viewpoint, do not enter it\nsolely to capture panoramas or create a node because the target has only a tiny\nvisual possibility of being there. Preserve the directly visible doorway clue in\nthe current area's records, and spend movement on stronger target evidence, a\nuseful unexplored frontier, or a materially plausible target hypothesis instead.\n\n- If the place is existing, update it instead of creating a duplicate.\n- If the place is new, create the appropriate `area` or `door` node.\n- When a newly observed door is still viewed from an area, create the door node\n  without `pano_images`. Do not attach the area's panorama to the door node.\n- Add door `pano_images` only after reaching and centering in that exact\n  threshold; then update the existing door node.\n- If an existing area reveals new doorways missing from `records`, add those\n  observations before leaving.\n- Do not write connectivity fields. Routes come from current RGB/depth and SLAM\n  geometry, not graph-memory paths.\n- State whether movement remained in the same area, crossed a semantic door,\n  entered a new area, or produced an unexpected encounter. Only the unexpected\n  case permits an extra graph-memory read during committed-path execution.\n\n## Long Narrow Hallways\n\nThe following rule applies only when there is not a remembered semantic anchor or\ndirection you are intentionally reaching.\n\nTreat long narrow hallways as area nodes, but move carefully:\n\n1. Stand near the hallway centerline, clear of both side walls.\n2. Create or update the hallway node from the centered view.\n3. Record every visible semantic side door as a stable record or door node.\n   Keep open side passages in the same area.\n4. Stop after each advance and re-check both sides.\n   Record any newly visible semantic doors before moving again.\n   Choose the most promising semantic doors to explore.\n5. Distinguish repeated similar doors with stable visual anchors and features of\n   the door itself. You can use SLAM maps to help locate your position if\n   provided.\n\n## Dense Doorway Areas\n\nWhen several openings are close together:\n\n- Add each semantic door as its own door node when directly observed. Do not\n  create door nodes for open pathways.\n- For each visible door, write records that include distinct visual features\n  with stable landmarks, what it appears to lead to, and explored/unexplored\n  state.\n- Include what is visible beyond the threshold and whether it is explored.\n- If you later notice a missing close doorway, update the area immediately.\n\n## Target Query\n\n1. Use `go2_query_route_context()` with target/context terms and candidate IDs to\n   select relevant semantic anchors.\n2. Inspect candidate nodes with `go2_inspect_graph_node(..., return_images=true)`\n   before committing. Use full details to choose stable landmarks and doorway\n   clues.\n3. Commit to a route from current RGB/depth and SLAM geometry, then execute it\n   without graph-memory reads at intended intermediate nodes.\n4. At each intended semantic anchor, compare the current view with the node's\n   stable landmarks, doorway/transition clues, and recorded evidence. Similar\n   furniture, doors, or layouts are not identity proof.\n5. If the view does not match the intended node, stop following that route. This\n   is an exception: read the minimum memory needed to identify the place or\n   semantic anchor, then plan a fresh route.\n6. Navigate using current visual evidence.\n7. If remembered evidence is wrong, update memory.\n8. Close achieved only from a current, clear, close visual verification.\n",
+    'examples.md': '# Examples\n\n## Area Node\n\n```json\n{\n  "id": "pink-bedroom-01",\n  "kind": "area",\n  "name": "pink accent bedroom",\n  "description": "Area node. Bedroom with a pink accent wall, white blinds over the window, a bed on one side, and a window ledge below the blinds.",\n  "records": [\n    "Entered and visually inspected this area.",\n    "Contains white blinds and a window ledge; possible laptop target context.",\n    "Open doorway beside the bed and below the white-blinds window leads toward the white bedroom hallway; explored.",\n    "Narrow dark passage beside the wall niche and glass cabinet leads to an unseen dark space; unexplored."\n  ],\n  "pano_images": {\n    "front": "pano:...:front",\n    "right": "pano:...:right",\n    "back": "pano:...:back",\n    "left": "pano:...:left"\n  }\n}\n```\n\n## Door Node With One Known Side\n\n```json\n{\n  "id": "door-white-hall-pink-bedroom-01",\n  "kind": "door",\n  "name": "doorway between white bedroom hall and pink bedroom",\n  "description": "Door node. Open doorway from the white bedroom hallway toward a bedroom with a pink accent wall and white blinds visible inside.",\n  "records": [\n    "White wall panels and metallic trim frame a long corridor on the hall side.",\n    "Pink accent wall and white blinds are visible beyond the threshold; the room beyond is unexplored."\n  ],\n  "pano_images": {}\n}\n```\n\n## Door Node After Centered Threshold View\n\n```json\n{\n  "id": "door-white-hall-pink-bedroom-01",\n  "kind": "door",\n  "name": "doorway between white bedroom hall and pink bedroom",\n  "description": "Door node. Threshold connecting the white bedroom hallway to the pink-accent bedroom.",\n  "records": [\n    "White wall panels and metallic trim identify the hallway side.",\n    "Pink accent wall, white blinds, bed, and window ledge identify the bedroom side.",\n    "Both sides of the threshold have been visually inspected."\n  ],\n  "pano_images": {\n    "hall_side": "pano:...:front",\n    "room_side": "pano:...:back"\n  }\n}\n```\n',
+    'tool-interface.md': '# Tool Interface\n\nUse these MCP tools after `go2_start_navigation_episode`.\n\n## `go2_list_graph_nodes()`\n\nList concise summaries of all known nodes. Use before choosing initial semantic\nanchors, or after an accidental encounter or route mismatch requires\nrelocalization. Do not use during normal committed-path execution.\n\n## `go2_grep_graph_node(term)`\n\nSearch node names, descriptions, and records. Use it only to choose initial\nsemantic anchors or replan after an exception.\n\n## `go2_inspect_graph_node(id, return_images=true)`\n\nInspect a node. Use `return_images=true` when comparing current observation to a\nremembered area/door, choosing between similar doors, or validating target\nevidence while planning. Do not read it at intended intermediate nodes on a\ncommitted path.\n\n## `go2_report_graph_position(id)`\n\nReport the graph node ID you believe you are physically at or inside. The tool\nreturns the full public node details only; it does not return neighboring nodes,\npaths, or route suggestions. In graph-memory/SLAM relocation runs, this call also\nrecords an agentic DimOS SLAM relocation prior when the node has a stored SLAM\npose.\n\nAt episode start, if memory is not empty and current RGB/panorama evidence\nmatches one stored node, call this before the first navigation action. If the\nlatest SLAM map reports relocation status `collecting`, call it again after any\nnew observation or movement that lets you identify the current stored node; do\nnot wait passively for relocation to accumulate enough points when you can\nprovide this prior.\n\nOutside startup/relocation, use it after an accidental encounter, visual route\nmismatch, or another exception requires relocalization. Never call it merely\nbecause you reached an intended known node on a committed path. If the report\ndoes not match current visual evidence, say the position is uncertain and gather\nmore evidence before relying on that memory.\n\n## `go2_query_route_context(...)`\n\nRead several related memory facts from one consistent node-only snapshot. Prefer\nit when choosing initial semantic anchors or replanning after an exception.\nArguments:\n\n```json\n{\n  "terms": ["laptop", "white blinds", "pink bedroom"],\n  "inspect_ids": ["known-target-area"],\n  "return_images": true\n}\n```\n\n- `terms` returns matches for every target or landmark term.\n- `inspect_ids` returns full details for known IDs.\n- `return_images=false` omits raw `pano_images` from inspected nodes.\n- Unknown `inspect_ids` fail the whole call with a graph-memory error.\n- The response never contains `current_node_id`, `depth`, `paths`,\n  `current_context`, or `adjacent_nodes`.\n\nDo not use this tool to guess your current node from a visual frame. First use\ncurrent visual evidence and known memory IDs. If an ID or term must be chosen\nfrom a prior response, make that dependency explicit and use the follow-up read.\n\n## `go2_apply_graph_mutations(node)`\n\nAdd a new node or partially update an existing node. New nodes require `id`,\n`kind`, `name`, and `description`; `records` and `pano_images` default to empty\ncontainers.\n\n## `go2_apply_graph_mutations(id, node)`\n\nPartially update mutable attributes of an existing node. Use it to add target\nevidence, add doorway observations, correct wrong notes, or refresh better\npanorama evidence. Mutable fields are `name`, `description`, `records`, and\n`pano_images`. When updating list fields, first inspect the node and preserve\nitems that should remain.\n\n## `go2_apply_graph_mutations(mutations)`\n\nAtomically apply a non-empty ordered array of node mutations. Use it to avoid\nseparate calls when several independent graph writes are already fully known.\nEvery mutation is one of:\n\n```json\n{"op": "create", "node": {"id": "...", "kind": "area", "name": "...", "description": "...", "records": [], "pano_images": {}}}\n{"op": "create", "node": {"id": "...", "kind": "door", "name": "...", "description": "...", "records": [], "pano_images": {}}}\n{"op": "upsert", "node": {"id": "...", "records": ["..."]}}\n{"op": "update", "id": "...", "node": {"records": ["..."]}}\n```\n\nThe server validates the final node set and saves nothing if any mutation is\ninvalid. Do not batch mutations whose facts or IDs depend on a prior tool result.\nOn success, `affected_nodes` returns the final complete state of every distinct\nnode created, updated, or upserted by the batch; raw `pano_images` are omitted.\nUse these snapshots immediately to verify semantic area boundaries before\ncontinuing.\n\n## `go2_apply_graph_mutations(node)`\n\nAdd one complete node and fail if the ID already exists. Prefer\n`go2_apply_graph_mutations(node)` unless duplicate failure is specifically useful.\n\n## `go2_apply_graph_mutations(id)`\n\nDelete only accidental duplicates or clearly invalid observations.\n',
+}
+
+GO2_GRAPH_SLAM_NAVIGATION_REFERENCES = {
+    'route-fusion.md': "# Route Fusion Workflow\n\nThis reference is the detailed integration workflow for `go2-graph-slam-navigation`.\nIt does not redefine graph-memory schema or SLAM map legend. Use\n`go2-graph-memory-hierarchy` as the canonical source for memory writes and\n`go2-2d-slam` as the canonical source for map status, geometry limits, and frontier\ndefinitions.\n\n## Evidence Priority\n\n- Semantic area and door identity: current RGB first, then graph-memory\n  panoramas, landmarks, and records.\n- Current map location when a live pose exists: the SLAM red-arrow pose first,\n  then RGB and graph-memory matching only as supporting evidence.\n- Semantic route anchors: graph-memory nodes and directly observed semantic\n  transitions.\n- Local route geometry and shortcut candidates: 2D SLAM occupancy evidence.\n- Immediate collision and traversability: current RGB/depth over stale map\n  geometry.\n- Unknown-target exploration priority: safe active SLAM frontiers first,\n  unentered doorway approaches second, shortcuts toward unmapped space third,\n  known numbered-node routes last unless they are waypoints to a frontier.\n\n## Map Status Use\n\nUse `go2-2d-slam` for the canonical status meanings. Route fusion applies those\nstatuses this way:\n\n- `current`: treat the red-arrow pose as the route origin. If RGB appears to\n  match a different graph node, mark that semantic match uncertain instead of\n  relocating the agent by language/appearance alone.\n- `static`: infer the current node from current RGB plus graph memory before\n  using it as the route origin.\n- `pending`: proceed from current RGB/depth and graph memory until a map\n  arrives.\n- `collecting`, `matching`, or `anchoring`: use the static-map workflow; do not\n  wait solely for a live pose marker. If status is `collecting` and RGB plus\n  graph memory identifies the current stored node, apply\n  `go2-graph-memory-hierarchy`'s `go2_report_graph_position(id)` relocation-prior rule.\n\n## Route Decision Record\n\nBefore movement, state one concise record:\n\n```text\nsemantic candidate: dining room -> doorway -> kitchen\nSLAM candidate: 1 -> 2 -> 4\nnext transition: opening beside the window bench, forward-right\ndecision: commit to the kitchen route\n```\n\nFor unknown-target exploration, the `SLAM candidate` line must include the\nnearest active SLAM frontier from the red-arrow pose. If a visible frontier is\nnot chosen, the `decision` line must name the concrete blocker or the\nhigher-priority frontier. Do not select a route through already explored\nnumbered nodes merely because graph memory has names for them.\n\nDo not invent semantic destinations from occupancy pixels. A shortcut can be\ngeometrically selected without graph-memory connectivity, but create or update\ngraph area/door facts only after direct observation.\n\nAvoid RGB-only map relocalization when a live SLAM pose is present. Graph memory\ndescriptions and panoramas can be too sparse to distinguish similar areas, so an\nappearance match that conflicts with the red-arrow map position is a warning\nabout aliasing, not permission to switch the current node.\n\n## Post-Movement Fusion Loop\n\nAt each movement response:\n\n1. Classify direct graph-memory facts before routing. If you entered a new\n   functional area, reached a semantic door threshold, observed a new semantic\n   door, or verified target evidence, write the corresponding graph update\n   before the next navigation action.\n2. Apply `go2-graph-memory-hierarchy`'s segmentation-gated area creation rule when\n   the latest SLAM map is colored by area segmentation. Never pre-create a node\n   for a colored frontier or adjacent colored region before entering it.\n3. Perform the `go2-graph-slam-navigation` post-movement observation in front, left,\n   right, and back directions.\n4. Compare current RGB and SLAM geometry against the expected next transition.\n5. Continue the committed route when evidence is consistent. Replan only when a\n   listed trigger fires.\n\n## Known Target Commitment\n\nFor a known target, commit to one semantic route from the current node or live\nSLAM pose toward the target evidence. Prefer `go2_navigate_to_memory_node`,\nif available, to the farthest useful node along the committed route, usually\nthe final target-side node. Use `go2_navigate_to_memory_node` only as a\nnavmesh-backed comparison/fallback. Use SLAM geometry to reject blocked edges,\nchoose safe shortcuts, and select the next local transition.\n\nDo not repeatedly read memory at intended intermediate nodes while following\nthe route correctly. Reads during committed execution are reserved for an\naccidental or unexpected encounter, a visual route mismatch, or a blocked or\nmissing intended transition.\n\n## Unknown Target Exploration\n\nWhen there is no committed target-node route and the agent is exploring, commit\nto the selected frontier until it is entered, blocked by current RGB/depth, or\nsuperseded by a closer safe frontier discovered from the current pose.\n\nKnown graph nodes are semantic anchors and possible waypoints to the selected\nfrontier. They are not default exploration goals.\n\n## Replan Triggers\n\nFor known-target routes, replan only when one of these occurs:\n\n- the intended semantic transition is blocked or missing;\n- current RGB contradicts the expected landmarks;\n- the SLAM map marks the next route as blocked or unsafe;\n- an unexpected area is reached;\n- a materially clearer SLAM shortcut is available.\n\nFor unknown-target exploration, do not treat every new frontier as a global\nreplan. Continue the selected frontier unless it is entered, blocked/unsafe, no\nlonger reachable from the current pose, already audited, or superseded by a\ncloser safe frontier.\n",
+}
+
+
+def _canonical_skill_text(name: str, fallback: str) -> str:
+    """Load versioned repo skills when present, retaining embedded fallback."""
+    root = Path(__file__).resolve().parents[3] / "skills" / name
+    path = root / "SKILL.md"
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return fallback
+
+
+def _canonical_skill_references(
+    name: str, fallback: dict[str, str]
+) -> dict[str, str]:
+    root = Path(__file__).resolve().parents[3] / "skills" / name / "references"
+    result: dict[str, str] = {}
+    for filename, text in fallback.items():
+        try:
+            result[filename] = (root / filename).read_text(encoding="utf-8")
+        except OSError:
+            result[filename] = text
+    return result
+
+
+# Repo-backed skills are canonical; embedded text remains available for wheels
+# and deployments that omit the source tree.
+GO2_GRAPH_MEMORY_SKILL_TEXT = _canonical_skill_text(
+    "go2-graph-memory-hierarchy", GO2_GRAPH_MEMORY_SKILL_TEXT
+)
+GO2_2D_SLAM_SKILL_TEXT = _canonical_skill_text("go2-2d-slam", GO2_2D_SLAM_SKILL_TEXT)
+GO2_GRAPH_SLAM_NAVIGATION_SKILL_TEXT = _canonical_skill_text(
+    "go2-graph-slam-navigation", GO2_GRAPH_SLAM_NAVIGATION_SKILL_TEXT
+)
+GO2_GRAPH_MEMORY_REFERENCES = _canonical_skill_references(
+    "go2-graph-memory-hierarchy", GO2_GRAPH_MEMORY_REFERENCES
+)
+GO2_GRAPH_SLAM_NAVIGATION_REFERENCES = _canonical_skill_references(
+    "go2-graph-slam-navigation", GO2_GRAPH_SLAM_NAVIGATION_REFERENCES
 )
 
+GO2_LONG_INSTRUCTION_POLICY_TEXT = """
+
+""".strip()
 
 MINIMAL_CODEX_ROOT_KEYS = (
     "model_provider",
     "model",
+    "preferred_auth_method",
     "model_reasoning_effort",
     "model_reasoning_summary",
     "model_verbosity",
     "model_context_window",
     "model_auto_compact_token_limit",
+    "disable_response_storage",
     "service_tier",
     "web_search",
 )
 
 MINIMAL_CODEX_TABLE_KEYS = ("sandbox_workspace_write",)
-
-# These can discover account-level or plugin-provided MCP servers even with a
-# fresh CODEX_HOME. Keep the robot run limited to its explicit DimOS endpoint.
-DISABLED_CODEX_FEATURES = ("hooks", "memories", "apps", "plugins", "remote_plugin")
 
 _SAFE_PROVIDER_KEYS = {
     "name",
@@ -210,8 +1006,22 @@ class CodexHarnessRun:
     drive_go2_workspace_skill_path: Path | None = None
     go2_pixelgoal_workspace_skill_path: Path | None = None
     global_navigation_pixelgoal_workspace_skill_path: Path | None = None
+    go2_graph_memory_skill_path: Path | None = None
+    go2_graph_memory_workspace_skill_path: Path | None = None
+    go2_2d_slam_skill_path: Path | None = None
+    go2_2d_slam_workspace_skill_path: Path | None = None
+    go2_graph_slam_navigation_skill_path: Path | None = None
+    go2_graph_slam_navigation_workspace_skill_path: Path | None = None
+    graph_memory_path: Path | None = None
+    slam_status_path: Path | None = None
+    prior_run_root: Path | None = None
+    prior_run_artifacts: dict[str, Any] | None = None
+    prior_graph_seed: dict[str, Any] | None = None
+    initial_slam_status_path: Path | None = None
+    initial_relocalization_bundle: Path | None = None
     authority_envelope: dict[str, Any] | None = None
     battery_gate: dict[str, Any] = field(default_factory=dict)
+    live_environment_preflight: dict[str, str] = field(default_factory=dict)
     copied_auth_files: list[str] = field(default_factory=list)
 
     def model_dump(self) -> dict[str, Any]:
@@ -268,8 +1078,48 @@ class CodexHarnessRun:
             )
             if self.global_navigation_pixelgoal_workspace_skill_path is not None
             else None,
+            "go2_graph_memory_skill_path": str(self.go2_graph_memory_skill_path)
+            if self.go2_graph_memory_skill_path is not None
+            else None,
+            "go2_graph_memory_workspace_skill_path": str(self.go2_graph_memory_workspace_skill_path)
+            if self.go2_graph_memory_workspace_skill_path is not None
+            else None,
+            "go2_2d_slam_skill_path": str(self.go2_2d_slam_skill_path)
+            if self.go2_2d_slam_skill_path is not None
+            else None,
+            "go2_2d_slam_workspace_skill_path": str(self.go2_2d_slam_workspace_skill_path)
+            if self.go2_2d_slam_workspace_skill_path is not None
+            else None,
+            "go2_graph_slam_navigation_skill_path": str(
+                self.go2_graph_slam_navigation_skill_path
+            )
+            if self.go2_graph_slam_navigation_skill_path is not None
+            else None,
+            "go2_graph_slam_navigation_workspace_skill_path": str(
+                self.go2_graph_slam_navigation_workspace_skill_path
+            )
+            if self.go2_graph_slam_navigation_workspace_skill_path is not None
+            else None,
+            "graph_memory_path": str(self.graph_memory_path)
+            if self.graph_memory_path is not None
+            else None,
+            "slam_status_path": str(self.slam_status_path)
+            if self.slam_status_path is not None
+            else None,
+            "prior_run_root": str(self.prior_run_root)
+            if self.prior_run_root is not None
+            else None,
+            "prior_run_artifacts": self.prior_run_artifacts,
+            "prior_graph_seed": self.prior_graph_seed,
+            "initial_slam_status_path": str(self.initial_slam_status_path)
+            if self.initial_slam_status_path is not None
+            else None,
+            "initial_relocalization_bundle": str(self.initial_relocalization_bundle)
+            if self.initial_relocalization_bundle is not None
+            else None,
             "authority_envelope": self.authority_envelope,
             "battery_gate": self.battery_gate,
+            "live_environment_preflight": self.live_environment_preflight,
             "copied_auth_files": list(self.copied_auth_files),
         }
         return payload
@@ -301,6 +1151,9 @@ def prepare_codex_harness_run(
     authority_allowed_movement_tools: tuple[str, ...] | list[str] = (),
     max_movement_calls: int | None = None,
     mcp_smoke_required: bool | None = None,
+    prior_run_root: Path | None = None,
+    initial_slam_status_path: Path | None = None,
+    initial_relocalization_bundle: Path | None = None,
 ) -> CodexHarnessRun:
     """Prepare a run-local ``codex exec`` invocation for DimOS MCP.
 
@@ -316,8 +1169,12 @@ def prepare_codex_harness_run(
         raise ValueError("mcp_url must not be empty")
     if mode not in {"readonly", "authority-proxy", "admin-override-debug"}:
         raise ValueError("mode must be readonly, authority-proxy, or admin-override-debug")
-    if prompt_mode != "default":
-        raise ValueError("this release supports only the memory-free default prompt mode")
+    if prompt_mode not in {"default", "long_instruction"}:
+        raise ValueError("prompt_mode must be default or long_instruction")
+    if prompt_mode == "long_instruction" and mode == "readonly":
+        raise ValueError(
+            "long_instruction prompt mode requires movement-capable authority-proxy mode"
+        )
     if codex_exec_timeout_s is not None and codex_exec_timeout_s <= 0.0:
         raise ValueError("codex_exec_timeout_s must be positive when set")
     if mcp_smoke_timeout_s is not None and mcp_smoke_timeout_s <= 0.0:
@@ -332,7 +1189,7 @@ def prepare_codex_harness_run(
         else ()
     )
     pixelgoal_enabled = "pixelgoal_navigate" in allowed_movement_tools
-    if pixelgoal_enabled:
+    if pixelgoal_enabled and prompt_mode != "long_instruction":
         prompt_mode = "default"
 
     run_root = run_root.expanduser().resolve()
@@ -357,10 +1214,14 @@ def prepare_codex_harness_run(
         model=model,
         model_reasoning_effort=model_reasoning_effort,
         service_tier=service_tier,
-        mcp_tool_timeout_sec=(320 if "pixelgoal_navigate" in allowed_movement_tools else None),
+        mcp_tool_timeout_sec=(
+            320 if "pixelgoal_navigate" in allowed_movement_tools else None
+        ),
     )
     effective_codex_config = _load_codex_config(config_path)
-    drive_go2_skill_path = None if pixelgoal_enabled else _write_drive_go2_skill(codex_home)
+    drive_go2_skill_path = (
+        None if pixelgoal_enabled else _write_drive_go2_skill(codex_home)
+    )
     drive_go2_workspace_skill_path = (
         None if pixelgoal_enabled else _write_workspace_drive_go2_skill(workspace)
     )
@@ -368,7 +1229,39 @@ def prepare_codex_harness_run(
         _write_workspace_go2_pixelgoal_skill(workspace) if pixelgoal_enabled else None
     )
     global_navigation_pixelgoal_workspace_skill_path = (
-        _write_workspace_global_navigation_pixelgoal_skill(workspace) if pixelgoal_enabled else None
+        _write_workspace_global_navigation_pixelgoal_skill(workspace)
+        if pixelgoal_enabled
+        else None
+    )
+    go2_graph_memory_skill_path = (
+        _write_go2_graph_memory_skill(codex_home)
+        if prompt_mode == "long_instruction"
+        else None
+    )
+    go2_graph_memory_workspace_skill_path = (
+        _write_workspace_go2_graph_memory_skill(workspace)
+        if prompt_mode == "long_instruction"
+        else None
+    )
+    go2_2d_slam_skill_path = (
+        _write_go2_2d_slam_skill(codex_home)
+        if prompt_mode == "long_instruction"
+        else None
+    )
+    go2_2d_slam_workspace_skill_path = (
+        _write_workspace_go2_2d_slam_skill(workspace)
+        if prompt_mode == "long_instruction"
+        else None
+    )
+    go2_graph_slam_navigation_skill_path = (
+        _write_go2_graph_slam_navigation_skill(codex_home)
+        if prompt_mode == "long_instruction"
+        else None
+    )
+    go2_graph_slam_navigation_workspace_skill_path = (
+        _write_workspace_go2_graph_slam_navigation_skill(workspace)
+        if prompt_mode == "long_instruction"
+        else None
     )
     prompt = codex_goal_prompt(
         task=task,
@@ -415,6 +1308,35 @@ def prepare_codex_harness_run(
     mcp_smoke_log_path = logs_dir / "mcp-smoke.jsonl"
     mcp_smoke_stderr_path = logs_dir / "mcp-smoke.stderr"
     mcp_smoke_result_path = logs_dir / "mcp-smoke-result.json"
+    graph_memory_path = (
+        logs_dir / "go2-graph-memory.json"
+        if prompt_mode == "long_instruction"
+        else None
+    )
+    slam_status_path = (
+        logs_dir / "go2-slam-status.json"
+        if prompt_mode == "long_instruction"
+        else None
+    )
+    prior_artifacts = resolve_go2_prior_run(prior_run_root)
+    prior_graph_seed = seed_go2_prior_graph_memory(
+        prior_artifacts,
+        graph_memory_path=graph_memory_path,
+    )
+    resolved_initial_slam_status_path = (
+        initial_slam_status_path.expanduser().resolve()
+        if initial_slam_status_path is not None
+        else prior_artifacts.slam_status_path
+        if prior_artifacts is not None
+        else None
+    )
+    resolved_initial_relocalization_bundle = (
+        initial_relocalization_bundle.expanduser().resolve()
+        if initial_relocalization_bundle is not None
+        else prior_artifacts.relocalization_bundle_path
+        if prior_artifacts is not None
+        else None
+    )
     shareable_summary_path = logs_dir / "shareable-summary.json"
     shareable_summary_markdown_path = logs_dir / "shareable-summary.md"
     env = {
@@ -457,6 +1379,10 @@ def prepare_codex_harness_run(
             allowed_movement_tools=allowed_movement_tools,
             max_movement_calls=max_movement_calls,
             tool_profile_name=resolved_tool_profile.name,
+            graph_memory_path=graph_memory_path,
+            slam_status_path=slam_status_path,
+            initial_slam_status_path=resolved_initial_slam_status_path,
+            initial_relocalization_bundle=resolved_initial_relocalization_bundle,
         )
         if mode == "authority-proxy"
         else None
@@ -506,8 +1432,26 @@ def prepare_codex_harness_run(
         global_navigation_pixelgoal_workspace_skill_path=(
             global_navigation_pixelgoal_workspace_skill_path
         ),
+        go2_graph_memory_skill_path=go2_graph_memory_skill_path,
+        go2_graph_memory_workspace_skill_path=go2_graph_memory_workspace_skill_path,
+        go2_2d_slam_skill_path=go2_2d_slam_skill_path,
+        go2_2d_slam_workspace_skill_path=go2_2d_slam_workspace_skill_path,
+        go2_graph_slam_navigation_skill_path=go2_graph_slam_navigation_skill_path,
+        go2_graph_slam_navigation_workspace_skill_path=(
+            go2_graph_slam_navigation_workspace_skill_path
+        ),
+        graph_memory_path=graph_memory_path,
+        slam_status_path=slam_status_path,
+        prior_run_root=prior_artifacts.run_root if prior_artifacts is not None else None,
+        prior_run_artifacts=(
+            prior_artifacts.model_dump() if prior_artifacts is not None else None
+        ),
+        prior_graph_seed=prior_graph_seed,
+        initial_slam_status_path=resolved_initial_slam_status_path,
+        initial_relocalization_bundle=resolved_initial_relocalization_bundle,
         authority_envelope=authority_envelope,
         battery_gate=_battery_gate_audit(),
+        live_environment_preflight=dict(GO2_LIVE_ENV_PREFLIGHT),
         copied_auth_files=copied_auth_files,
     )
     _write_launch_audit(prepared)
@@ -535,7 +1479,7 @@ def codex_mcp_smoke_prompt(
         f"When comparing tool names, strip the exact `{tool_prefix}` prefix from both required and available names; bare and prefixed forms are equivalent.",
         "If any required DimOS MCP tool is not visible/callable, stop immediately and answer:",
         "DIMOS_MCP_SMOKE: FAIL missing=<comma-separated missing mcp__dimos__ tool names>",
-        "If all required tools are visible, call only these read-only/status tools before passing: go2_robot_status, motion_safety_status, observe, and last_motion_diagnostics.",
+        "If all required tools are visible, call only these read-only/status tools before passing: go2_robot_status, motion_safety_status, observe, last_motion_diagnostics, go2_list_graph_nodes, and go2_relocalization_status.",
         "Do not call movement or posture tools during this visibility gate; those are checked for visibility only before hardware movement.",
         "After the read-only checks, answer exactly one final line:",
         "DIMOS_MCP_SMOKE: PASS tools=<comma-separated required mcp tool names>",
@@ -557,18 +1501,23 @@ def _mcp_smoke_required_tools(
         "go2_robot_status",
         "motion_safety_status",
         "last_motion_diagnostics",
-        "stop_movement",
     )
     if mode != "authority-proxy":
         return DEFAULT_MCP_SMOKE_REQUIRED_TOOLS
+    long_instruction_tools = (
+        LONG_INSTRUCTION_MCP_SMOKE_REQUIRED_TOOLS
+        if prompt_mode == "long_instruction"
+        and "pixelgoal_navigate" not in allowed_movement_tools
+        else ()
+    )
     pixelgoal_tools = (
-        ("observe_surround", "pixelgoal_status", "pixelgoal_stop")
+        ("observe_surround", "pixelgoal_status")
         if "pixelgoal_navigate" in allowed_movement_tools
         else ()
     )
     return tuple(
         dict.fromkeys(
-            (*read_tools, *allowed_movement_tools, *pixelgoal_tools)
+            (*read_tools, *allowed_movement_tools, *pixelgoal_tools, *long_instruction_tools)
         )
     )
 
@@ -709,7 +1658,9 @@ def run_direct_mcp_smoke_gate(
     """Run the live preflight directly against MCP without an LLM inference."""
 
     required_bare = tuple(
-        dict.fromkeys(_bare_mcp_tool_name(tool, server_name=server_name) for tool in required_tools)
+        dict.fromkeys(
+            _bare_mcp_tool_name(tool, server_name=server_name) for tool in required_tools
+        )
     )
     required_mcp = tuple(
         _codex_mcp_tool_name(tool, server_name=server_name) for tool in required_bare
@@ -1049,36 +2000,59 @@ def codex_goal_prompt(
         "For visual claims, use direct MCP observe/image tool outputs that are visible to the model, not a human description.",
     ]
     if pixelgoal_enabled:
-        lines.extend(
-            [
-                (
-                    "Use the run-local `global-navigation-pixelgoal` skill for search "
-                    "and `go2-pixelgoal` for safe point selection. Read "
-                    "`.agents/skills/global-navigation-pixelgoal/SKILL.md` and "
-                    "`.agents/skills/go2-pixelgoal/SKILL.md` before moving."
-                ),
-                (
-                    "For map-backend results, exploration_complete means inspect the "
-                    "returned views and choose again. Multi-leg exploration uses up to "
-                    "4 m per leg, a default 60 s hop deadline, and a 10 m exploration budget. "
-                    "deadline_exceeded also requires fresh views before the next point. "
-                    "no_progress or exploration_failed "
-                    "means reassess the obstruction before moving; never blindly retry "
-                    "the same point or doorway. Operator/safety stops override exploration."
-                ),
-                (
-                    "Call `pixelgoal_navigate` directly on the `dimos` MCP server. "
-                    "Use the shell only to read skill files."
-                ),
-                (
-                    "Stop discipline: for find/search tasks, target merely appearing "
-                    "is not success. If it is distant or small, approach via safe "
-                    "visible floor proxies until it is close enough for "
-                    "human-verifiable identity; never click the target itself."
-                ),
-                "",
-            ]
-        )
+        if prompt_mode != "long_instruction":
+            lines.extend(
+                [
+                    (
+                        "Read and use run-local `global-navigation-pixelgoal` for search "
+                        "and `go2-pixelgoal` for safe point selection."
+                    ),
+                    (
+                        "Call `pixelgoal_navigate` directly on the `dimos` MCP server. "
+                        "Use the shell only to read skill files."
+                    ),
+                    (
+                        "Environment prior: the test area is an office pocket connected "
+                        "to the broader space by a hallway beside the wooden cabinets. "
+                        "Treat clear floor beside the wooden cabinets as a high-priority "
+                        "frontier when it is visible; do not spend repeated hops auditing "
+                        "the same office pocket while that hallway remains unexplored."
+                    ),
+                    (
+                        "Stop discipline: for find/search tasks, target merely appearing "
+                        "is not success. If it is distant or small, approach via safe "
+                        "visible floor proxies until it is close enough for "
+                        "human-verifiable identity; never click the target itself."
+                    ),
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    (
+                        "Read and use `go2-pixelgoal` for safe point selection."
+                    ),
+                    (
+                        "Call `pixelgoal_navigate` directly on the `dimos` MCP server. "
+                        "Use the shell only to read skill files."
+                        "Treat `go2-pixelgoal` as primitive movement tool, prefer to use"
+                        " `go2_navigate_to_memory_node` if possible."
+                    ),
+                    (
+                        "Environment prior: the test area is at the first floor of a building with a circular corrider."
+                        "Officies, stairs, restrooms, etc. are located beside the corrider."
+                        "The first floor is 2 meters above the outdoor ground. One can go outside through the stairs or the ramp."
+                    ),
+                    (
+                        "Stop discipline: for find/search tasks, target merely appearing "
+                        "is not success. If it is distant or small, approach via safe "
+                        "visible floor proxies until it is close enough for "
+                        "human-verifiable identity; never click the target itself."
+                    ),
+                    "",
+                ]
+            )
     else:
         lines.extend(
             [
@@ -1090,7 +2064,48 @@ def codex_goal_prompt(
                 "",
             ]
         )
-    if tool_profile is not None and not pixelgoal_enabled:
+    if prompt_mode == "long_instruction":
+        lines.extend(
+            [
+                "go2-graph-memory-hierarchy, go2-2d-slam, and go2-graph-slam-navigation skills and their references are embedded in the prompt, which does not requires additional read from disk."
+                "Follow the run-local go2-graph-memory-hierarchy skill when recording or "
+                "reusing long-horizon route memory.",
+                # "The skill file is written at `.agents/skills/go2-graph-memory-hierarchy/SKILL.md`; "
+                # "the same essential notes are embedded below so MCP-only runs do not "
+                # "need shell/file access to read them.",
+                "",
+                "Embedded go2-graph-memory-hierarchy operating skill:",
+                GO2_GRAPH_MEMORY_SKILL_TEXT.strip(),
+                "",
+                "Follow the run-local go2-2d-slam skill when movement responses include "
+                "current 2D SLAM map evidence.",
+                # "The skill file is written at `.agents/skills/go2-2d-slam/SKILL.md`; "
+                # "the same essential notes are embedded below so MCP-only runs do not "
+                # "need shell/file access to read them.",
+                "",
+                "Embedded go2-2d-slam operating skill:",
+                GO2_2D_SLAM_SKILL_TEXT.strip(),
+                "",
+                "Follow the run-local go2-graph-slam-navigation skill when graph memory "
+                "and SLAM map evidence are both available.",
+                # "The skill file is written at `.agents/skills/go2-graph-slam-navigation/SKILL.md`; "
+                # "the same essential notes are embedded below so MCP-only runs do not "
+                # "need shell/file access to read them.",
+                "",
+                "Embedded go2-graph-slam-navigation operating skill:",
+                GO2_GRAPH_SLAM_NAVIGATION_SKILL_TEXT.strip(),
+                "",
+                "Embedded go2-graph-memory-hierarchy references:",
+                _embedded_skill_references(GO2_GRAPH_MEMORY_REFERENCES),
+                "",
+                "Embedded go2-graph-slam-navigation references:",
+                _embedded_skill_references(GO2_GRAPH_SLAM_NAVIGATION_REFERENCES),
+                "",
+                GO2_LONG_INSTRUCTION_POLICY_TEXT,
+                "",
+            ]
+        )
+    if tool_profile is not None:
         lines.extend(go2_harness_profile_prompt_lines(tool_profile))
         lines.append("")
     if mode == "readonly":
@@ -1109,7 +2124,7 @@ def codex_goal_prompt(
         lines.extend(
             [
                 "Before doing substantive work, call the built-in create_goal tool with the task objective above.",
-                'Do not call get_goal immediately after create_goal; use get_goal/update_goal only after context loss or when progress needs re-anchoring. Call update_goal(status="complete") only when the task is actually complete, or status="blocked" only at a true impasse.',
+                "Do not call get_goal immediately after create_goal; use get_goal/update_goal only after context loss or when progress needs re-anchoring. Call update_goal(status=\"complete\") only when the task is actually complete, or status=\"blocked\" only at a true impasse.",
             ]
         )
     return "\n".join(lines) + "\n"
@@ -1181,7 +2196,7 @@ def write_run_local_codex_config(
     if mcp_tool_timeout_sec is not None:
         mcp_config["tool_timeout_sec"] = mcp_tool_timeout_sec
     _write_toml_table(lines, f"mcp_servers.{server_name}", mcp_config)
-    _write_toml_table(lines, "features", dict.fromkeys(DISABLED_CODEX_FEATURES, False))
+    _write_toml_table(lines, "features", {"hooks": False, "memories": False})
 
     config_path = codex_home / "config.toml"
     config_path.write_text("\n".join(lines), encoding="utf-8")
@@ -1286,6 +2301,10 @@ def _authority_proxy_command(
     allowed_movement_tools: tuple[str, ...] | list[str],
     max_movement_calls: int | None,
     tool_profile_name: str,
+    graph_memory_path: Path | None = None,
+    slam_status_path: Path | None = None,
+    initial_slam_status_path: Path | None = None,
+    initial_relocalization_bundle: Path | None = None,
 ) -> list[str]:
     parsed = urlparse(proxy_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or not parsed.port:
@@ -1315,29 +2334,123 @@ def _authority_proxy_command(
         command.extend(["--tool-profile", tool_profile_name])
     if max_movement_calls is not None:
         command.extend(["--max-movement-calls", str(max_movement_calls)])
+    if graph_memory_path is not None:
+        command.extend(["--graph-memory-path", str(graph_memory_path)])
+    if slam_status_path is not None:
+        command.extend(["--slam-status-path", str(slam_status_path)])
+    if initial_slam_status_path is not None:
+        command.extend(["--initial-slam-status-path", str(initial_slam_status_path)])
+    if initial_relocalization_bundle is not None:
+        command.extend(["--initial-relocalization-bundle", str(initial_relocalization_bundle)])
     return command
 
 
 def _dimos_cli_command() -> list[str]:
-    """Run the proxy with the same interpreter as the operator."""
+    """Prefer the promoted runtime venv when Jetson wrappers provide one."""
 
-    return [sys.executable, "-m", "dimos.robot.cli.dimos"]
+    dimos_venv = os.environ.get("DIMOS_VENV")
+    if dimos_venv:
+        return [str(Path(dimos_venv).expanduser() / "bin" / "dimos")]
+    return ["uv", "run", "dimos"]
 
 
 def _write_drive_go2_skill(codex_home: Path) -> Path:
-    return copy_skill("drive-go2", codex_home / "skills")
+    skill_dir = codex_home / "skills" / "drive-go2"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text(DRIVE_GO2_SKILL_TEXT, encoding="utf-8")
+    return skill_path
 
 
 def _write_workspace_drive_go2_skill(workspace: Path) -> Path:
-    return copy_skill("drive-go2", workspace / ".agents" / "skills")
+    skill_dir = workspace / ".agents" / "skills" / "drive-go2"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text(DRIVE_GO2_SKILL_TEXT, encoding="utf-8")
+    return skill_path
 
 
 def _write_workspace_go2_pixelgoal_skill(workspace: Path) -> Path:
-    return copy_skill("go2-pixelgoal", workspace / ".agents" / "skills")
+    skill_dir = workspace / ".agents" / "skills" / "go2-pixelgoal"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text(GO2_PIXELGOAL_SKILL_TEXT, encoding="utf-8")
+    return skill_path
 
 
 def _write_workspace_global_navigation_pixelgoal_skill(workspace: Path) -> Path:
-    return copy_skill("global-navigation-pixelgoal", workspace / ".agents" / "skills")
+    skill_dir = workspace / ".agents" / "skills" / "global-navigation-pixelgoal"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text(GO2_GLOBAL_NAVIGATION_PIXELGOAL_SKILL_TEXT, encoding="utf-8")
+    _write_skill_references(skill_dir, GO2_GLOBAL_NAVIGATION_PIXELGOAL_REFERENCES)
+    return skill_path
+
+
+def _write_go2_graph_memory_skill(codex_home: Path) -> Path:
+    skill_dir = codex_home / "skills" / "go2-graph-memory-hierarchy"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text(GO2_GRAPH_MEMORY_SKILL_TEXT, encoding="utf-8")
+    _write_skill_references(skill_dir, GO2_GRAPH_MEMORY_REFERENCES)
+    return skill_path
+
+
+def _write_workspace_go2_graph_memory_skill(workspace: Path) -> Path:
+    skill_dir = workspace / ".agents" / "skills" / "go2-graph-memory-hierarchy"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text(GO2_GRAPH_MEMORY_SKILL_TEXT, encoding="utf-8")
+    _write_skill_references(skill_dir, GO2_GRAPH_MEMORY_REFERENCES)
+    return skill_path
+
+
+def _write_go2_2d_slam_skill(codex_home: Path) -> Path:
+    skill_dir = codex_home / "skills" / "go2-2d-slam"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text(GO2_2D_SLAM_SKILL_TEXT, encoding="utf-8")
+    return skill_path
+
+
+def _write_workspace_go2_2d_slam_skill(workspace: Path) -> Path:
+    skill_dir = workspace / ".agents" / "skills" / "go2-2d-slam"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text(GO2_2D_SLAM_SKILL_TEXT, encoding="utf-8")
+    return skill_path
+
+
+def _write_go2_graph_slam_navigation_skill(codex_home: Path) -> Path:
+    skill_dir = codex_home / "skills" / "go2-graph-slam-navigation"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text(GO2_GRAPH_SLAM_NAVIGATION_SKILL_TEXT, encoding="utf-8")
+    _write_skill_references(skill_dir, GO2_GRAPH_SLAM_NAVIGATION_REFERENCES)
+    return skill_path
+
+
+def _write_workspace_go2_graph_slam_navigation_skill(workspace: Path) -> Path:
+    skill_dir = workspace / ".agents" / "skills" / "go2-graph-slam-navigation"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text(GO2_GRAPH_SLAM_NAVIGATION_SKILL_TEXT, encoding="utf-8")
+    _write_skill_references(skill_dir, GO2_GRAPH_SLAM_NAVIGATION_REFERENCES)
+    return skill_path
+
+
+def _write_skill_references(skill_dir: Path, references: dict[str, str]) -> None:
+    references_dir = skill_dir / "references"
+    references_dir.mkdir(parents=True, exist_ok=True)
+    for name, text in references.items():
+        (references_dir / name).write_text(text.strip() + "\n", encoding="utf-8")
+
+
+def _embedded_skill_references(references: dict[str, str]) -> str:
+    parts = []
+    for name, text in references.items():
+        parts.append(f"## references/{name}\n\n{text.strip()}")
+    return "\n\n".join(parts)
 
 
 def _copy_run_local_codex_auth(source_home: Path, codex_home: Path) -> list[str]:
@@ -1446,11 +2559,13 @@ def _codex_command(
         "codex",
         "exec",
         "--json",
+        "--disable",
+        "hooks",
+        "--disable",
+        "memories",
         "--ignore-rules",
         "--skip-git-repo-check",
     ]
-    for feature in DISABLED_CODEX_FEATURES:
-        command.extend(["--disable", feature])
     for key, value in (config_overrides or {}).items():
         command.extend(["-c", f"{key}={_toml_value(value)}"])
     command.extend(["-C", str(workspace)])
@@ -1559,6 +2674,21 @@ def write_shareable_run_summary(
             "trace_root": str(run.trace_root),
             "mcp_smoke_log": str(run.mcp_smoke_log_path),
             "mcp_smoke_result": str(run.mcp_smoke_result_path),
+            "graph_memory": str(run.graph_memory_path) if run.graph_memory_path else None,
+            "slam_status": str(run.slam_status_path) if run.slam_status_path else None,
+            "prior_run_root": str(run.prior_run_root) if run.prior_run_root else None,
+            "prior_run_artifacts": run.prior_run_artifacts,
+            "prior_graph_seed": run.prior_graph_seed,
+            "initial_slam_status": (
+                str(run.initial_slam_status_path)
+                if run.initial_slam_status_path
+                else None
+            ),
+            "initial_relocalization_bundle": (
+                str(run.initial_relocalization_bundle)
+                if run.initial_relocalization_bundle
+                else None
+            ),
         },
         "codex_runtime_config": {
             "model": run.model,

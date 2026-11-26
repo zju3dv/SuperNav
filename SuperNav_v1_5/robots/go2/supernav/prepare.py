@@ -107,8 +107,11 @@ def prepare(root: Path = ROOT, rebuild: bool = False) -> Path:
             for entry in manifest["overlay"]:
                 relative = safe_relative(entry["path"])
                 destination = stage / relative
-                if destination.exists():
-                    raise ValueError(f"overlay collides with upstream file: {relative}; use a patch")
+                if destination.exists() and not entry.get("replace", False):
+                    raise ValueError(
+                        f"overlay collides with upstream file: {relative}; "
+                        "mark an audited source replacement explicitly"
+                    )
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(root / "supernav/overlay" / relative, destination)
                 destination.chmod(0o755 if entry["executable"] else 0o644)

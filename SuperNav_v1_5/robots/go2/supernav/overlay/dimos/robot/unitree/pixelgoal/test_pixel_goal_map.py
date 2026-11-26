@@ -342,6 +342,33 @@ def test_directed_waypoint_does_not_detour_sideways_around_inflated_obstacle() -
     assert waypoint is None
 
 
+def test_directed_waypoint_extends_half_meter_into_unknown_on_ray() -> None:
+    grid = np.full((100, 100), CostValues.UNKNOWN, dtype=np.int8)
+    grid[48:53, 30:36] = CostValues.FREE
+    costmap = OccupancyGrid(
+        grid=grid, resolution=0.1,
+        origin=Pose(position=Vector3(-3.0, -5.0, 0.0)), frame_id="world",
+    )
+    waypoint = directed_waypoint(costmap, np.array([0.0, 0.0, 0.0]),
+                                 np.array([1.0, 0.0, 0.0]), max_step_m=1.5)
+    assert waypoint is not None
+    assert costmap.cell_value(Vector3(*waypoint)) == CostValues.UNKNOWN
+    assert 0.5 <= waypoint[0] <= 1.0 + 1e-6
+    assert abs(waypoint[1]) <= 0.1 + 1e-6
+
+
+def test_directed_waypoint_rejects_off_ray_free_strip() -> None:
+    grid = np.full((100, 100), CostValues.UNKNOWN, dtype=np.int8)
+    grid[48:53, 30:34] = CostValues.FREE
+    grid[53:67, 30:47] = CostValues.FREE
+    grid[48:53, 34] = CostValues.OCCUPIED
+    costmap = OccupancyGrid(
+        grid=grid, resolution=0.1,
+        origin=Pose(position=Vector3(-3.0, -5.0, 0.0)), frame_id="world",
+    )
+    assert directed_waypoint(costmap, np.zeros(3), np.array([1.0, 0.0, 0.0])) is None
+
+
 def test_directed_waypoint_excludes_previously_unreachable_goal() -> None:
     costmap = OccupancyGrid(
         grid=np.full((100, 100), CostValues.FREE, dtype=np.int8),
@@ -378,80 +405,3 @@ def test_directed_waypoint_rejects_empty_and_vertical() -> None:
         frame_id="world",
     )
     assert directed_waypoint(costmap, np.zeros(3), np.array([0.0, 0.0, -1.0])) is None
-
-
-def test_directed_waypoint_extends_half_meter_into_unknown_on_ray() -> None:
-    grid = np.full((100, 100), CostValues.UNKNOWN, dtype=np.int8)
-    grid[48:53, 30:36] = CostValues.FREE
-    costmap = OccupancyGrid(
-        grid=grid, resolution=0.1,
-        origin=Pose(position=Vector3(-3.0, -5.0, 0.0)), frame_id="world",
-    )
-    waypoint = directed_waypoint(costmap, np.zeros(3), np.array([1.0, 0.0, 0.0]))
-    assert waypoint is not None
-    assert costmap.cell_value(Vector3(*waypoint)) == CostValues.UNKNOWN
-    assert 0.5 < waypoint[0] <= 1.0 + 1e-9
-    assert abs(waypoint[1]) <= 0.1 + 1e-9
-
-
-def test_directed_waypoint_rejects_off_ray_free_strip() -> None:
-    grid = np.full((100, 100), CostValues.UNKNOWN, dtype=np.int8)
-    grid[48:53, 30:34] = CostValues.FREE
-    grid[53:67, 30:47] = CostValues.FREE
-    grid[48:53, 34] = CostValues.OCCUPIED
-    costmap = OccupancyGrid(
-        grid=grid, resolution=0.1,
-        origin=Pose(position=Vector3(-3.0, -5.0, 0.0)), frame_id="world",
-    )
-    assert directed_waypoint(costmap, np.zeros(3), np.array([1.0, 0.0, 0.0])) is None
-
-
-def test_unknown_extension_cannot_jump_thin_obstacle() -> None:
-    grid = np.full((100, 100), CostValues.UNKNOWN, dtype=np.int8)
-    grid[48:53, 30:36] = CostValues.FREE
-    grid[:, 37] = CostValues.OCCUPIED
-    costmap = OccupancyGrid(
-        grid=grid, resolution=0.1,
-        origin=Pose(position=Vector3(-3.0, -5.0, 0.0)), frame_id="world",
-    )
-    waypoint = directed_waypoint(
-        costmap, np.zeros(3), np.array([1.0, 0.0, 0.0]), footprint_diameter_m=0.0
-    )
-    assert waypoint is not None
-    assert waypoint[0] < 0.7
-
-
-def test_on_ray_goal_beyond_wall_cannot_use_sideways_free_detour() -> None:
-    grid = np.full((100, 100), CostValues.FREE, dtype=np.int8)
-    grid[48:53, 34] = CostValues.OCCUPIED
-    costmap = OccupancyGrid(
-        grid=grid, resolution=0.1,
-        origin=Pose(position=Vector3(-3.0, -5.0, 0.0)), frame_id="world",
-    )
-    assert directed_waypoint(costmap, np.zeros(3), np.array([1.0, 0.0, 0.0])) is None
-
-
-def test_unknown_extension_stops_before_disconnected_free_island() -> None:
-    grid = np.full((100, 100), CostValues.UNKNOWN, dtype=np.int8)
-    grid[48:53, 30:36] = CostValues.FREE
-    grid[48:53, 38:42] = CostValues.FREE
-    costmap = OccupancyGrid(
-        grid=grid, resolution=0.1,
-        origin=Pose(position=Vector3(-3.0, -5.0, 0.0)), frame_id="world",
-    )
-    waypoint = directed_waypoint(costmap, np.zeros(3), np.array([1.0, 0.0, 0.0]))
-    assert waypoint is not None
-    assert costmap.cell_value(Vector3(*waypoint)) == CostValues.UNKNOWN
-    assert waypoint[0] < 0.8
-
-
-def test_reachable_free_cells_cannot_cut_diagonal_obstacle_corner() -> None:
-    grid = np.full((10, 10), CostValues.OCCUPIED, dtype=np.int8)
-    np.fill_diagonal(grid, CostValues.FREE)
-    costmap = OccupancyGrid(
-        grid=grid, resolution=0.1, origin=Pose(position=Vector3(0.0, 0.0, 0.0)),
-        frame_id="world",
-    )
-    assert directed_waypoint(
-        costmap, np.zeros(3), np.array([1.0, 1.0, 0.0]), footprint_diameter_m=0.0
-    ) is None

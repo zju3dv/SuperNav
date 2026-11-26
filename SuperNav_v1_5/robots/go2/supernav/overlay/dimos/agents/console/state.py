@@ -34,6 +34,7 @@ class UiMode(str, Enum):
     STARTUP = "STARTUP"
     MANUAL = "MANUAL"
     AGENT = "AGENT"
+    AWM = "AWM"
     PIXEL_GOAL = "PIXEL_GOAL"
     STOPPED = "STOPPED"
 
@@ -71,7 +72,6 @@ class ConsoleState:
     last_error: str | None = None
     robot_connection: str = "unknown"
     battery_percent: int | None = None
-    robot_status_error: str | None = None
     pending_start_confirmation: bool = False
     launch_attempted: bool = False
     launch_pid: int | None = None

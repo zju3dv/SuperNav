@@ -57,6 +57,12 @@ class SubprocessDimOSLauncher:
     """Launch DimOS by reusing the public ``dimos run`` command path."""
 
     def launch(self, config: ConsoleConfig) -> subprocess.Popen[str]:
+        prior_args = (
+            ["--prior-run-root", str(config.prior_run_root.expanduser())]
+            if config.prior_run_root is not None
+            else []
+        )
+
         cmd = [
             sys.executable,
             "-m",
@@ -70,6 +76,7 @@ class SubprocessDimOSLauncher:
             config.stack,
             "--control",
             config.control,
+            *prior_args,
         ]
         return subprocess.Popen(cmd, text=True)
 
@@ -98,11 +105,19 @@ class StartupService:
     ) -> StartupResult:
         """Attach to an active MCP server or prepare an explicitly confirmed start."""
 
-        entry = None if config.mcp_url else self._run_entry_getter()
+        entry = self._run_entry_getter()
+        if config.mcp_url and not _mcp_url_matches_entry(config.mcp_url, entry):
+            entry = None
         first = self._probe(config, entry)
         messages = ["attach-first: probing MCP readiness"]
         if first.ready:
             messages.append("MCP initialize succeeded")
+            if config.prior_run_root is not None:
+                messages.append(
+                    "Attached to an existing DimOS process; prior graph/static context "
+                    "will be exposed through the agent proxy, but backend relocalization "
+                    "depends on how DimOS was already started."
+                )
             return _result_from_snapshot(first, entry, messages=tuple(messages))
 
         messages.append(first.error or "MCP server is not reachable")
@@ -177,3 +192,10 @@ def _entry_attr(entry: Any | None, name: str) -> str | None:
     if isinstance(value, Path):
         return str(value)
     return str(value)
+
+
+def _mcp_url_matches_entry(mcp_url: str, entry: Any | None) -> bool:
+    entry_url = _entry_attr(entry, "mcp_url")
+    if entry_url is None:
+        return False
+    return mcp_url.rstrip("/") == entry_url.rstrip("/")

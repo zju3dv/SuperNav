@@ -17,8 +17,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
-import math
 from typing import Any, Protocol
 
 import requests
@@ -55,13 +53,6 @@ class McpStatusSnapshot:
     url: str
     tools: tuple[ToolInfo, ...] = ()
     server_info: dict[str, Any] | None = None
-    error: str | None = None
-
-
-@dataclass(frozen=True)
-class RobotStatusSnapshot:
-    available: bool
-    battery_percent: int | None = None
     error: str | None = None
 
 
@@ -115,34 +106,6 @@ class ConsoleMcpClient:
         """Call an MCP tool through the existing adapter implementation."""
 
         return self.adapter.call_tool(name, arguments, meta=meta)
-
-    def robot_status_snapshot(self) -> RobotStatusSnapshot:
-        """Read low-state telemetry; MCP readiness alone does not verify it."""
-        try:
-            result = self.call_tool("go2_robot_status", {})
-            if result.get("isError"):
-                return RobotStatusSnapshot(False, error="Robot status tool failed")
-            payload = result.get("structuredContent")
-            if not isinstance(payload, dict):
-                payload = next(
-                    (json.loads(item["text"]) for item in result.get("content", [])
-                     if item.get("type") == "text"),
-                    {},
-                )
-            if not isinstance(payload, dict) or payload.get("success") is not True:
-                return RobotStatusSnapshot(False, error="Robot status unavailable")
-            status = payload.get("metadata", {}).get("robot_status", {})
-            if not isinstance(status, dict) or status.get("available") is not True:
-                return RobotStatusSnapshot(False, error="Robot low-state unavailable")
-            battery = status.get("battery", {})
-            soc = battery.get("soc_percent") if isinstance(battery, dict) else None
-            percent = None
-            if (isinstance(soc, (int, float)) and not isinstance(soc, bool)
-                    and math.isfinite(soc) and 0 <= soc <= 100):
-                percent = round(soc)
-            return RobotStatusSnapshot(True, battery_percent=percent)
-        except (requests.RequestException, McpError, ValueError, TypeError, KeyError, AttributeError):
-            return RobotStatusSnapshot(False, error="Robot status request failed")
 
 
 def _tool_info(raw: dict[str, Any]) -> ToolInfo:

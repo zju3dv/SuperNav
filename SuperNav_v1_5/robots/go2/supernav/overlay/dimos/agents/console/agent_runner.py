@@ -281,6 +281,9 @@ class AgentTaskRunner:
     def _run(self, handle: AgentRunHandle, task: str, run_root: Path) -> None:
         try:
             handle.add_event("console", "prepare_codex_harness_run starting")
+            prior_run_root = self._config.prior_run_root
+            if prior_run_root is None and self._run_log_dir:
+                prior_run_root = Path(self._run_log_dir)
             prepared = self._prepare_run(
                 run_root=run_root,
                 task=task,
@@ -291,6 +294,7 @@ class AgentTaskRunner:
                 prompt_mode=self._config.prompt_mode,
                 tool_profile=self._config.tool_profile,
                 authority_allowed_movement_tools=self._config.authority_tools,
+                prior_run_root=prior_run_root,
             )
             artifacts = AgentRunArtifacts(
                 run_root=Path(prepared.run_root),
@@ -312,11 +316,7 @@ class AgentTaskRunner:
             handle.add_event("console", f"agent task failed: {exc}")
 
     def _agent_run_root(self) -> Path:
-        base = self._config.run_root
-        if base is None and self._run_log_dir:
-            base = Path(self._run_log_dir) / "operator-console"
-        if base is None:
-            base = Path.cwd() / "runs" / "operator-console"
+        base = self._config.run_root or Path.cwd() / "runs" / "operator-console"
         return base.expanduser() / self._run_id_factory()
 
 

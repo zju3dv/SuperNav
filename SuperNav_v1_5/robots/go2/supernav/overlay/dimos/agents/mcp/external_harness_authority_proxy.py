@@ -16,18 +16,29 @@
 
 from __future__ import annotations
 
+import base64
+import copy
 from dataclasses import asdict, dataclass, field
+from io import BytesIO
 import json
+import math
+from pathlib import Path
 import time
 from typing import Any
 import uuid
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from PIL import Image as PILImage, ImageDraw, ImageFont
 import requests
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 
+from dimos.agents.harness.go2_graph_memory import (
+    GRAPH_MEMORY_TOOL_NAMES,
+    Go2GraphMemoryStore,
+    graph_memory_tool_specs,
+)
 from dimos.agents.mcp.external_harness_authority import ExternalHarnessMovementAuthority
 from dimos.agents.mcp.external_harness_types import ExternalHarnessMcpAdapter
 from dimos.agents.mcp.mcp_adapter import McpAdapter
@@ -50,26 +61,51 @@ BATTERY_SAFE_TOOL_NAMES = frozenset(
         "stop_navigation",
     }
 )
-DISABLED_MEMORY_TOOL_NAMES = frozenset(
+GO2_NAVIGATION_MAP_TOOL_NAMES = frozenset(
     {
-        "go2_list_graph_nodes",
-        "go2_grep_graph_node",
-        "go2_inspect_graph_node",
-        "go2_query_route_context",
-        "go2_report_graph_position",
-        "go2_graph_map_nodes",
-        "go2_apply_graph_mutations",
         "go2_relocalization_status",
         "go2_known_slam_map",
         "go2_navigation_map_context",
-        "go2_start_navigation_episode",
-        "go2_save_relocalization_bundle",
     }
 )
-OPERATOR_ONLY_TOOL_NAMES = frozenset({"reset_pixel_goal_map"})
+GO2_MEMORY_NAV_TOOL_NAME = "go2_navigate_to_memory_node"
+GO2_RELOCALIZATION_SAVE_TOOL_NAME = "go2_save_relocalization_bundle"
+GO2_RELOCALIZATION_PRIOR_TOOL_NAME = "go2_report_relocalization_prior"
+GO2_SLAM_MAP_SNAPSHOT_TOOL_NAME = "go2_slam_map_snapshot"
+GO2_NAVIGATION_EPISODE_START_TOOL_NAME = "go2_start_navigation_episode"
+OPERATOR_ONLY_TOOL_NAMES = frozenset(
+    {
+        "reset_pixel_goal_map",
+        GO2_RELOCALIZATION_PRIOR_TOOL_NAME,
+        GO2_SLAM_MAP_SNAPSHOT_TOOL_NAME,
+    }
+)
+AGENT_DISABLED_TOOL_NAMES = frozenset(
+    {
+        "pixelgoal_stop",
+        "stop_movement",
+    }
+)
 PIXELGOAL_COMPLETION_TIMEOUT_S = 300.0
 PIXELGOAL_POLL_INTERVAL_S = 1.0
 SURROUND_DIRECTIONS = frozenset({"front", "right", "back", "left"})
+AGENT_HIDDEN_SLAM_MAP_FIELDS = frozenset(
+    {
+        "grid_ts",
+        "map_frame",
+        "slam_area_memory_names",
+    }
+)
+AGENT_HIDDEN_SLAM_AREA_FIELDS = frozenset(
+    {
+        "bbox_grid",
+        "centroid_grid",
+        "grid_ts",
+        "map_frame",
+        "target_grid",
+        "target_slam_pose",
+    }
+)
 
 
 @dataclass
@@ -216,13 +252,31 @@ class ExternalHarnessAuthorityProxy:
         *,
         envelope: MovementAuthorityEnvelope | None = None,
         battery_gate: BatteryGatePolicy | None = None,
+        graph_memory_path: Path | None = None,
+        slam_status_path: Path | None = None,
+        initial_slam_status_path: Path | None = None,
+        initial_relocalization_bundle: Path | None = None,
         url: str = "memory://external-harness-authority-proxy",
     ) -> None:
         self.upstream = upstream
         self.envelope = envelope
         self.battery_gate = battery_gate or BatteryGatePolicy()
+        self.graph_memory = (
+            Go2GraphMemoryStore(graph_memory_path) if graph_memory_path is not None else None
+        )
         self.url = url
         self._tools_by_name: dict[str, dict[str, Any]] = {}
+        self._latest_slam_pose: dict[str, Any] | None = None
+        self._latest_slam_map_metadata: dict[str, Any] | None = None
+        self._latest_slam_map_image_block: dict[str, Any] | None = None
+        self._slam_status_path = slam_status_path
+        self._initial_slam_status_path = initial_slam_status_path
+        self._initial_relocalization_bundle = initial_relocalization_bundle
+        self._relocalization_bundle_context = _load_relocalization_bundle_context(
+            initial_relocalization_bundle
+        )
+        self._loaded_slam_status = self._load_initial_slam_status(initial_slam_status_path)
+        self._save_slam_status()
 
     def initialize(self) -> dict[str, Any]:
         return self.upstream.initialize()
@@ -233,6 +287,14 @@ class ExternalHarnessAuthorityProxy:
         visible_tools = [
             self._agent_facing_tool(tool) for tool in tools if self._tool_visible(tool)
         ]
+        if self.graph_memory is not None:
+            visible_tools.extend(graph_memory_tool_specs())
+        if (
+            self.graph_memory is not None
+            or self._slam_status_path is not None
+            or self._latest_slam_map_metadata is not None
+        ):
+            visible_tools.extend(_navigation_map_tool_specs())
         return visible_tools
 
     def call_tool(
@@ -246,14 +308,86 @@ class ExternalHarnessAuthorityProxy:
 
         arguments = arguments or {}
         meta = dict(meta or {})
-        if name in DISABLED_MEMORY_TOOL_NAMES:
-            return _text_result(f"Tool '{name}' refused: memory and agent-facing SLAM tools are disabled.")
+        if name in AGENT_DISABLED_TOOL_NAMES:
+            return _text_result(f"Tool '{name}' refused: disabled for agent use.")
+        if name == GO2_MEMORY_NAV_TOOL_NAME:
+            target, error = self._resolve_memory_navigation_target(arguments.get("node_id"))
+            if error is not None:
+                return _text_result(json.dumps({
+                    "success": False,
+                    "error": error,
+                }))
+            arguments = {**arguments, **target}
         if name in OPERATOR_ONLY_TOOL_NAMES:
             return _text_result(f"Tool '{name}' refused: operator-only tool.")
+        if name in GRAPH_MEMORY_TOOL_NAMES:
+            if self.graph_memory is None:
+                return _text_result(
+                    json.dumps(
+                        {
+                            "success": False,
+                            "error": "go2 graph memory is not enabled for this run",
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            slam_pose = self._latest_slam_pose if name == "go2_apply_graph_mutations" else None
+            if name == "go2_query_route_context":
+                self._refresh_slam_map_snapshot()
+            payload = self.graph_memory.handle_tool(name, arguments, slam_pose=slam_pose)
+            if (
+                name == "go2_apply_graph_mutations"
+                and isinstance(payload, dict)
+                and payload.get("success") is True
+            ):
+                self._save_slam_status()
+            if name == "go2_report_graph_position" and isinstance(payload, dict):
+                prior_returned_map = False
+                prior_result = self._forward_graph_position_prior(
+                    arguments.get("id", arguments.get("node_id"))
+                )
+                if prior_result is not None:
+                    payload["relocalization_prior"] = prior_result
+                    metadata = prior_result.get("metadata")
+                    prior_returned_map = isinstance(metadata, dict) and isinstance(
+                        metadata.get("2d_slam_map"), dict
+                    )
+                    if isinstance(metadata, dict) and isinstance(
+                        metadata.get("relocalization_wait"), dict
+                    ):
+                        payload["relocalization_wait"] = metadata["relocalization_wait"]
+                if not prior_returned_map:
+                    self._refresh_slam_map_snapshot()
+            response = _text_result(json.dumps(payload, ensure_ascii=False))
+            return_images = name == "go2_report_graph_position" or bool(
+                arguments.get("return_images", True)
+            )
+            if return_images and name in {
+                "go2_inspect_graph_node",
+                "go2_query_route_context",
+                "go2_report_graph_position",
+            }:
+                response["content"].extend(self.graph_memory.image_blocks_for_payload(payload))
+            if name in {"go2_query_route_context", "go2_report_graph_position"}:
+                self._append_cached_slam_map(response, payload)
+            return response
+        if name in GO2_NAVIGATION_MAP_TOOL_NAMES:
+            return _text_result(
+                json.dumps(
+                    self._navigation_map_tool_payload(name, arguments),
+                    ensure_ascii=False,
+                )
+            )
 
         uses = self._uses_for_tool(name)
         if not is_movement_tool(name, uses) or is_stop_tool(name):
             result = self.upstream.call_tool(name, arguments, meta=meta or None)
+            self._capture_panoramas(result)
+            self._cache_navigation_context_from_result(result)
+            if name == GO2_NAVIGATION_EPISODE_START_TOOL_NAME:
+                self._cache_navigation_episode_reset_from_result(result)
+            if name == GO2_RELOCALIZATION_SAVE_TOOL_NAME:
+                self._cache_relocalization_bundle_from_result(result)
             return self._agent_facing_result(name, result)
 
         if self.envelope is None:
@@ -291,25 +425,154 @@ class ExternalHarnessAuthorityProxy:
         forwarded_meta = {**meta, **signed}
         try:
             result = self.upstream.call_tool(name, arguments, meta=forwarded_meta)
+            self._cache_navigation_context_from_result(result)
             if name == "pixelgoal_navigate":
-                return self._wait_for_pixelgoal(result)
-            return result
+                result = self._wait_for_pixelgoal(result)
+            if name == GO2_MEMORY_NAV_TOOL_NAME:
+                result = self._append_surround_result(result)
+            return self._agent_facing_result(name, result)
         except requests.Timeout as exc:
             if name == "pixelgoal_navigate":
                 try:
                     self.upstream.call_tool("pixelgoal_stop", {})
-                except Exception:
+                except Exception:  # noqa: BLE001,S110 — preserve the original timeout result
                     pass
-            return _movement_timeout_result(
+            timeout_result = _movement_timeout_result(
                 name,
                 arguments,
                 envelope=self.envelope,
                 exc=exc,
             )
+            if name == GO2_MEMORY_NAV_TOOL_NAME:
+                timeout_result = self._append_surround_result(timeout_result)
+            return self._agent_facing_result(name, timeout_result)
+
+    def _append_surround_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Add fresh four-way evidence without changing the movement outcome."""
+        try:
+            observed = self.upstream.call_tool("observe_surround", {})
+        except Exception:  # noqa: BLE001 — navigation result remains authoritative
+            return result
+        content = result.get("content")
+        observed_content = observed.get("content") if isinstance(observed, dict) else None
+        if not isinstance(content, list) or not isinstance(observed_content, list):
+            self._capture_panoramas(result)
+            return result
+        merged = dict(result)
+        # Keep the navigation result's status JSON and SLAM-map image first;
+        # append only the labelled surround images from the fresh observation.
+        merged["content"] = [*content, *observed_content[1:]]
+        self._capture_panoramas(merged)
+        self._cache_navigation_context_from_result(merged)
+        return merged
+
+    def _forward_graph_position_prior(self, node_id: Any) -> dict[str, Any] | None:
+        clean_id = str(node_id or "").strip()
+        if not clean_id or self.graph_memory is None:
+            return None
+        pose = self.graph_memory.navigation_target(clean_id)
+        if not isinstance(pose, dict):
+            return {"reported": False, "reason": "graph node has no stored slam_pose"}
+        if GO2_RELOCALIZATION_PRIOR_TOOL_NAME not in self._tools_by_name:
+            self.list_tools()
+        if GO2_RELOCALIZATION_PRIOR_TOOL_NAME not in self._tools_by_name:
+            return {"reported": False, "reason": "upstream relocalization-prior tool unavailable"}
+        try:
+            result = self.upstream.call_tool(
+                GO2_RELOCALIZATION_PRIOR_TOOL_NAME,
+                {"node_id": clean_id, "slam_pose": pose},
+            )
+        except Exception as exc:  # noqa: BLE001 - keep graph report useful even if prior fails.
+            return {"reported": False, "reason": f"upstream prior failed: {exc}"}
+        self._cache_navigation_context_from_result(result)
+        parsed = _parse_first_text_json(result)
+        if isinstance(parsed, dict):
+            return parsed
+        return {"reported": True, "result": result}
+
+    def _refresh_slam_map_snapshot(self) -> dict[str, Any] | None:
+        if GO2_SLAM_MAP_SNAPSHOT_TOOL_NAME not in self._tools_by_name:
+            self.list_tools()
+        if GO2_SLAM_MAP_SNAPSHOT_TOOL_NAME not in self._tools_by_name:
+            return None
+        try:
+            result = self.upstream.call_tool(
+                GO2_SLAM_MAP_SNAPSHOT_TOOL_NAME,
+                {},
+            )
+        except Exception:  # noqa: BLE001 - graph memory remains useful without a map.
+            return None
+        self._cache_navigation_context_from_result(result)
+        return _parse_first_text_json(result)
+
+    def _append_cached_slam_map(
+        self,
+        response: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> None:
+        if self._latest_slam_map_metadata is None:
+            return
+        payload["2d_slam_map"] = _sanitize_slam_map_metadata_for_agent(
+            self._latest_slam_map_metadata
+        )
+        _rewrite_first_text_json(response, payload)
+        if self._latest_slam_map_image_block is not None:
+            response.setdefault("content", []).append(
+                copy.deepcopy(self._latest_slam_map_image_block)
+            )
+
+    def _resolve_memory_navigation_target(
+        self, node_id: Any
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        clean_id = str(node_id or "").strip()
+        if not clean_id:
+            return None, "memory node ID is required"
+        latest = self._latest_slam_map_metadata or {}
+        if latest.get("status") != "current":
+            status = latest.get("status") or "unavailable"
+            return None, f"current SLAM map unavailable (status: {status})"
+        frame = latest.get("map_frame")
+        robot_pose = latest.get("pose")
+        if (
+            not isinstance(frame, str)
+            or not isinstance(robot_pose, dict)
+            or robot_pose.get("frame_id") != frame
+        ):
+            return None, "current robot pose is not in the SLAM map frame"
+        if clean_id.startswith("slam_area_"):
+            for row in latest.get("slam_area_nodes", []) or []:
+                if isinstance(row, dict) and row.get("id") == clean_id:
+                    pose = row.get("target_slam_pose")
+                    if isinstance(pose, dict):
+                        return {
+                            "target_slam_pose": {**pose, "frame_id": frame},
+                            "map_frame": frame,
+                            "map_sequence": pose.get("sequence"),
+                        }, None
+            return None, "unknown SLAM area node target"
+        if self.graph_memory is None:
+            return None, "graph memory is not enabled"
+        pose = self.graph_memory.navigation_target(clean_id)
+        if not isinstance(pose, dict):
+            return None, "unknown or pose-less memory node target"
+        if pose.get("frame_id") != frame:
+            return None, (
+                "memory node pose frame differs from current map "
+                "(legacy nodes without a frame must be re-anchored)"
+            )
+        return {
+            "target_slam_pose": pose,
+            "map_frame": frame,
+            "map_sequence": pose.get("sequence"),
+        }, None
 
     def _tool_visible(self, tool: dict[str, Any]) -> bool:
         name = str(tool.get("name") or "")
-        if not name or name in OPERATOR_ONLY_TOOL_NAMES or name in DISABLED_MEMORY_TOOL_NAMES:
+        if (
+            not name
+            or name in AGENT_DISABLED_TOOL_NAMES
+            or name in OPERATOR_ONLY_TOOL_NAMES
+        ):
             return False
         uses = self._tool_uses(tool)
         if is_stop_tool(name) or not is_movement_tool(name, uses):
@@ -323,7 +586,8 @@ class ExternalHarnessAuthorityProxy:
         payload = dict(tool)
         uses = self._tool_uses(tool)
         pixelgoal_enabled = bool(
-            self.envelope and "pixelgoal_navigate" in self.envelope.allowed_movement_tools
+            self.envelope
+            and "pixelgoal_navigate" in self.envelope.allowed_movement_tools
         )
         if pixelgoal_enabled and name == "observe_surround":
             payload["description"] = (
@@ -373,15 +637,7 @@ class ExternalHarnessAuthorityProxy:
                     "invalid; never mark the search target itself. "
                     "This agent-facing call waits for the hop to finish and returns the "
                     "terminal status plus camera freshness metadata and only fresh four-way "
-                    "images; do not poll pixelgoal_status during normal operation. "
-                    "With the map backend, an unresolved surface allows successive "
-                    "exploration legs of up to 4 m, rechecking the target after each "
-                    "successful leg, within a default 60 s hop and 10 m exploration budget. "
-                    "Budget/free-space exhaustion returns needs_agent / exploration_complete; "
-                    "the hop deadline returns timeout / deadline_exceeded. "
-                    "Use the returned views to choose the next point. A no_progress "
-                    "result means the hop stopped for lack of net approach; reassess "
-                    "the obstacle or doorway before issuing another movement."
+                    "images; do not poll pixelgoal_status during normal operation."
                 )
         return payload
 
@@ -392,25 +648,21 @@ class ExternalHarnessAuthorityProxy:
         goal_id = str(started.get("goal_id") or "")
         deadline = time.monotonic() + PIXELGOAL_COMPLETION_TIMEOUT_S
         while time.monotonic() < deadline:
-            status_result = self.upstream.call_tool("pixelgoal_status", {"include_images": False})
+            status_result = self.upstream.call_tool(
+                "pixelgoal_status", {"include_images": False}
+            )
             status = _parse_first_text_json(status_result)
             if (
                 status
                 and status.get("hop_running") is False
                 and _pixelgoal_status_goal_id(status) == goal_id
             ):
-                final = self.upstream.call_tool("pixelgoal_status", {"include_images": True})
-                final_status = _parse_first_text_json(final)
-                if (
-                    not final_status
-                    or final_status.get("hop_running") is not False
-                    or _pixelgoal_status_goal_id(final_status) != goal_id
-                ):
-                    # Status can change between the metadata poll and image fetch.
-                    # Never return another hop's frames as this call's outcome.
-                    time.sleep(PIXELGOAL_POLL_INTERVAL_S)
-                    continue
+                final = self.upstream.call_tool(
+                    "pixelgoal_status", {"include_images": True}
+                )
                 _compact_pixelgoal_events(final, goal_id)
+                self._capture_panoramas(final)
+                self._cache_navigation_context_from_result(final)
                 if _surround_image_directions(final) == SURROUND_DIRECTIONS:
                     return final
                 observed = self.upstream.call_tool("observe_surround", {})
@@ -419,11 +671,7 @@ class ExternalHarnessAuthorityProxy:
                 if isinstance(content, list) and content and isinstance(observed_content, list):
                     merged = dict(final)
                     merged["content"] = [content[0], *observed_content]
-                    health = _parse_first_text_json(observed)
-                    terminal = _parse_first_text_json(merged)
-                    if terminal is not None and health is not None and "stale" in health:
-                        terminal["camera_health"] = health
-                        _rewrite_first_text_json(merged, terminal)
+                    self._capture_panoramas(merged)
                     return merged
                 return final
             time.sleep(PIXELGOAL_POLL_INTERVAL_S)
@@ -445,18 +693,51 @@ class ExternalHarnessAuthorityProxy:
             )
         )
 
+    def _capture_panoramas(self, result: dict[str, Any]) -> None:
+        """Persist labeled movement images and expose their run-relative refs."""
+        if self.graph_memory is None:
+            return
+        content = result.get("content")
+        if not isinstance(content, list):
+            return
+        images: dict[str, dict[str, Any]] = {}
+        label = ""
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text = str(block.get("text") or "").strip().lower()
+                label = text if text in SURROUND_DIRECTIONS else ""
+            elif block.get("type") == "image" and label:
+                images[label] = block
+                label = ""
+        refs = self.graph_memory.save_panorama(images)
+        if not refs:
+            return
+        payload = _parse_first_text_json(result)
+        if payload is None:
+            return
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            metadata["pano_images"] = refs
+        else:
+            payload["pano_images"] = refs
+        _rewrite_first_text_json(result, payload)
+
     def _agent_facing_result(self, name: str, result: dict[str, Any]) -> dict[str, Any]:
-        if self.envelope is None:
-            return result
-        if name == "go2_situation":
-            return _overlay_go2_situation_proxy_context(
+        if self.envelope is not None and name == "go2_situation":
+            result = _overlay_go2_situation_proxy_context(
                 result,
                 envelope=self.envelope,
                 robot_status_result=self._safe_robot_status_result(),
             )
-        if name == "server_status" and "pixelgoal_navigate" in self.envelope.allowed_movement_tools:
-            return _overlay_pixelgoal_server_status(result, envelope=self.envelope)
-        return result
+        elif (
+            self.envelope is not None
+            and name == "server_status"
+            and "pixelgoal_navigate" in self.envelope.allowed_movement_tools
+        ):
+            result = _overlay_pixelgoal_server_status(result, envelope=self.envelope)
+        return _sanitize_agent_navigation_result(result)
 
     def _safe_robot_status_result(self) -> dict[str, Any] | None:
         if "go2_robot_status" not in self._tools_by_name:
@@ -468,6 +749,245 @@ class ExternalHarnessAuthorityProxy:
         except Exception:
             return None
 
+    def _navigation_map_tool_payload(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        del arguments
+        latest_map = _sanitize_slam_map_metadata_for_agent(
+            self._latest_slam_map_metadata or {}
+        )
+        graph_nodes = (
+            self.graph_memory.handle_tool("go2_graph_map_nodes", {})
+            if self.graph_memory is not None
+            else {"success": False, "graph_nodes": [], "anchored_node_count": 0}
+        )
+        graph_payload = graph_nodes if isinstance(graph_nodes, dict) else {}
+        if name == "go2_relocalization_status":
+            status = str(latest_map.get("localization_status") or latest_map.get("status") or "")
+            if not latest_map:
+                status = "unavailable"
+            elif status in {"current", "localized", "relocalized"}:
+                status = "localized"
+            elif status in {"static", "collecting", "matching", "anchoring"}:
+                status = status
+            else:
+                status = "unavailable" if status in {"", "stale"} else status
+            return {
+                "success": True,
+                "status": status,
+                "source": "authority_proxy_cached_movement_map_metadata",
+                "map_status": latest_map.get("status"),
+                "pose_available": self._latest_slam_pose is not None,
+                "graph_overlay": bool(latest_map.get("graph_overlay")),
+                "loaded_initial_status": self._loaded_slam_status,
+                "status_saved": self._slam_status_path is not None,
+                "relocalization_bundle": self._relocalization_bundle_context,
+            }
+        if name == "go2_known_slam_map":
+            return {
+                "success": True,
+                "status": "static" if latest_map else "unavailable",
+                "source": "authority_proxy_cached_movement_map_metadata",
+                "message": (
+                    "Static known-map image is available only when the upstream Go2 "
+                    "tool attached one to the latest movement/map result."
+                    if latest_map
+                    else "No cached known-map image is available yet."
+                ),
+                "graph_nodes": graph_payload.get("graph_nodes", []),
+                "graph_overlay": bool(graph_payload.get("anchored_node_count", 0)),
+                "loaded_initial_status": self._loaded_slam_status,
+                "status_saved": self._slam_status_path is not None,
+                "relocalization_bundle": self._relocalization_bundle_context,
+            }
+        return {
+            "success": True,
+            "status": latest_map.get("status") or "unavailable",
+            "source": "authority_proxy_cached_movement_map_metadata",
+            "latest_2d_slam_map": latest_map,
+            "pose_available": self._latest_slam_pose is not None,
+            "graph_nodes": graph_payload.get("graph_nodes", []),
+            "graph_overlay": bool(
+                latest_map.get("graph_overlay") or graph_payload.get("anchored_node_count", 0)
+            ),
+            "loaded_initial_status": self._loaded_slam_status,
+            "status_saved": self._slam_status_path is not None,
+            "relocalization_bundle": self._relocalization_bundle_context,
+        }
+
+    def _cache_navigation_context_from_result(self, result: dict[str, Any]) -> None:
+        payload = _parse_first_text_json(result)
+        if payload is None:
+            return
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            slam_map = metadata.get("2d_slam_map")
+        else:
+            slam_map = payload.get("2d_slam_map")
+        if not isinstance(slam_map, dict):
+            return
+        self._latest_slam_map_metadata = dict(slam_map)
+        pose = (
+            _slam_pose_from_map_metadata(slam_map)
+            if slam_map.get("status") == "current"
+            else None
+        )
+        self._latest_slam_pose = pose
+        self._overlay_graph_nodes_on_result(result)
+        image_block = _find_2d_slam_image_block(result)
+        self._latest_slam_map_image_block = (
+            copy.deepcopy(image_block) if image_block is not None else None
+        )
+        self._save_slam_status()
+
+    def _cache_relocalization_bundle_from_result(self, result: dict[str, Any]) -> None:
+        payload = _parse_first_text_json(result)
+        if payload is None:
+            return
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            return
+        bundle = metadata.get("relocalization_bundle")
+        if not isinstance(bundle, dict):
+            return
+        sanitized = _sanitize_relocalization_bundle_context(bundle)
+        metadata["relocalization_bundle"] = sanitized
+        _rewrite_first_text_json(result, payload)
+        self._relocalization_bundle_context = sanitized
+        self._save_slam_status()
+
+    def _cache_navigation_episode_reset_from_result(self, result: dict[str, Any]) -> None:
+        payload = _parse_first_text_json(result)
+        success = bool(payload.get("success")) if isinstance(payload, dict) else False
+        if not success:
+            return
+        self._latest_slam_map_metadata = {
+            "status": "reset",
+            "source": "episode_start_reset",
+            "reset_at_epoch_s": time.time(),
+            "graph_nodes": [],
+            "graph_overlay": False,
+        }
+        self._latest_slam_pose = None
+        self._latest_slam_map_image_block = None
+        self._save_slam_status()
+
+    def _overlay_graph_nodes_on_result(self, result: dict[str, Any]) -> None:
+        if self.graph_memory is None:
+            return
+        payload = _parse_first_text_json(result)
+        if payload is None:
+            return
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            slam_map = metadata.get("2d_slam_map")
+        else:
+            metadata = payload
+            slam_map = payload.get("2d_slam_map")
+        if not isinstance(slam_map, dict):
+            return
+        graph_nodes = self.graph_memory.map_nodes()
+        image_block = _find_2d_slam_image_block(result)
+        displayed = _overlay_graph_badges_on_image_block(
+            image_block,
+            slam_map,
+            graph_nodes,
+        )
+        if displayed is None:
+            displayed = _displayable_graph_nodes(graph_nodes)
+        suppressed = {
+            str(label)
+            for label in (
+                (image_block or {}).get("metadata", {}).get(
+                    "suppressed_slam_area_labels", []
+                )
+                if isinstance((image_block or {}).get("metadata", {}), dict)
+                else []
+            )
+        }
+        memory_names = _memory_area_name_map(slam_map, graph_nodes)
+        suppressed.update(str(next(iter(mapping))) for mapping in memory_names if mapping)
+        if suppressed:
+            slam_map["slam_area_nodes"] = [
+                area
+                for area in slam_map.get("slam_area_nodes", []) or []
+                if not isinstance(area, dict) or str(area.get("label")) not in suppressed
+            ]
+        slam_map["graph_nodes"] = displayed
+        slam_map["graph_overlay"] = bool(displayed)
+        self._latest_slam_map_metadata = dict(slam_map)
+        _rewrite_first_text_json(result, payload)
+
+    def _load_initial_slam_status(self, path: Path | None) -> bool:
+        if path is None:
+            return False
+        try:
+            payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return False
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        slam_map = payload.get("latest_slam_map_metadata")
+        if not isinstance(slam_map, dict):
+            slam_map = payload.get("latest_2d_slam_map")
+        if not isinstance(slam_map, dict):
+            slam_map = payload.get("2d_slam_map")
+        if not isinstance(slam_map, dict):
+            return False
+        self._latest_slam_map_metadata = dict(slam_map)
+        pose = (
+            _slam_pose_from_map_metadata(self._latest_slam_map_metadata)
+            if self._latest_slam_map_metadata.get("status") == "current"
+            else None
+        )
+        self._latest_slam_pose = dict(pose) if isinstance(pose, dict) else None
+        return True
+
+    def _save_slam_status(self) -> None:
+        if self._slam_status_path is None or self._latest_slam_map_metadata is None:
+            return
+        graph_payload = (
+            self.graph_memory.handle_tool("go2_graph_map_nodes", {})
+            if self.graph_memory is not None
+            else {"success": False, "graph_nodes": [], "anchored_node_count": 0}
+        )
+        graph_nodes = graph_payload if isinstance(graph_payload, dict) else {}
+        payload = {
+            "schema_version": 1,
+            "saved_at_epoch_s": time.time(),
+            "source": "authority_proxy_cached_movement_map_metadata",
+            "loaded_initial_status": self._loaded_slam_status,
+            "latest_slam_map_metadata": self._latest_slam_map_metadata,
+            "latest_slam_pose": self._latest_slam_pose,
+            "pose_available": self._latest_slam_pose is not None,
+            "graph_nodes": graph_nodes.get("graph_nodes", []),
+            "graph_overlay": bool(
+                self._latest_slam_map_metadata.get("graph_overlay")
+                or graph_nodes.get("anchored_node_count", 0)
+            ),
+            "relocalization_bundle_path": self._relocalization_bundle_context.get("bundle_path"),
+            "relocalization_map_file": self._relocalization_bundle_context.get(
+                "global_map_file"
+            ),
+            "relocalization_map_available": bool(
+                self._relocalization_bundle_context.get("map_available")
+            ),
+            "relocalization_map_point_count": self._relocalization_bundle_context.get(
+                "point_count"
+            ),
+            "relocalization_map_frame_id": self._relocalization_bundle_context.get("frame_id"),
+            "relocalization_bundle_saved_at_epoch_s": self._relocalization_bundle_context.get(
+                "saved_at_epoch_s"
+            ),
+        }
+        self._slam_status_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self._slam_status_path.with_suffix(self._slam_status_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(self._slam_status_path)
 
     def call_tool_text(
         self,
@@ -515,12 +1035,21 @@ def create_authority_proxy_app(
     envelope: MovementAuthorityEnvelope | None,
     proxy_url: str = "http://127.0.0.1:9992/mcp",
     upstream: ExternalHarnessMcpAdapter | None = None,
+    graph_memory_path: Path | None = None,
+    slam_status_path: Path | None = None,
+    initial_slam_status_path: Path | None = None,
+    initial_relocalization_bundle: Path | None = None,
 ) -> FastAPI:
     """Create a Streamable-HTTP MCP proxy app for Codex external harness runs."""
 
+    _publish_caption_route(graph_memory_path)
     proxy = ExternalHarnessAuthorityProxy(
         upstream or McpAdapter(upstream_url),
         envelope=envelope,
+        graph_memory_path=graph_memory_path,
+        slam_status_path=slam_status_path,
+        initial_slam_status_path=initial_slam_status_path,
+        initial_relocalization_bundle=initial_relocalization_bundle,
         url=proxy_url,
     )
     app = FastAPI()
@@ -540,6 +1069,27 @@ def create_authority_proxy_app(
 
     app.state.proxy = proxy
     return app
+
+
+def _publish_caption_route(graph_memory_path: Path | None) -> None:
+    """Tell the long-lived Go2 worker which operator run owns captions."""
+    if graph_memory_path is None:
+        return
+    logs_dir = graph_memory_path.expanduser().resolve().parent
+    run_dir = logs_dir.parent
+    operator_root = run_dir.parent
+    if logs_dir.name != "logs" or operator_root.name != "operator-console":
+        return
+    route_file = operator_root / ".active-caption-dir"
+    temporary = route_file.with_name(f".{route_file.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(str(logs_dir / "captions"), encoding="utf-8")
+        temporary.replace(route_file)
+    except OSError:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
 
 
 def _handle_proxy_request(
@@ -576,6 +1126,417 @@ def _text_result(text: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}]}
 
 
+def _navigation_map_tool_specs() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "go2_relocalization_status",
+            "description": "Read cached Go2 known-map relocalization status without raw transforms.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "go2_known_slam_map",
+            "description": "Read cached static known-map availability and graph badge context.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"return_image": {"type": "boolean", "default": True}},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "go2_navigation_map_context",
+            "description": "Read compact current/static navigation-map context and graph badges.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"return_image": {"type": "boolean", "default": True}},
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+
+def _load_relocalization_bundle_context(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {
+            "provided": False,
+            "map_available": False,
+            "status": "not_provided",
+        }
+    bundle_path = path.expanduser()
+    manifest_path = bundle_path / "manifest.json" if bundle_path.is_dir() else bundle_path
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {
+            "provided": True,
+            "map_available": False,
+            "status": "missing_manifest",
+            "bundle_path": str(bundle_path),
+        }
+    except (OSError, json.JSONDecodeError):
+        return {
+            "provided": True,
+            "map_available": False,
+            "status": "invalid_manifest",
+            "bundle_path": str(bundle_path),
+        }
+    if not isinstance(manifest, dict):
+        return {
+            "provided": True,
+            "map_available": False,
+            "status": "invalid_manifest",
+            "bundle_path": str(bundle_path),
+        }
+    global_map_file = manifest.get("global_map_file") or manifest.get("global_map_path")
+    map_path = Path(str(global_map_file)).expanduser() if global_map_file else None
+    if map_path is not None and not map_path.is_absolute():
+        map_path = manifest_path.parent / map_path
+    map_available = bool(
+        manifest.get("status") == "current"
+        and map_path is not None
+        and map_path.exists()
+    )
+    return {
+        "provided": True,
+        "map_available": map_available,
+        "status": str(manifest.get("status") or "unavailable"),
+        "bundle_path": str(manifest_path.parent),
+        "manifest_path": str(manifest_path),
+        "global_map_file": str(map_path) if map_path is not None else None,
+        "point_count": manifest.get("point_count"),
+        "frame_id": manifest.get("frame_id"),
+        "saved_at_epoch_s": manifest.get("saved_at_epoch_s"),
+        "backend_note": (
+            "Use global_map.pc2.lcm as RelocalizationModule.map_file input; "
+            "live point-cloud matching still controls acceptance."
+        ),
+    }
+
+
+def _sanitize_relocalization_bundle_context(bundle: dict[str, Any]) -> dict[str, Any]:
+    """Normalize save-tool metadata while keeping raw poses/transforms out."""
+
+    global_map_file = bundle.get("global_map_file") or bundle.get("global_map_path")
+    bundle_path = bundle.get("bundle_path")
+    manifest_path = bundle.get("manifest_path")
+    return {
+        "provided": True,
+        "map_available": bool(bundle.get("map_available")),
+        "status": str(bundle.get("status") or "unavailable"),
+        "reason": bundle.get("reason"),
+        "bundle_path": str(bundle_path) if bundle_path is not None else None,
+        "manifest_path": str(manifest_path) if manifest_path is not None else None,
+        "global_map_file": str(global_map_file) if global_map_file is not None else None,
+        "point_count": bundle.get("point_count"),
+        "frame_id": bundle.get("frame_id"),
+        "saved_at_epoch_s": bundle.get("saved_at_epoch_s"),
+        "costmap_saved": bundle.get("costmap_saved"),
+        "global_map_age_s": bundle.get("global_map_age_s"),
+        "max_age_s": bundle.get("max_age_s"),
+        "backend_note": (
+            "Use global_map.pc2.lcm as RelocalizationModule.map_file input; "
+            "live point-cloud matching still controls acceptance."
+        ),
+    }
+
+
+def _slam_pose_from_map_metadata(slam_map: dict[str, Any]) -> dict[str, Any] | None:
+    pose = slam_map.get("pose")
+    if not isinstance(pose, dict):
+        pose = slam_map.get("robot_pose")
+    if not isinstance(pose, dict):
+        return None
+    position = pose.get("position_m") if isinstance(pose.get("position_m"), dict) else pose
+    if not isinstance(position, dict):
+        return None
+    frame_id = pose.get("frame_id")
+    if not isinstance(frame_id, str) or frame_id != slam_map.get("map_frame"):
+        return None
+    try:
+        return {
+            "sequence": int(slam_map.get("pose_sequence") or slam_map.get("step_count") or 0),
+            "x": float(position.get("x")),
+            "y": float(position.get("y")),
+            "yaw_rad": float(pose.get("yaw_rad")),
+            "frame_id": frame_id,
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def _find_2d_slam_image_block(result: dict[str, Any]) -> dict[str, Any] | None:
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+    for block in reversed(content):
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "image" and block.get("mimeType") == "image/png":
+            return block
+    return None
+
+
+def _overlay_graph_badges_on_image_block(
+    image_block: dict[str, Any] | None,
+    slam_map: dict[str, Any],
+    graph_nodes: list[dict[str, Any]],
+) -> list[dict[str, Any]] | None:
+    if image_block is None:
+        return None
+    data = image_block.get("data")
+    if not isinstance(data, str):
+        return None
+    crop = slam_map.get("crop_grid_bounds")
+    origin = slam_map.get("origin_xy")
+    grid_size = slam_map.get("grid_size_cells")
+    resolution = slam_map.get("resolution_m_per_cell")
+    # PixelGoal's segmented renderer emits the complete occupancy grid rather
+    # than the cropped view used by the regular agent-map renderer.
+    if not isinstance(crop, dict) and isinstance(grid_size, list) and len(grid_size) >= 2:
+        crop = {
+            "x_min": 0,
+            "y_min": 0,
+            "x_max": grid_size[0],
+            "y_max": grid_size[1],
+        }
+    width_px = image_block.get("width_px") or slam_map.get("width_px")
+    height_px = image_block.get("height_px") or slam_map.get("height_px")
+    if (
+        not isinstance(crop, dict)
+        or not isinstance(origin, list)
+        or len(origin) < 2
+        or not isinstance(grid_size, list)
+        or len(grid_size) < 2
+    ):
+        return None
+    try:
+        image = PILImage.open(BytesIO(base64.b64decode(data))).convert("RGB")
+        width = int(width_px or image.width)
+        height = int(height_px or image.height)
+        if image.size != (width, height):
+            width, height = image.size
+        x0 = float(crop["x_min"])
+        y1 = float(crop["y_max"])
+        scale_x = width / max(1.0, float(crop["x_max"]) - x0)
+        scale_y = height / max(1.0, y1 - float(crop["y_min"]))
+        origin_x = float(origin[0])
+        origin_y = float(origin[1])
+        res = float(resolution)
+    except Exception:
+        return None
+    draw = ImageDraw.Draw(image)
+    displayed: list[dict[str, Any]] = []
+    occupied: list[tuple[float, float]] = []
+    graph_world_positions: list[tuple[float, float]] = []
+    radius = max(11, width // 42)
+    for node in graph_nodes:
+        slam_pose = node.get("slam_pose")
+        if not node.get("has_pano_images") or not isinstance(slam_pose, dict):
+            continue
+        try:
+            order_id = int(node["order_id"])
+            gx = (float(slam_pose["x"]) - origin_x) / res
+            gy = (float(slam_pose["y"]) - origin_y) / res
+            px = (gx - x0 + 0.5) * scale_x
+            py = (y1 - gy - 0.5) * scale_y
+            graph_world_positions.append((float(slam_pose["x"]), float(slam_pose["y"])))
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            continue
+        if not (0 <= px < width and 0 <= py < height):
+            continue
+        # Persistent graph markers must stay on their measured SLAM pose. Do
+        # not displace them to avoid overlap: the connector line makes a
+        # marker look like it belongs to a different area on dense maps.
+        marker_px = (px, py)
+        occupied.append(marker_px)
+        _draw_badge(draw, marker_px, radius, str(order_id))
+        displayed.append(
+            {
+                "order_id": order_id,
+                "id": str(node.get("id") or ""),
+                "name": str(node.get("name") or ""),
+                "kind": str(node.get("kind") or ""),
+            }
+        )
+    area_labels_drawn = False
+    suppressed_area_labels: list[str] = []
+    area_font = ImageFont.load_default(size=max(18, min(width, height) // 24))
+    for area in slam_map.get("slam_area_nodes", []) or []:
+        if not isinstance(area, dict) or not area.get("label"):
+            continue
+        pose = area.get("target_slam_pose")
+        if not isinstance(pose, dict):
+            continue
+        try:
+            area_x, area_y = float(pose["x"]), float(pose["y"])
+            graph_in_area = False
+            bbox = area.get("bbox_grid")
+            if isinstance(bbox, list) and len(bbox) == 4:
+                row_min, col_min, row_max, col_max = (float(value) for value in bbox)
+                for graph_x, graph_y in graph_world_positions:
+                    graph_col = (graph_x - origin_x) / res
+                    # ``region_labels`` uses the same bottom-origin grid
+                    # coordinates as ``OccupancyGrid``. Only the final image
+                    # renderer flips Y for display; do not flip it here.
+                    graph_row = (graph_y - origin_y) / res
+                    if col_min <= graph_col < col_max and row_min <= graph_row < row_max:
+                        graph_in_area = True
+                        break
+            else:
+                # Compatibility with older map metadata without a bbox.
+                graph_in_area = any(
+                    math.hypot(area_x - graph_x, area_y - graph_y) <= 0.75
+                    for graph_x, graph_y in graph_world_positions
+                )
+            if graph_in_area:
+                suppressed_area_labels.append(str(area["label"]))
+                continue
+            gx = (area_x - origin_x) / res
+            gy = (area_y - origin_y) / res
+            px = (gx - x0 + 0.5) * scale_x
+            py = (y1 - gy - 0.5) * scale_y
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            continue
+        if not (0 <= px < width and 0 <= py < height):
+            continue
+        label_px = _displaced_badge_position((px, py), occupied, radius, width, height)
+        occupied.append(label_px)
+        draw.text(
+            label_px,
+            str(area["label"]),
+            font=area_font,
+            fill=(255, 255, 255),
+            stroke_width=max(1, radius // 8),
+            stroke_fill=(0, 0, 0),
+            anchor="mm",
+        )
+        area_labels_drawn = True
+    if not displayed and not area_labels_drawn:
+        return []
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    image_block["data"] = base64.b64encode(buffer.getvalue()).decode("ascii")
+    image_block["width_px"] = image.width
+    image_block["height_px"] = image.height
+    image_block.setdefault("metadata", {})
+    if suppressed_area_labels:
+        image_block["metadata"]["suppressed_slam_area_labels"] = suppressed_area_labels
+    return displayed
+
+
+def _displayable_graph_nodes(graph_nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    displayed = []
+    for node in graph_nodes:
+        if not node.get("has_pano_images") or not node.get("slam_pose"):
+            continue
+        displayed.append(
+            {
+                "order_id": node.get("order_id"),
+                "id": node.get("id"),
+                "name": node.get("name"),
+                "kind": node.get("kind"),
+            }
+        )
+    return displayed
+
+
+def _memory_area_name_map(
+    slam_map: dict[str, Any],
+    graph_nodes: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Map suppressed live area labels to the marked memory node names."""
+    origin = slam_map.get("origin_xy")
+    resolution = slam_map.get("resolution_m_per_cell")
+    if not isinstance(origin, list) or len(origin) < 2:
+        return []
+    try:
+        origin_x, origin_y, res = float(origin[0]), float(origin[1]), float(resolution)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return []
+    result: list[dict[str, str]] = []
+    for area in slam_map.get("slam_area_nodes", []) or []:
+        if not isinstance(area, dict) or not area.get("label"):
+            continue
+        bbox = area.get("bbox_grid")
+        area_pose = area.get("target_slam_pose")
+        if not isinstance(area_pose, dict):
+            continue
+        try:
+            area_x, area_y = float(area_pose["x"]), float(area_pose["y"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        match: dict[str, Any] | None = None
+        for node in graph_nodes:
+            if not node.get("has_pano_images") or not isinstance(node.get("slam_pose"), dict):
+                continue
+            pose = node["slam_pose"]
+            try:
+                graph_col = (float(pose["x"]) - origin_x) / res
+                graph_row = (float(pose["y"]) - origin_y) / res
+                inside = False
+                if isinstance(bbox, list) and len(bbox) == 4:
+                    row_min, col_min, row_max, col_max = (float(value) for value in bbox)
+                    inside = col_min <= graph_col < col_max and row_min <= graph_row < row_max
+                else:
+                    inside = math.hypot(area_x - float(pose["x"]), area_y - float(pose["y"])) <= 0.75
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                continue
+            if inside:
+                match = node
+                break
+        if match is not None and str(match.get("name") or ""):
+            result.append({str(area["label"]): str(match["name"])})
+    return result
+
+
+def _draw_badge(
+    draw: ImageDraw.ImageDraw,
+    center: tuple[float, float],
+    radius: int,
+    text: str,
+) -> None:
+    cx, cy = center
+    font = ImageFont.load_default(size=max(18, radius * 2))
+    draw.text(
+        (cx, cy),
+        text,
+        font=font,
+        fill=(255, 255, 255),
+        stroke_width=max(1, radius // 8),
+        stroke_fill=(0, 0, 0),
+        anchor="mm",
+    )
+
+
+def _displaced_badge_position(
+    base: tuple[float, float],
+    occupied: list[tuple[float, float]],
+    radius: int,
+    width: int,
+    height: int,
+) -> tuple[float, float]:
+    min_distance = radius * 2.4
+    candidates = [base]
+    for ring in range(1, 4):
+        distance = ring * radius * 2.6
+        for angle_deg in (0, 45, 90, 135, 180, 225, 270, 315):
+            angle = math.radians(angle_deg)
+            candidates.append(
+                (
+                    base[0] + math.cos(angle) * distance,
+                    base[1] + math.sin(angle) * distance,
+                )
+            )
+    for candidate in candidates:
+        cx = min(max(radius + 2, candidate[0]), width - radius - 2)
+        cy = min(max(radius + 2, candidate[1]), height - radius - 2)
+        if all(math.hypot(cx - ox, cy - oy) >= min_distance for ox, oy in occupied):
+            return (cx, cy)
+    return (
+        min(max(radius + 2, base[0]), width - radius - 2),
+        min(max(radius + 2, base[1]), height - radius - 2),
+    )
+
+
 def _movement_timeout_result(
     name: str,
     arguments: dict[str, Any],
@@ -589,8 +1550,8 @@ def _movement_timeout_result(
             f"Movement tool '{name}' timed out waiting for completion after the command was "
             "sent. The robot may already be moving or may have made partial progress; this can "
             "happen when local planning or Go2 obstacle protection slows, clips, or blocks the "
-            "requested motion. Check go2_situation/observe and call stop_movement before retrying "
-            "a shorter corrective move."
+            "requested motion. Check go2_situation/observe, do not retry while motion may still "
+            "be active, and report the condition to the operator."
         ),
         "error_code": "MOVEMENT_COMPLETION_TIMEOUT_AFTER_DISPATCH",
         "metadata": {
@@ -598,7 +1559,7 @@ def _movement_timeout_result(
             "requested_arguments": arguments,
             "command_may_be_active": True,
             "upstream_exception": exc.__class__.__name__,
-            "recommended_next_action": "check_situation_observe_then_stop_or_retry_shorter",
+            "recommended_next_action": "check_situation_observe_then_report_operator",
             "external_authority": {
                 "tool_profile": envelope.tool_profile,
                 "movement_calls_signed": envelope.movement_calls_signed,
@@ -766,6 +1727,41 @@ def _rewrite_first_text_json(result: dict[str, Any], payload: dict[str, Any]) ->
     content = result.get("content")
     if isinstance(content, list) and content and isinstance(content[0], dict):
         content[0]["text"] = json.dumps(payload, ensure_ascii=False)
+
+
+def _sanitize_slam_map_metadata_for_agent(slam_map: dict[str, Any]) -> dict[str, Any]:
+    sanitized = {
+        key: value
+        for key, value in slam_map.items()
+        if key not in AGENT_HIDDEN_SLAM_MAP_FIELDS
+    }
+    areas = slam_map.get("slam_area_nodes")
+    if isinstance(areas, list):
+        sanitized["slam_area_nodes"] = [
+            {
+                key: value
+                for key, value in area.items()
+                if key not in AGENT_HIDDEN_SLAM_AREA_FIELDS
+            }
+            if isinstance(area, dict)
+            else area
+            for area in areas
+        ]
+    return sanitized
+
+
+def _sanitize_agent_navigation_result(result: dict[str, Any]) -> dict[str, Any]:
+    payload = _parse_first_text_json(result)
+    if payload is None:
+        return result
+    metadata = payload.get("metadata")
+    container = metadata if isinstance(metadata, dict) else payload
+    slam_map = container.get("2d_slam_map")
+    if not isinstance(slam_map, dict):
+        return result
+    container["2d_slam_map"] = _sanitize_slam_map_metadata_for_agent(slam_map)
+    _rewrite_first_text_json(result, payload)
+    return result
 
 
 def _extract_robot_status(result: dict[str, Any] | None) -> dict[str, Any] | None:

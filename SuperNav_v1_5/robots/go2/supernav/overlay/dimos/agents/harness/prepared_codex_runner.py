@@ -155,6 +155,26 @@ def execute_prepared_codex_run(
             )
             if proxy_url:
                 wait_for_proxy_ready(proxy_url, timeout_s=wait_for_proxy_s)
+        episode_start_ok, episode_start_reason = _start_navigation_episode_if_needed(audit)
+        if episode_start_reason:
+            _append_text(proxy_stdout_path, episode_start_reason)
+        if not episode_start_ok:
+            result = PreparedCodexExecutionResult(
+                ok=False,
+                returncode=1,
+                reason=episode_start_reason or "failed to start navigation episode",
+                audit_path=audit_path,
+                codex_stdout_path=codex_stdout_path,
+                codex_stderr_path=codex_stderr_path,
+                proxy_stdout_path=proxy_stdout_path if proxy_proc is not None else None,
+                proxy_stderr_path=proxy_stderr_path if proxy_proc is not None else None,
+                result_path=result_path,
+            )
+            result_path.write_text(
+                json.dumps(result.model_dump(), indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            return result
         smoke_ok, smoke_reason = _run_mcp_smoke_if_needed(audit=audit, env=env)
         if not smoke_ok:
             result = PreparedCodexExecutionResult(
@@ -207,6 +227,9 @@ def execute_prepared_codex_run(
             timeout_s=timeout_s,
             stop_event=stop_event,
         )
+        finalization_reason = _finalize_relocalization_bundle_if_needed(audit)
+        if finalization_reason:
+            _append_text(proxy_stdout_path, finalization_reason)
         ok = returncode == 0
         result = PreparedCodexExecutionResult(
             ok=ok,
@@ -373,6 +396,62 @@ def _command_with_images(command: list[str], paths: list[Path]) -> list[str]:
     split = len(command) - 1 if command[-1] == "-" else len(command)
     image_args = [part for path in paths for part in ("--image", str(path))]
     return [*command[:split], *image_args, *command[split:]]
+
+
+def _start_navigation_episode_if_needed(audit: dict[str, Any]) -> tuple[bool, str | None]:
+    if audit.get("prompt_mode") != "long_instruction":
+        return True, None
+    proxy_url = _optional_str(audit.get("proxy_url") or audit.get("mcp_url"))
+    if proxy_url is None:
+        return False, "Failed navigation episode start: no proxy URL.\n"
+    try:
+        adapter = McpAdapter(proxy_url, timeout=15)
+        adapter.initialize()
+        visible = {str(tool.get("name")) for tool in adapter.list_tools()}
+        if "go2_start_navigation_episode" not in visible:
+            return (
+                False,
+                "Failed navigation episode start: "
+                "go2_start_navigation_episode is not visible.\n",
+            )
+        adapter.call_tool(
+            "go2_start_navigation_episode",
+            {
+                "clear_slam_map": True,
+                "reason": "agent-long-inst episode start",
+            },
+        )
+    except Exception as exc:
+        return (
+            False,
+            "Failed navigation episode start: "
+            f"{exc.__class__.__name__}: {exc}\n",
+        )
+    return True, "Started Go2 navigation episode with SLAM reset.\n"
+
+
+def _finalize_relocalization_bundle_if_needed(audit: dict[str, Any]) -> str | None:
+    if not audit.get("slam_status_path") and audit.get("prompt_mode") != "long_instruction":
+        return None
+    proxy_url = _optional_str(audit.get("proxy_url") or audit.get("mcp_url"))
+    if proxy_url is None:
+        return "Skipped relocalization bundle finalization: no proxy URL.\n"
+    try:
+        adapter = McpAdapter(proxy_url, timeout=15)
+        adapter.initialize()
+        visible = {str(tool.get("name")) for tool in adapter.list_tools()}
+        if "go2_save_relocalization_bundle" not in visible:
+            return (
+                "Skipped relocalization bundle finalization: "
+                "go2_save_relocalization_bundle is not visible.\n"
+            )
+        adapter.call_tool("go2_save_relocalization_bundle", {})
+    except Exception as exc:
+        return (
+            "Failed relocalization bundle finalization: "
+            f"{exc.__class__.__name__}: {exc}\n"
+        )
+    return "Finalized Go2 relocalization bundle for episode.\n"
 
 
 def wait_for_proxy_ready(proxy_url: str, *, timeout_s: float) -> None:

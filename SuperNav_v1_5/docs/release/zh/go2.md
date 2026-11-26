@@ -2,7 +2,7 @@
 
 # Unitree Go2 安装
 
-SuperNav 的 map-backed PixelGoal 使用四路 GoPro 图像、实时 LiDAR 地图和局部规划器执行图像目标导航。安装后继续阅读[操作教程](go2-usage.md)；源码修改和功能测试分别见[维护](go2-maintenance.md)与[测试](go2-testing.md)。
+Go2 上的 SuperNav-1.5 结合四路 GoPro 图像、实时 LiDAR 建图、Habitat 风格区域分割、带标注占据图、memory nodes 和 agent-guided 跨会话重定位。PixelGoal 与局部规划器负责执行短程导航；structured spatial memory 是实验中唯一启用的空间记忆系统。安装后继续阅读[操作教程](go2-usage.md)；源码修改和功能测试分别见[维护](go2-maintenance.md)与[测试](go2-testing.md)。
 
 部署环境：Jetson aarch64、L4T R36.4 系列、Python 3.12、四路 GoPro HERO8 USB 网络相机及 NVIDIA ffmpeg。为部署创建独立目录和 Python 环境；运行时独占相机、MCP 端口及机器人 LCM 通道。
 
@@ -37,7 +37,7 @@ python3 -m supernav.prepare
 ./deploy/bin/check.sh --static
 ```
 
-DimOS HEAD 应为 `79c9ed163ec6b1abd278a9161f0c74f4562f1231`。`prepare` 将固定版本的公开源码、补丁和新增文件组装到 `runtime/dimos/`，生成 blueprint 注册表。LFS 演示数据保留为指针即可。
+DimOS HEAD 应为 `79c9ed163ec6b1abd278a9161f0c74f4562f1231`。`prepare` 将固定版本的公开源码与审计过的 SuperNav-1.5 实现文件组装到 `runtime/dimos/`，并生成 blueprint 注册表。移植实现以 DimOS commit `ae8160cc9c7ea0494b18a47395799e2698d6c891` 为基础，并包含 `supernav/manifest.json` 记录的三个审计 backport；不包含 SuperNav-2.0 的 XYTheta 导航。LFS 演示数据保留为指针即可。
 
 **后续命令和路径均以 `SuperNav/robots/go2/` 为部署根目录。**
 
