@@ -1,0 +1,4356 @@
+diff --git a/dimos/hardware/sensors/camera/webcam.py b/dimos/hardware/sensors/camera/webcam.py
+index bd0a939..c995eeb 100644
+--- a/dimos/hardware/sensors/camera/webcam.py
++++ b/dimos/hardware/sensors/camera/webcam.py
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ 
+ from functools import cache
++import math
+ import threading
+ import time
+ from typing import Literal
+@@ -29,15 +30,36 @@ from dimos.utils.reactive import backpressure
+ 
+ 
+ class WebcamConfig(CameraConfig):
+-    camera_index: int = 0  # /dev/videoN
++    camera_index: int | str = 0  # numeric index or stable /dev/v4l path
+     width: int = 640
+     height: int = 480
+     fps: float = 15.0
++    fourcc: str | None = Field(default=None, min_length=4, max_length=4)
++    publish_fps: float = Field(default=0.0, ge=0.0)
++    warmup_frames: int = Field(default=0, ge=0)
++    sharpness: float | None = None
+     camera_info: CameraInfo = Field(default_factory=CameraInfo)
+     frame_id_prefix: str | None = None
+     stereo_slice: Literal["left", "right"] | None = None  # For stereo cameras
+ 
+ 
++def _frame_due(now_s: float, next_emit_s: float | None, publish_fps: float) -> bool:
++    return publish_fps <= 0 or next_emit_s is None or now_s >= next_emit_s
++
++
++def _advance_frame_clock(
++    now_s: float, next_emit_s: float | None, publish_fps: float
++) -> float | None:
++    """Advance an ideal output clock without accumulating capture jitter."""
++    if publish_fps <= 0:
++        return None
++    period_s = 1.0 / publish_fps
++    if next_emit_s is None:
++        return now_s + period_s
++    elapsed_periods = max(1, math.floor((now_s - next_emit_s) / period_s) + 1)
++    return next_emit_s + elapsed_periods * period_s
++
++
+ class Webcam(CameraHardware):
+     config: WebcamConfig
+ 
+@@ -59,7 +81,7 @@ class Webcam(CameraHardware):
+             # Start the camera when someone subscribes
+             try:
+                 self.start()  # type: ignore[no-untyped-call]
+-            except Exception as e:
++            except Exception as e:  # noqa: BLE001 — forward hardware startup errors
+                 observer.on_error(e)
+                 return
+ 
+@@ -82,8 +104,27 @@ class Webcam(CameraHardware):
+             raise RuntimeError(f"Failed to open camera {self.config.camera_index}")
+ 
+         # Set camera properties
++        self._capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # type: ignore[attr-defined]
++        if self.config.fourcc:
++            self._capture.set(  # type: ignore[attr-defined]
++                cv2.CAP_PROP_FOURCC,
++                cv2.VideoWriter_fourcc(*self.config.fourcc),
++            )
+         self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)  # type: ignore[attr-defined]
+         self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)  # type: ignore[attr-defined]
++        if self.config.fps > 0:
++            self._capture.set(cv2.CAP_PROP_FPS, self.config.fps)  # type: ignore[attr-defined]
++        if self.config.sharpness is not None:
++            self._capture.set(cv2.CAP_PROP_SHARPNESS, self.config.sharpness)  # type: ignore[attr-defined]
++        if self.config.fourcc:
++            negotiated = _decode_fourcc(self._capture.get(cv2.CAP_PROP_FOURCC))  # type: ignore[attr-defined]
++            if negotiated != self.config.fourcc:
++                self._capture.release()  # type: ignore[attr-defined]
++                self._capture = None
++                raise RuntimeError(
++                    f"Camera {self.config.camera_index} requested {self.config.fourcc} "
++                    f"but negotiated {negotiated or 'unknown'}"
++                )
+ 
+         # Clear stop event and start the capture thread
+         self._stop_event.clear()
+@@ -111,12 +152,13 @@ class Webcam(CameraHardware):
+         else:
+             return f"{self.config.frame_id_prefix}/{frame}"
+ 
+-    def capture_frame(self) -> Image:
+-        # Read frame
++    def _read_frame(self):  # type: ignore[no-untyped-def]
+         ret, frame = self._capture.read()  # type: ignore[attr-defined]
+         if not ret:
+             raise RuntimeError(f"Failed to read frame from camera {self.config.camera_index}")
++        return frame
+ 
++    def _to_image(self, frame, *, ts: float | None = None) -> Image:  # type: ignore[no-untyped-def]
+         # Convert BGR to RGB (OpenCV uses BGR by default)
+         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+ 
+@@ -127,7 +169,7 @@ class Webcam(CameraHardware):
+             frame_rgb,
+             format=ImageFormat.RGB,  # We converted to RGB above
+             frame_id=self._frame("camera_optical"),  # Standard frame ID for camera images
+-            ts=time.time(),  # Current timestamp
++            ts=time.time() if ts is None else ts,
+         )
+ 
+         if self.config.stereo_slice in ("left", "right"):
+@@ -139,17 +181,32 @@ class Webcam(CameraHardware):
+ 
+         return image
+ 
++    def capture_frame(self) -> Image:
++        return self._to_image(self._read_frame())
++
+     def _capture_loop(self) -> None:
+         """Capture frames at the configured frequency"""
+         frame_interval = 0.0 if self.config.fps <= 0 else 1.0 / self.config.fps
+         next_frame_time = time.time()
++        next_emit_s: float | None = None
++        warmup_remaining = self.config.warmup_frames
+ 
+         while self._capture and not self._stop_event.is_set():
+-            image = self.capture_frame()
+-
+-            # Emit the image to the observer only if not stopping
+-            if self._observer and not self._stop_event.is_set():
+-                self._observer.on_next(image)
++            frame = self._read_frame()
++            captured_at = time.time()
++            captured_monotonic_s = time.monotonic()
++
++            if warmup_remaining > 0:
++                warmup_remaining -= 1
++            elif _frame_due(captured_monotonic_s, next_emit_s, self.config.publish_fps):
++                next_emit_s = _advance_frame_clock(
++                    captured_monotonic_s, next_emit_s, self.config.publish_fps
++                )
++                # Convert only frames that will be published. This keeps a 30 Hz
++                # camera fresh without paying RGB conversion cost for dropped frames.
++                image = self._to_image(frame, ts=captured_at)
++                if self._observer and not self._stop_event.is_set():
++                    self._observer.on_next(image)
+ 
+             # Wait for next frame time or until stopped
+             if frame_interval <= 0:
+@@ -169,3 +226,8 @@ class Webcam(CameraHardware):
+         return self.config.camera_info
+ 
+     def emit(self, image: Image) -> None: ...
++
++
++def _decode_fourcc(value: float) -> str:
++    encoded = int(value)
++    return "".join(chr((encoded >> (8 * index)) & 0xFF) for index in range(4)).rstrip("\x00")
+diff --git a/dimos/perception/detection/type/detection3d/pointcloud.py b/dimos/perception/detection/type/detection3d/pointcloud.py
+index c70315b..352309a 100644
+--- a/dimos/perception/detection/type/detection3d/pointcloud.py
++++ b/dimos/perception/detection/type/detection3d/pointcloud.py
+@@ -105,6 +105,7 @@ class Detection3DPC(Detection3D):
+         # filters are to be adjusted based on the sensor noise characteristics if feeding
+         # sensor data directly
+         filters: list[PointCloudFilter] | None = None,
++        bbox_margin_px: int = 5,
+     ) -> Detection3DPC | None:
+         """Create a Detection3D from a 2D detection by projecting world pointcloud.
+ 
+@@ -120,6 +121,7 @@ class Detection3DPC(Detection3D):
+             camera_info: Camera calibration info
+             world_to_camerlka_transform: Transform from world to camera frame
+             filters: List of functions to apply to the pointcloud for filtering
++            bbox_margin_px: Extra pixels added around the 2D box before selecting points.
+         Returns:
+             Detection3D with filtered pointcloud, or None if no valid points
+         """
+@@ -177,7 +179,7 @@ class Detection3DPC(Detection3D):
+         x_min, y_min, x_max, y_max = det.bbox
+ 
+         # Find points within this detection box (with small margin)
+-        margin = 5  # pixels
++        margin = max(0, int(bbox_margin_px))
+         in_box_mask = (
+             (points_2d[:, 0] >= x_min - margin)
+             & (points_2d[:, 0] <= x_max + margin)
+diff --git a/dimos/robot/unitree/connection.py b/dimos/robot/unitree/connection.py
+index 44101cc..554239c 100644
+--- a/dimos/robot/unitree/connection.py
++++ b/dimos/robot/unitree/connection.py
+@@ -13,8 +13,16 @@
+ # limitations under the License.
+ 
+ import asyncio
++from collections.abc import Mapping, Sequence
++from concurrent.futures import TimeoutError as FutureTimeoutError
+ from dataclasses import dataclass
+ import functools
++import inspect
++import json
++import math
++import os
++import random
++import socket
+ import threading
+ import time
+ from typing import Any, TypeAlias, TypeVar
+@@ -25,20 +33,20 @@ from reactivex import operators as ops
+ from reactivex.observable import Observable
+ from reactivex.subject import Subject
+ from unitree_webrtc_connect.constants import (
++    DATA_CHANNEL_TYPE,
+     RTC_TOPIC,
+     SPORT_CMD,
+     VUI_COLOR,
+ )
+-from unitree_webrtc_connect.webrtc_driver import (
+-    UnitreeWebRTCConnection as LegionConnection,
+-    WebRTCConnectionMethod,
+-)
+ 
+ from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
+ from dimos.core.resource import Resource
+ from dimos.msgs.geometry_msgs.Pose import Pose
++from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
++from dimos.msgs.geometry_msgs.Quaternion import Quaternion
+ from dimos.msgs.geometry_msgs.Transform import Transform
+ from dimos.msgs.geometry_msgs.Twist import Twist
++from dimos.msgs.geometry_msgs.Vector3 import Vector3
+ from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
+ from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
+ from dimos.robot.unitree.type.lidar import (
+@@ -49,12 +57,21 @@ from dimos.robot.unitree.type.lowstate import LowStateMsg
+ from dimos.robot.unitree.type.odometry import Odometry
+ from dimos.types.timestamped import Timestamped
+ from dimos.utils.decorators.decorators import simple_mcache
++from dimos.utils.logging_config import setup_logger
+ from dimos.utils.reactive import backpressure, callback_to_observable
+ 
+ VideoMessage: TypeAlias = NDArray[np.uint8]  # Shape: (height, width, 3)
+ 
++logger = setup_logger()
+ 
+ _T = TypeVar("_T", bound=Timestamped)
++DEFAULT_PUBLISH_REQUEST_TIMEOUT_S = 8.0
++DEFAULT_CONNECT_READY_TIMEOUT_S = 30.0
++DEFAULT_WEBRTC_UDP_RCVBUF_BYTES = 67_108_864
++DEFAULT_WEBRTC_HEARTBEAT_TIMEOUT_S = 8.0
++DEFAULT_WEBRTC_RECONNECT_DELAY_S = 2.0
++DEFAULT_GO2_VIDEO_FPS = 4.0
++PUBLISH_REQUEST_TIMEOUT_STATUS_CODE = -408
+ 
+ 
+ def time_is_now(x: _T) -> _T:
+@@ -62,6 +79,107 @@ def time_is_now(x: _T) -> _T:
+     return x
+ 
+ 
++def _env_float(name: str, default: float) -> float:
++    try:
++        return float(os.environ.get(name, default))
++    except (TypeError, ValueError):
++        return default
++
++
++def _env_int(name: str, default: int) -> int:
++    try:
++        return int(os.environ.get(name, default))
++    except (TypeError, ValueError):
++        return default
++
++
++def _video_frame_due(now_s: float, last_emit_s: float | None, fps: float) -> bool:
++    return fps <= 0 or last_emit_s is None or now_s - last_emit_s >= 1.0 / fps
++
++
++def _advance_video_frame_clock(
++    now_s: float, last_emit_s: float | None, fps: float
++) -> float:
++    """Advance the ideal publication clock without accumulating arrival jitter."""
++    if fps <= 0 or last_emit_s is None:
++        return now_s
++    period_s = 1.0 / fps
++    elapsed_periods = max(1, math.floor((now_s - last_emit_s) / period_s))
++    return last_emit_s + elapsed_periods * period_s
++
++
++def _configure_aioice_udp_receive_buffer(size_bytes: int) -> bool:
++    if size_bytes <= 0:
++        return False
++    try:
++        from aioice import turn
++    except ImportError:
++        return False
++    turn.UDP_SOCKET_BUFFER_SIZE = size_bytes
++    return True
++
++
++def _webrtc_local_ip(peer_ip: str) -> str | None:
++    override = os.environ.get("DIMOS_GO2_WEBRTC_LOCAL_IP", "").strip()
++    if override:
++        return override
++    try:
++        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
++            sock.connect((peer_ip, 9))
++            return str(sock.getsockname()[0])
++    except OSError:
++        return None
++
++
++def _configure_aioice_host_address(local_ip: str | None) -> bool:
++    if not local_ip:
++        return False
++    try:
++        from aioice import ice
++    except ImportError:
++        return False
++
++    def get_host_addresses(use_ipv4: bool, use_ipv6: bool) -> list[str]:
++        del use_ipv6
++        return [local_ip] if use_ipv4 else []
++
++    ice.get_host_addresses = get_host_addresses
++    return True
++
++
++def _sport_mode_state_to_pose(
++    message: Mapping[str, Any], *, ts: float | None = None
++) -> PoseStamped | None:
++    data = message.get("data")
++    if not isinstance(data, Mapping):
++        return None
++    if "position" not in data and isinstance(data.get("data"), Mapping):
++        data = data["data"]
++
++    position = data.get("position")
++    imu_state = data.get("imu_state")
++    quaternion = imu_state.get("quaternion") if isinstance(imu_state, Mapping) else None
++    if not isinstance(position, Sequence) or not isinstance(quaternion, Sequence):
++        return None
++    if len(position) < 3 or len(quaternion) < 4:
++        return None
++
++    try:
++        px, py, pz = (float(position[index]) for index in range(3))
++        qw, qx, qy, qz = (float(quaternion[index]) for index in range(4))
++    except (TypeError, ValueError):
++        return None
++    if not all(math.isfinite(value) for value in (px, py, pz, qw, qx, qy, qz)):
++        return None
++
++    return PoseStamped(
++        ts=time.time() if ts is None else ts,
++        frame_id="sport_mode_odom",
++        position=Vector3(px, py, pz),
++        orientation=Quaternion(qx, qy, qz, qw),
++    )
++
++
+ @dataclass
+ class SerializableVideoFrame:
+     """Pickleable wrapper for av.VideoFrame with all metadata"""
+@@ -94,34 +212,93 @@ class UnitreeWebRTCConnection(Resource):
+     _SPORT_API_ID_RAGEMODE: int = 2059
+ 
+     def __init__(self, ip: str, mode: str = "ai") -> None:
++        from unitree_webrtc_connect.webrtc_driver import (
++            UnitreeWebRTCConnection as LegionConnection,
++            WebRTCConnectionMethod,
++        )
++
+         self.ip = ip
+         self.mode = mode
++        self.publish_request_timeout_s = _env_float(
++            "DIMOS_GO2_PUBLISH_REQUEST_TIMEOUT_S", DEFAULT_PUBLISH_REQUEST_TIMEOUT_S
++        )
++        self.connect_ready_timeout_s = _env_float(
++            "DIMOS_GO2_CONNECT_READY_TIMEOUT_S", DEFAULT_CONNECT_READY_TIMEOUT_S
++        )
++        self.webrtc_udp_rcvbuf_bytes = _env_int(
++            "DIMOS_GO2_WEBRTC_RCVBUF_BYTES", DEFAULT_WEBRTC_UDP_RCVBUF_BYTES
++        )
++        self.video_fps = _env_float("DIMOS_GO2_VIDEO_FPS", DEFAULT_GO2_VIDEO_FPS)
++        self.heartbeat_timeout_s = _env_float(
++            "DIMOS_GO2_HEARTBEAT_TIMEOUT_S", DEFAULT_WEBRTC_HEARTBEAT_TIMEOUT_S
++        )
++        self.reconnect_delay_s = _env_float(
++            "DIMOS_GO2_RECONNECT_DELAY_S", DEFAULT_WEBRTC_RECONNECT_DELAY_S
++        )
++        logger.info("Go2 WebRTC video publish FPS cap: %s", self.video_fps)
++        _configure_aioice_udp_receive_buffer(self.webrtc_udp_rcvbuf_bytes)
++        self.last_publish_request_diagnostic: dict[str, Any] | None = None
++        self.connection_error: Exception | None = None
+         self.stop_timer: threading.Timer | None = None
+         self.cmd_vel_timeout = 0.2
+-        self.conn = LegionConnection(WebRTCConnectionMethod.LocalSTA, ip=self.ip)
++        self._topic_callbacks: dict[str, Any] = {}
++        self._video_track_callbacks: set[Any] = set()
++        self._connected_at_s = 0.0
++        self._stopping = False
++        self.webrtc_local_ip = _webrtc_local_ip(self.ip)
++        conn_kwargs: dict[str, Any] = {"ip": self.ip}
++        aes_128_key = os.environ.get("UNITREE_AES_128_KEY") or os.environ.get(
++            "DIMOS_UNITREE_AES_128_KEY"
++        )
++        if aes_128_key:
++            if "aes_128_key" not in inspect.signature(LegionConnection).parameters:
++                logger.warning(
++                    "UNITREE_AES_128_KEY is set, but the installed "
++                    "unitree_webrtc_connect package does not support aes_128_key; "
++                    "continuing without passing the key."
++                )
++            else:
++                conn_kwargs["aes_128_key"] = aes_128_key
++        self.conn = LegionConnection(WebRTCConnectionMethod.LocalSTA, **conn_kwargs)
+         self.connect()
+ 
+     def connect(self) -> None:
++        local_ip = getattr(self, "webrtc_local_ip", None)
++        if _configure_aioice_host_address(local_ip):
++            logger.info("Go2 WebRTC ICE local address: %s", local_ip)
++        else:
++            logger.warning(
++                "Could not select a local WebRTC address for Go2 %s",
++                getattr(self, "ip", "<unknown>"),
++            )
+         self.loop = asyncio.new_event_loop()
+         self.task = None
+         self.connected_event = asyncio.Event()
+         self.connection_ready = threading.Event()
++        self.connection_error = None
++        self._stopping = False
++        self._topic_callbacks = getattr(self, "_topic_callbacks", {})
++        self._video_track_callbacks = getattr(self, "_video_track_callbacks", set())
+ 
+         async def async_connect() -> None:
+-            await self.conn.connect()
+-            await self.conn.datachannel.disableTrafficSaving(True)
+-
+-            self.conn.datachannel.set_decoder(decoder_type="native")
+-
+-            await self.conn.datachannel.pub_sub.publish_request_new(
+-                RTC_TOPIC["MOTION_SWITCHER"], {"api_id": 1002, "parameter": {"name": self.mode}}
+-            )
+-
+-            self.connected_event.set()
+-            self.connection_ready.set()
+-
+-            while True:
+-                await asyncio.sleep(1)
++            try:
++                await self._connect_session()
++
++                self.connected_event.set()
++                self.connection_ready.set()
++
++                while not self._stopping:
++                    await asyncio.sleep(1)
++                    reason = self._connection_unhealthy_reason()
++                    if reason:
++                        await self._reconnect(reason)
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:
++                self.connection_error = exc
++                raise
++            finally:
++                self.connection_ready.set()
+ 
+         def start_background_loop() -> None:
+             asyncio.set_event_loop(self.loop)
+@@ -131,12 +308,121 @@ class UnitreeWebRTCConnection(Resource):
+         self.loop = asyncio.new_event_loop()
+         self.thread = threading.Thread(target=start_background_loop, daemon=True)
+         self.thread.start()
+-        self.connection_ready.wait()
++        if not self.connection_ready.wait(timeout=self.connect_ready_timeout_s):
++            self._stop_background_loop()
++            raise TimeoutError(
++                f"Timed out after {self.connect_ready_timeout_s}s waiting for Unitree WebRTC "
++                "connection to become ready."
++            )
++        if self.connection_error is not None:
++            self._stop_background_loop()
++            raise RuntimeError("Unitree WebRTC connection failed before becoming ready.") from (
++                self.connection_error
++            )
++
++    async def _connect_session(self) -> None:
++        await self.conn.connect()
++        await self.conn.datachannel.disableTrafficSaving(True)
++        self.conn.datachannel.set_decoder(decoder_type="native")
++
++        motion_switcher_request = {"api_id": 1002, "parameter": {"name": self.mode}}
++        started_at_s = time.monotonic()
++        try:
++            await asyncio.wait_for(
++                self.conn.datachannel.pub_sub.publish_request_new(
++                    RTC_TOPIC["MOTION_SWITCHER"], motion_switcher_request
++                ),
++                timeout=self.publish_request_timeout_s,
++            )
++        except TimeoutError:
++            self.last_publish_request_diagnostic = self._publish_request_timeout_result(
++                topic=RTC_TOPIC["MOTION_SWITCHER"],
++                data=motion_switcher_request,
++                timeout_s=self.publish_request_timeout_s,
++                started_at_s=started_at_s,
++                phase="connect_warmup",
++            )
++
++        self._connected_at_s = time.monotonic()
++        for topic, callback in tuple(self._topic_callbacks.items()):
++            self.conn.datachannel.pub_sub.subscribe(topic, callback)
++        for callback in tuple(self._video_track_callbacks):
++            self.conn.video.add_track_callback(callback)
++        if self._video_track_callbacks:
++            self.conn.video.switchVideoChannel(True)
++
++    def _connection_unhealthy_reason(self) -> str | None:
++        pc = getattr(self.conn, "pc", None)
++        datachannel = getattr(self.conn, "datachannel", None)
++        channel = getattr(datachannel, "channel", None)
++        peer_state = getattr(pc, "connectionState", None)
++        ice_state = getattr(pc, "iceConnectionState", None)
++        channel_state = getattr(channel, "readyState", None)
++
++        if peer_state in {"closed", "disconnected", "failed"}:
++            return f"peer_{peer_state}"
++        if ice_state in {"closed", "disconnected", "failed"}:
++            return f"ice_{ice_state}"
++        if channel_state != "open":
++            return f"datachannel_{channel_state or 'missing'}"
++        if self.heartbeat_timeout_s <= 0:
++            return None
++
++        heartbeat = getattr(getattr(datachannel, "heartbeat", None), "heartbeat_response", None)
++        if heartbeat is None:
++            if time.monotonic() - self._connected_at_s > self.heartbeat_timeout_s:
++                return "heartbeat_missing"
++            return None
++        age_s = time.time() - heartbeat
++        if age_s > self.heartbeat_timeout_s:
++            return f"heartbeat_stale_{age_s:.1f}s"
++        return None
++
++    async def _reconnect(self, reason: str) -> None:
++        logger.warning("Go2 WebRTC unhealthy; reconnecting", reason=reason)
++        while not self._stopping:
++            try:
++                try:
++                    await self.conn.disconnect()
++                except Exception:
++                    logger.warning("Go2 WebRTC disconnect cleanup failed", exc_info=True)
++                local_ip = _webrtc_local_ip(self.ip)
++                if local_ip:
++                    self.webrtc_local_ip = local_ip
++                _configure_aioice_host_address(self.webrtc_local_ip)
++                await self._connect_session()
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:
++                self.connection_error = exc
++                logger.warning(
++                    "Go2 WebRTC reconnect failed; retrying",
++                    delay_s=self.reconnect_delay_s,
++                    exc_info=True,
++                )
++                await asyncio.sleep(max(0.1, self.reconnect_delay_s))
++                continue
++            self.connection_error = None
++            logger.warning(
++                "Go2 WebRTC reconnected",
++                topics=list(self._topic_callbacks),
++            )
++            return
++
++    def _stop_background_loop(self) -> None:
++        self._stopping = True
++        if getattr(self, "loop", None) and self.loop.is_running():
++            if getattr(self, "task", None) and not self.task.done():
++                self.loop.call_soon_threadsafe(self.task.cancel)
++            self.loop.call_soon_threadsafe(self.loop.stop)
++        if getattr(self, "thread", None) and self.thread.is_alive():
++            self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+ 
+     def start(self) -> None:
+         pass
+ 
+     def stop(self) -> None:
++        self._stopping = True
+         # Cancel timer
+         if self.stop_timer:
+             self.stop_timer.cancel()
+@@ -176,15 +462,36 @@ class UnitreeWebRTCConnection(Resource):
+         """
+         x, y, yaw = twist.linear.x, twist.linear.y, twist.angular.z
+ 
+-        # WebRTC coordinate mapping:
++        # DIMOS_GO2_MOVE_API selects the drive path:
++        #   "1008"     -> SPORT_MOD Move (api_id 1008): parameter x/y/z are ACTUAL
++        #                 velocities (m/s, m/s, rad/s) in the robot frame, so cmd_vel
++        #                 maps 1:1 to real speed (NO joystick V_max scale/deadzone).
++        #   "joystick" -> WIRELESS_CONTROLLER (default, legacy): the value is a
++        #                 normalized joystick deflection [-1,1], real v = defl x V_max.
++        move_api = os.environ.get("DIMOS_GO2_MOVE_API", "joystick").strip().lower()
++
++        # WebRTC coordinate mapping (joystick path):
+         # x - Positive right, negative left
+         # y - positive forward, negative backwards
+         # yaw - Positive rotate right, negative rotate left
+         async def async_move() -> None:
+-            self.conn.datachannel.pub_sub.publish_without_callback(
+-                RTC_TOPIC["WIRELESS_CONTROLLER"],
+-                data={"lx": -y, "ly": x, "rx": -yaw, "ry": 0},
+-            )
++            if move_api == "1008":
++                # Sport Move: parameter {x=forward m/s, y=left m/s, z=yaw rad/s}
++                # (robot frame; verify signs with a small drive_calib after enabling).
++                gid = int(time.time() * 1000) % 2147483648 + random.randint(0, 1000)
++                payload = {
++                    "header": {"identity": {"id": gid, "api_id": SPORT_CMD["Move"]}},
++                    "parameter": json.dumps({"x": x, "y": y, "z": yaw}),
++                }
++                self.conn.datachannel.pub_sub.publish_without_callback(
++                    RTC_TOPIC["SPORT_MOD"], data=payload,
++                    msg_type=DATA_CHANNEL_TYPE["REQUEST"],
++                )
++            else:
++                self.conn.datachannel.pub_sub.publish_without_callback(
++                    RTC_TOPIC["WIRELESS_CONTROLLER"],
++                    data={"lx": -y, "ly": x, "rx": -yaw, "ry": 0},
++                )
+ 
+         async def async_move_duration() -> None:
+             """Send movement commands continuously for the specified duration."""
+@@ -225,6 +532,7 @@ class UnitreeWebRTCConnection(Resource):
+         def subscribe_in_thread(cb) -> None:  # type: ignore[no-untyped-def]
+             # Run the subscription in the background thread that has the event loop
+             def run_subscription() -> None:
++                self._topic_callbacks[topic_name] = cb
+                 self.conn.datachannel.pub_sub.subscribe(topic_name, cb)
+ 
+             # Use call_soon_threadsafe to run in the background thread
+@@ -233,6 +541,8 @@ class UnitreeWebRTCConnection(Resource):
+         def unsubscribe_in_thread(cb) -> None:  # type: ignore[no-untyped-def]
+             # Run the unsubscription in the background thread that has the event loop
+             def run_unsubscription() -> None:
++                if self._topic_callbacks.get(topic_name) is cb:
++                    self._topic_callbacks.pop(topic_name, None)
+                 self.conn.datachannel.pub_sub.unsubscribe(topic_name)
+ 
+             # Use call_soon_threadsafe to run in the background thread
+@@ -244,11 +554,69 @@ class UnitreeWebRTCConnection(Resource):
+         )
+ 
+     # Generic sync API call (we jump into the client thread)
+-    def publish_request(self, topic: str, data: dict[Any, Any]) -> Any:
+-        future = asyncio.run_coroutine_threadsafe(
+-            self.conn.datachannel.pub_sub.publish_request_new(topic, data), self.loop
+-        )
+-        return future.result()
++    def publish_request(
++        self, topic: str, data: dict[Any, Any], timeout_s: float | None = None
++    ) -> Any:
++        effective_timeout_s = self.publish_request_timeout_s if timeout_s is None else timeout_s
++        started_at_s = time.monotonic()
++        try:
++            future = asyncio.run_coroutine_threadsafe(
++                self.conn.datachannel.pub_sub.publish_request_new(topic, data), self.loop
++            )
++            return future.result(timeout=None if effective_timeout_s <= 0 else effective_timeout_s)
++        except FutureTimeoutError:
++            future.cancel()
++            self.last_publish_request_diagnostic = self._publish_request_timeout_result(
++                topic=topic,
++                data=data,
++                timeout_s=effective_timeout_s,
++                started_at_s=started_at_s,
++                phase="publish_request",
++            )
++            return self.last_publish_request_diagnostic
++        except Exception as exc:
++            self.last_publish_request_diagnostic = {
++                "ok": False,
++                "error": "publish_request_failed",
++                "timed_out": False,
++                "phase": "publish_request",
++                "topic": topic,
++                "request": data,
++                "timeout_s": effective_timeout_s,
++                "elapsed_s": round(time.monotonic() - started_at_s, 3),
++                "exception_type": exc.__class__.__name__,
++                "exception": str(exc),
++                "command_may_have_been_accepted": False,
++            }
++            return self.last_publish_request_diagnostic
++
++    def _publish_request_timeout_result(
++        self,
++        *,
++        topic: str,
++        data: dict[Any, Any],
++        timeout_s: float,
++        started_at_s: float,
++        phase: str,
++    ) -> dict[str, Any]:
++        return {
++            "ok": False,
++            "error": "publish_request_timeout",
++            "timed_out": True,
++            "phase": phase,
++            "topic": topic,
++            "request": data,
++            "timeout_s": timeout_s,
++            "duration_ms": round((time.monotonic() - started_at_s) * 1000, 1),
++            "status": {
++                "code": PUBLISH_REQUEST_TIMEOUT_STATUS_CODE,
++                "message": "Unitree WebRTC publish_request did not return before timeout.",
++            },
++            "command_may_have_been_accepted": True,
++            "recommended_next_action": (
++                "Check observe/status before retrying; avoid blindly repeating the same command."
++            ),
++        }
+ 
+     @simple_mcache
+     def raw_lidar_stream(self) -> Observable[RawLidarMsg]:
+@@ -305,12 +673,23 @@ class UnitreeWebRTCConnection(Resource):
+     def lowstate_stream(self) -> Observable[LowStateMsg]:
+         return backpressure(self.unitree_sub_stream(RTC_TOPIC["LOW_STATE"]))
+ 
++    @simple_mcache
++    def sport_mode_state_stream(self) -> Observable[PoseStamped]:
++        return backpressure(
++            self.unitree_sub_stream(RTC_TOPIC["LF_SPORT_MOD_STATE"]).pipe(
++                ops.map(_sport_mode_state_to_pose),
++                ops.filter(lambda pose: pose is not None),
++            )
++        )
++
+     def standup(self) -> bool:
+-        return bool(self.publish_request(RTC_TOPIC["SPORT_MOD"], {"api_id": SPORT_CMD["StandUp"]}))
++        return self._request_succeeded(
++            self.publish_request(RTC_TOPIC["SPORT_MOD"], {"api_id": SPORT_CMD["StandUp"]})
++        )
+ 
+     def balance_stand(self) -> bool:
+         """Activate BalanceStand mode — enables WIRELESS_CONTROLLER joystick commands."""
+-        return bool(
++        return self._request_succeeded(
+             self.publish_request(RTC_TOPIC["SPORT_MOD"], {"api_id": SPORT_CMD["BalanceStand"]})
+         )
+ 
+@@ -322,13 +701,15 @@ class UnitreeWebRTCConnection(Resource):
+ 
+     def free_walk(self) -> bool:
+         """Activate FreeWalk locomotion mode — enables walking and velocity commands."""
+-        return bool(self.publish_request(RTC_TOPIC["SPORT_MOD"], {"api_id": SPORT_CMD["FreeWalk"]}))
++        return self._request_succeeded(
++            self.publish_request(RTC_TOPIC["SPORT_MOD"], {"api_id": SPORT_CMD["FreeWalk"]})
++        )
+ 
+     def enable_rage_mode(self) -> bool:
+         """Enable Rage Mode on the Go2 via WebRTC.
+         Assumes the robot is already in BalanceStand.
+         """
+-        rage_ok = bool(
++        rage_ok = self._request_succeeded(
+             self.publish_request(
+                 RTC_TOPIC["SPORT_MOD"],
+                 {"api_id": self._SPORT_API_ID_RAGEMODE, "parameter": {"data": True}},
+@@ -336,7 +717,7 @@ class UnitreeWebRTCConnection(Resource):
+         )
+         time.sleep(2.0)
+ 
+-        joystick_ok = bool(
++        joystick_ok = self._request_succeeded(
+             self.publish_request(
+                 RTC_TOPIC["SPORT_MOD"],
+                 {
+@@ -348,10 +729,15 @@ class UnitreeWebRTCConnection(Resource):
+         return rage_ok and joystick_ok
+ 
+     def liedown(self) -> bool:
+-        return bool(
++        return self._request_succeeded(
+             self.publish_request(RTC_TOPIC["SPORT_MOD"], {"api_id": SPORT_CMD["StandDown"]})
+         )
+ 
++    def _request_succeeded(self, response: Any) -> bool:
++        if isinstance(response, dict) and response.get("ok") is False:
++            return False
++        return bool(response)
++
+     async def handstand(self):  # type: ignore[no-untyped-def]
+         return self.publish_request(
+             RTC_TOPIC["SPORT_MOD"],
+@@ -374,18 +760,27 @@ class UnitreeWebRTCConnection(Resource):
+     def raw_video_stream(self) -> Observable[VideoMessage]:
+         subject: Subject[VideoMessage] = Subject()
+         stop_event = threading.Event()
++        last_emit_s: float | None = None
+ 
+         from aiortc import MediaStreamTrack
+ 
+         async def accept_track(track: MediaStreamTrack) -> None:
++            nonlocal last_emit_s
+             while True:
+                 if stop_event.is_set():
+                     return
+                 frame = await track.recv()
++                now_s = time.monotonic()
++                if not _video_frame_due(now_s, last_emit_s, self.video_fps):
++                    continue
++                last_emit_s = _advance_video_frame_clock(
++                    now_s, last_emit_s, self.video_fps
++                )
+                 serializable_frame = SerializableVideoFrame.from_av_frame(frame)  # type: ignore[no-untyped-call]
+                 subject.on_next(serializable_frame)
+ 
+         self.conn.video.add_track_callback(accept_track)
++        self._video_track_callbacks.add(accept_track)
+ 
+         # Run the video channel switching in the background thread
+         def switch_video_channel() -> None:
+@@ -395,7 +790,9 @@ class UnitreeWebRTCConnection(Resource):
+ 
+         def stop() -> None:
+             stop_event.set()  # Signal the loop to stop
+-            self.conn.video.track_callbacks.remove(accept_track)
++            self._video_track_callbacks.discard(accept_track)
++            if accept_track in self.conn.video.track_callbacks:
++                self.conn.video.track_callbacks.remove(accept_track)
+ 
+             # Run the video channel switching off in the background thread
+             def switch_video_channel_off() -> None:
+diff --git a/dimos/robot/unitree/dimsim_connection.py b/dimos/robot/unitree/dimsim_connection.py
+index 5afcd1f..e3d63a6 100644
+--- a/dimos/robot/unitree/dimsim_connection.py
++++ b/dimos/robot/unitree/dimsim_connection.py
+@@ -75,6 +75,10 @@ class DimSimConnection:
+     def odom_stream(self) -> Observable[PoseStamped]:
+         return Subject()
+ 
++    @functools.cache
++    def sport_mode_state_stream(self) -> Observable[PoseStamped]:
++        return self.odom_stream()
++
+     @functools.cache
+     def video_stream(self) -> Observable[Image]:
+         return Subject()
+diff --git a/dimos/robot/unitree/go2/blueprints/basic/unitree_go2_basic.py b/dimos/robot/unitree/go2/blueprints/basic/unitree_go2_basic.py
+index 96a2911..ee3a1b2 100644
+--- a/dimos/robot/unitree/go2/blueprints/basic/unitree_go2_basic.py
++++ b/dimos/robot/unitree/go2/blueprints/basic/unitree_go2_basic.py
+@@ -14,6 +14,8 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from functools import partial
++import os
+ import platform
+ from typing import Any
+ 
+@@ -23,6 +25,10 @@ from dimos.core.global_config import global_config
+ from dimos.core.transport import pSHMTransport
+ from dimos.msgs.sensor_msgs.Image import Image
+ from dimos.robot.unitree.go2.connection import GO2Connection
++from dimos.robot.unitree.go2.surround_camera import (
++    CAMERA_DIRECTIONS,
++    RERUN_IMAGE_DOWNSAMPLE,
++)
+ from dimos.visualization.vis_module import vis_module
+ 
+ # Mac has some issue with high bandwidth UDP, so we use pSHMTransport for color_image
+@@ -69,55 +75,138 @@ def _static_base_link(rr: Any) -> list[Any]:
+     ]
+ 
+ 
++def _static_odom_axes(rr: Any) -> Any:
++    return rr.Arrows3D(
++        vectors=[[0.3, 0, 0], [0, 0.3, 0], [0, 0, 0.3]],
++        colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
++    )
++
++
++def _use_surround_cameras() -> bool:
++    return os.environ.get("DIMOS_NOMAD_USE_USB_CAMERAS", "0").strip().lower() in {
++        "1",
++        "true",
++        "yes",
++        "on",
++    }
++
++
++def _surround_frame_size(direction: str) -> tuple[int, int]:
++    width = int(os.environ.get("DIMOS_GO2_CAMERA_WIDTH", "1600"))
++    height = int(os.environ.get("DIMOS_GO2_CAMERA_HEIGHT", "1200"))
++    rotation = int(os.environ.get(f"DIMOS_GO2_CAMERA_{direction.upper()}_ROTATION", "0"))
++    width, height = (height, width) if rotation in (90, 270) else (width, height)
++    return (
++        max(1, width // RERUN_IMAGE_DOWNSAMPLE),
++        max(1, height // RERUN_IMAGE_DOWNSAMPLE),
++    )
++
++
++def _static_surround_pinhole(rr: Any, direction: str) -> Any:
++    from dimos.robot.unitree.pixelgoal.pixel_goal_map import SurroundCameraRig
++
++    rig = SurroundCameraRig.from_env()
++    width, height = _surround_frame_size(direction)
++    model = rig.pinhole(width, height)
++    return rr.Pinhole(
++        focal_length=[model.fx, model.fy],
++        principal_point=[model.cx, model.cy],
++        width=model.width,
++        height=model.height,
++        image_plane_distance=1.0,
++        parent_frame=f"tf#/{rig.optical_frame(direction)}",
++    )
++
++
++def _static_surround_transform(_: Any, direction: str) -> Any:
++    from dimos.robot.unitree.pixelgoal.pixel_goal_map import SurroundCameraRig
++
++    rig = SurroundCameraRig.from_env()
++    optical_frame = rig.optical_frame(direction)
++    return rig.mount(direction).optical_to_base(optical_frame, rig.base_height_m).to_rerun()
++
++
+ def _go2_rerun_blueprint() -> Any:
+-    """Split layout: camera feed + 3D world view side by side."""
++    """Show frozen USB snapshots next to the continuously updated 3D view."""
+     import rerun as rr
+     import rerun.blueprint as rrb
+ 
+-    return rrb.Blueprint(
+-        rrb.Horizontal(
+-            rrb.Spatial2DView(origin="world/color_image", name="Camera"),
+-            rrb.Spatial3DView(
+-                origin="world",
+-                name="3D",
+-                background=rrb.Background(kind="SolidColor", color=[0, 0, 0]),
+-                line_grid=rrb.LineGrid3D(
+-                    plane=rr.components.Plane3D.XY.with_distance(0.5),
+-                ),
+-                overrides={
+-                    "world/lidar": rrb.EntityBehavior(visible=False),
+-                },
+-            ),
+-            column_shares=[1, 2],
++    world_panel = rrb.Spatial3DView(
++        origin="world",
++        name="3D",
++        background=rrb.Background(kind="SolidColor", color=[0, 0, 0]),
++        line_grid=rrb.LineGrid3D(
++            plane=rr.components.Plane3D.XY.with_distance(0.5),
+         ),
++    )
++    if _use_surround_cameras():
++        camera_panel = rrb.Grid(
++            *(
++                rrb.Spatial2DView(
++                    origin=f"world/surround_{direction}_image",
++                    name=direction.title(),
++                )
++                for direction in CAMERA_DIRECTIONS
++            ),
++            grid_columns=2,
++            name="USB Cameras",
++        )
++    else:
++        camera_panel = rrb.Spatial2DView(origin="world/color_image", name="Camera")
++
++    return rrb.Blueprint(
++        rrb.Horizontal(camera_panel, world_panel, column_shares=[1, 2]),
+         rrb.TimePanel(state="hidden"),
+         rrb.SelectionPanel(state="hidden"),
+     )
+ 
+ 
+-rerun_config = {
+-    "blueprint": _go2_rerun_blueprint,
+-    # Custom converters for specific rerun entity paths
+-    # Normally all these would be specified in their respectative modules
+-    # Until this is implemented we have central overrides here
+-    #
+-    # This is unsustainable once we move to multi robot etc
+-    "visual_override": {
+-        "world/camera_info": _convert_camera_info,
+-        "world/global_map": _convert_global_map,
+-        "world/merged_map": _convert_global_map,
+-        "world/navigation_costmap": _convert_navigation_costmap,
+-    },
+-    "max_hz": {
+-        "world/global_map": 0,  # publishes at ~7.8 Hz
+-        "world/color_image": 0,  # publishes at ~14 Hz
+-        "world/global_costmap": 0,  # publishes at ~7.6 Hz
+-    },
+-    # slapping a go2 shaped box on top of tf/base_link
+-    "static": {
+-        "world/tf/base_link": _static_base_link,
+-    },
+-}
++def _go2_rerun_config() -> dict[str, Any]:
++    config: dict[str, Any] = {
++        "blueprint": _go2_rerun_blueprint,
++        # Custom converters for specific rerun entity paths
++        # Normally all these would be specified in their respectative modules
++        # Until this is implemented we have central overrides here
++        #
++        # This is unsustainable once we move to multi robot etc
++        "visual_override": {
++            "world/camera_info": _convert_camera_info,
++            "world/lidar": None,
++            "world/global_map": _convert_global_map,
++            "world/merged_map": _convert_global_map,
++            "world/navigation_costmap": _convert_navigation_costmap,
++        },
++        "max_hz": {
++            "world/global_map": 0,  # publishes at ~7.8 Hz
++            "world/color_image": 0,  # publishes at ~14 Hz
++            "world/global_costmap": 0,  # publishes at ~7.6 Hz
++        },
++        # slapping a go2 shaped box on top of tf/base_link
++        "static": {
++            "world/tf/base_link": _static_base_link,
++            "world/odom/axes": _static_odom_axes,
++        },
++    }
++    if not _use_surround_cameras():
++        return config
++
++    config["visual_override"].update(
++        {
++            "world/color_image": None,
++            "world/camera_info": None,
++        }
++    )
++    for direction in CAMERA_DIRECTIONS:
++        config["static"][f"world/surround_{direction}_image"] = partial(
++            _static_surround_pinhole, direction=direction
++        )
++        config["static"][f"world/tf/go2/{direction}/camera_optical"] = partial(
++            _static_surround_transform, direction=direction
++        )
++    return config
++
++
++rerun_config = _go2_rerun_config()
+ 
+ _with_vis = autoconnect(
+     _transports_base,
+diff --git a/dimos/robot/unitree/go2/connection.py b/dimos/robot/unitree/go2/connection.py
+index 5568a47..12914cd 100644
+--- a/dimos/robot/unitree/go2/connection.py
++++ b/dimos/robot/unitree/go2/connection.py
+@@ -12,12 +12,14 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import copy
+ from enum import Enum
+ from importlib import resources
++import os
+ import sys
+-from threading import Thread
++from threading import Event, Thread
+ import time
+-from typing import TYPE_CHECKING, Any, Protocol
++from typing import TYPE_CHECKING, Any, ClassVar, Protocol
+ 
+ from pydantic import Field
+ from reactivex.disposable import Disposable
+@@ -49,6 +51,7 @@ from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
+ from dimos.msgs.sensor_msgs.Image import Image
+ from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
+ from dimos.robot.unitree.connection import UnitreeWebRTCConnection
++from dimos.robot.unitree.go2.status import summarize_go2_low_state, unavailable_go2_status
+ from dimos.utils.decorators.decorators import cached_property, simple_mcache
+ 
+ if sys.version_info < (3, 13):
+@@ -67,6 +70,7 @@ class Go2Mode(str, Enum):
+ class ConnectionConfig(ModuleConfig):
+     ip: str = Field(default_factory=lambda m: m["g"].robot_ip)
+     mode: Go2Mode = Go2Mode.DEFAULT
++    enable_video: bool = True
+ 
+ 
+ class Go2ConnectionProtocol(Protocol):
+@@ -76,6 +80,7 @@ class Go2ConnectionProtocol(Protocol):
+     def stop(self) -> None: ...
+     def lidar_stream(self) -> Observable: ...  # type: ignore[type-arg]
+     def odom_stream(self) -> Observable: ...  # type: ignore[type-arg]
++    def sport_mode_state_stream(self) -> Observable: ...  # type: ignore[type-arg]
+     def video_stream(self) -> Observable: ...  # type: ignore[type-arg]
+     def move(self, twist: Twist, duration: float = 0.0) -> bool: ...
+     def standup(self) -> bool: ...
+@@ -83,7 +88,7 @@ class Go2ConnectionProtocol(Protocol):
+     def balance_stand(self) -> bool: ...
+     def set_obstacle_avoidance(self, enabled: bool = True) -> None: ...
+     def enable_rage_mode(self) -> bool: ...
+-    def publish_request(self, topic: str, data: dict) -> dict: ...  # type: ignore[type-arg]
++    def publish_request(self, topic: str, data: dict[str, Any]) -> dict[Any, Any]: ...
+ 
+ 
+ _FRONT_CAMERA_720_YAML = resources.files("dimos.robot.unitree.go2").joinpath(
+@@ -186,6 +191,18 @@ class ReplayConnection(UnitreeWebRTCConnection, CompositeResource):
+     def video_stream(self) -> Observable[Image]:
+         return self.replay.streams.color_image.observable()
+ 
++    @simple_mcache
++    def lowstate_stream(self) -> Observable[dict[str, Any]]:
++        from reactivex import empty
++
++        return empty()
++
++    @simple_mcache
++    def sport_mode_state_stream(self) -> Observable[PoseStamped]:
++        from reactivex import empty
++
++        return empty()
++
+     def move(self, twist: Twist, duration: float = 0.0) -> bool:
+         return True
+ 
+@@ -199,6 +216,7 @@ _Config = TypeVar("_Config", bound=ConnectionConfig, default=ConnectionConfig)
+ 
+ class GO2Connection(Module, Camera, Pointcloud):
+     dedicated_worker = True
++    restartable: ClassVar[bool] = False
+ 
+     config: ConnectionConfig
+     cmd_vel: In[Twist]
+@@ -207,11 +225,13 @@ class GO2Connection(Module, Camera, Pointcloud):
+     lidar: Out[PointCloud2]
+     color_image: Out[Image]
+     camera_info: Out[CameraInfo]
++    sport_odom: Out[PoseStamped]
+ 
+     connection: Go2ConnectionProtocol
+     camera_info_static: CameraInfo = _camera_info_static()
+     _camera_info_thread: Thread | None = None
+     _latest_video_frame: Image | None = None
++    _latest_robot_status: dict[str, Any]
+ 
+     @classmethod
+     def rerun_views(cls):  # type: ignore[no-untyped-def]
+@@ -224,56 +244,93 @@ class GO2Connection(Module, Camera, Pointcloud):
+         ]
+ 
+     def __init__(self, **kwargs: Any) -> None:
+-        super().__init__(**kwargs)
+-        self.connection = make_connection(self.config.ip, self.config.g)
+-
++        config = ConnectionConfig(**kwargs)
++        self.connection = make_connection(config.ip, config.g)
+         if hasattr(self.connection, "camera_info_static"):
+             self.camera_info_static = self.connection.camera_info_static
++        self._stop_event = Event()
++        self._latest_robot_status = unavailable_go2_status("lowstate_not_received")
++        super().__init__(**kwargs)
++        logger.warning(
++            "GO2Connection init self_id=%s pid=%s connection_id=%s",
++            id(self),
++            os.getpid(),
++            id(getattr(self, "connection", None)),
++        )
+ 
+     @rpc
+     def start(self) -> None:
++        logger.warning(
++            "GO2Connection start self_id=%s pid=%s connection_id=%s",
++            id(self),
++            os.getpid(),
++            id(getattr(self, "connection", None)),
++        )
+         super().start()
+-        if not hasattr(self, "connection"):
++        connection = getattr(self, "connection", None)
++        if connection is None:
+             return
+-        self.connection.start()
++        self._stop_event.clear()
++        connection.start()
+ 
+         def onimage(image: Image) -> None:
+             self.color_image.publish(image)
+             self._latest_video_frame = image
+ 
+-        self.register_disposable(self.connection.lidar_stream().subscribe(self.lidar.publish))
+-        self.register_disposable(self.connection.odom_stream().subscribe(self._publish_tf))
+-        self.register_disposable(self.connection.video_stream().subscribe(onimage))
++        self.register_disposable(connection.lidar_stream().subscribe(self.lidar.publish))
++        self.register_disposable(connection.odom_stream().subscribe(self._publish_tf))
++        if self.config.enable_video:
++            self.register_disposable(connection.video_stream().subscribe(onimage))
++        else:
++            logger.info("Go2 built-in video subscription disabled")
++        self._subscribe_low_state()
++        self._subscribe_sport_mode_state()
+         self.register_disposable(Disposable(self.cmd_vel.subscribe(self.move)))
+ 
+-        self._camera_info_thread = Thread(
+-            target=self.publish_camera_info,
+-            daemon=True,
+-        )
+-        self._camera_info_thread.start()
+-
+-        self.standup()
+-        time.sleep(3)
+-        self.connection.balance_stand()
+-
+-        if self.config.mode == Go2Mode.RAGE:
+-            self.connection.enable_rage_mode()
+-
+-        self.connection.set_obstacle_avoidance(self.config.g.obstacle_avoidance)
++        if self.config.enable_video:
++            self._camera_info_thread = Thread(
++                target=self.publish_camera_info,
++                daemon=True,
++            )
++            self._camera_info_thread.start()
++
++        if self.config.g.go2_auto_stand:
++            self.standup()
++            time.sleep(3)
++            connection.balance_stand()
++
++            if self.config.mode == Go2Mode.RAGE:
++                connection.enable_rage_mode()
++
++        # Enable the firmware obstacle-avoidance ("safe") reflex REGARDLESS of
++        # auto-stand. set_obstacle_avoidance only sets a firmware flag (api 1001,
++        # OBSTACLES_AVOID) -- no motion -- so the built-in close-range safety is
++        # on even when launched with --no-go2-auto-stand (planner waypoint driving).
++        # It was previously gated inside the auto-stand block, so
++        # --no-go2-auto-stand silently disabled the robot's built-in avoidance.
++        connection.set_obstacle_avoidance(self.config.g.obstacle_avoidance)
+ 
+         # self.record("go2_bigoffice")
+ 
+     @rpc
+-    def stop(self) -> None:
+-        self.liedown()
++    def stop(self) -> dict[str, Any] | None:
++        self._stop_event.set()
++        result: dict[str, Any] | None = None
++        connection = getattr(self, "connection", None)
+ 
+-        if self.connection:
+-            self.connection.stop()
++        if self.config.g.go2_lie_down_on_stop:
++            result = self.liedown()
++
++        if connection is None:
++            result = result or self._missing_connection_result("stop")
++        else:
++            connection.stop()
+ 
+         if self._camera_info_thread and self._camera_info_thread.is_alive():
+             self._camera_info_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+ 
+         super().stop()
++        return result
+ 
+     @classmethod
+     def _odom_to_tf(cls, odom: PoseStamped) -> list[Transform]:
+@@ -305,44 +362,126 @@ class GO2Connection(Module, Camera, Pointcloud):
+         if self.odom.transport:
+             self.odom.publish(msg)
+ 
++    def _on_low_state(self, msg: dict[str, Any]) -> None:
++        self._latest_robot_status = summarize_go2_low_state(msg)
++
++    def _subscribe_low_state(self) -> None:
++        connection = getattr(self, "connection", None)
++        lowstate_stream = getattr(connection, "lowstate_stream", None)
++        if not callable(lowstate_stream):
++            self._latest_robot_status = unavailable_go2_status("lowstate_not_supported")
++            return
++        try:
++            self.register_disposable(lowstate_stream().subscribe(self._on_low_state))
++        except Exception:
++            logger.exception("Failed to subscribe to Go2 low-state stream.")
++            self._latest_robot_status = unavailable_go2_status("lowstate_subscription_failed")
++
++    def _subscribe_sport_mode_state(self) -> None:
++        connection = getattr(self, "connection", None)
++        sport_mode_state_stream = getattr(connection, "sport_mode_state_stream", None)
++        if not callable(sport_mode_state_stream):
++            return
++        try:
++            self.register_disposable(sport_mode_state_stream().subscribe(self.sport_odom.publish))
++        except Exception:
++            logger.exception("Failed to subscribe to Go2 sport-mode state stream.")
++
+     def publish_camera_info(self) -> None:
+-        while True:
++        while not self._stop_event.is_set():
+             self.camera_info.publish(self.camera_info_static)
+-            time.sleep(1.0)
++            self._stop_event.wait(1.0)
++
++    def _missing_connection_result(self, method: str) -> dict[str, Any]:
++        return {
++            "ok": False,
++            "error": "connection_missing",
++            "timed_out": False,
++            "phase": method,
++            "exception_type": "AttributeError",
++            "exception": "GO2Connection.connection is missing",
++            "command_may_have_been_accepted": False,
++        }
+ 
+     @rpc
+-    def move(self, twist: Twist, duration: float = 0.0) -> bool:
++    def move(self, twist: Twist, duration: float = 0.0) -> bool | dict[str, Any]:
+         """Send movement command to robot."""
+-        return self.connection.move(twist, duration)
++        connection = getattr(self, "connection", None)
++        if connection is None:
++            config = getattr(self, "config", None)
++            ip = getattr(config, "ip", None)
++            cfg = getattr(config, "g", None)
++            if ip is None or cfg is None:
++                return self._missing_connection_result("move")
++            logger.warning("GO2 connection missing; recreating before move")
++            try:
++                connection = make_connection(ip, cfg)
++                self.connection = connection
++            except Exception as exc:
++                return {
++                    "ok": False,
++                    "error": "connection_recreate_failed",
++                    "timed_out": False,
++                    "phase": "move",
++                    "exception_type": exc.__class__.__name__,
++                    "exception": str(exc),
++                    "command_may_have_been_accepted": False,
++                }
++        try:
++            return connection.move(twist, duration)
++        except Exception as exc:
++            return {
++                "ok": False,
++                "error": "move_failed",
++                "timed_out": False,
++                "phase": "move",
++                "exception_type": exc.__class__.__name__,
++                "exception": str(exc),
++                "command_may_have_been_accepted": True,
++            }
+ 
+     @rpc
+-    def standup(self) -> bool:
++    def standup(self) -> bool | dict[str, Any]:
+         """Make the robot stand up."""
+-        return self.connection.standup()
++        connection = getattr(self, "connection", None)
++        if connection is None:
++            return self._missing_connection_result("standup")
++        return connection.standup()
+ 
+     @rpc
+-    def liedown(self) -> bool:
++    def liedown(self) -> bool | dict[str, Any]:
+         """Make the robot lie down."""
+-        return self.connection.liedown()
++        connection = getattr(self, "connection", None)
++        if connection is None:
++            return self._missing_connection_result("liedown")
++        return connection.liedown()
+ 
+     @rpc
+-    def balance_stand(self) -> bool:
++    def balance_stand(self) -> bool | dict[str, Any]:
+         """Enter BalanceStand: neutral state for switching locomotion modes"""
+-        return self.connection.balance_stand()
++        connection = getattr(self, "connection", None)
++        if connection is None:
++            return self._missing_connection_result("balance_stand")
++        return connection.balance_stand()
+ 
+     @rpc
+-    def enable_rage_mode(self) -> bool:
++    def enable_rage_mode(self) -> bool | dict[str, Any]:
+         """Enable Rage Mode (~2.5 m/s forward velocity envelope).
+         Ensures BalanceStand precondition regardless of current FSM state.
+         """
+-        self.connection.balance_stand()
++        connection = getattr(self, "connection", None)
++        if connection is None:
++            return self._missing_connection_result("enable_rage_mode")
++        connection.balance_stand()
+         time.sleep(0.3)
+-        result = self.connection.enable_rage_mode()
++        result = connection.enable_rage_mode()
+         logger.info("Rage Mode enabled")
+         return result
+ 
+     @rpc
+-    def publish_request(self, topic: str, data: dict[str, Any]) -> dict[Any, Any]:
++    def publish_request(
++        self, topic: str, data: dict[str, Any], timeout_s: float | None = None
++    ) -> dict[Any, Any]:
+         """Publish a request to the WebRTC connection.
+         Args:
+             topic: The RTC topic to publish to
+@@ -350,16 +489,53 @@ class GO2Connection(Module, Camera, Pointcloud):
+         Returns:
+             The result of the publish request
+         """
+-        return self.connection.publish_request(topic, data)
++        logger.warning(
++            "GO2Connection publish_request self_id=%s pid=%s connection_id=%s",
++            id(self),
++            os.getpid(),
++            id(getattr(self, "connection", None)),
++        )
++        publish_call_entered = False
++        try:
++            connection = getattr(self, "connection", None)
++            if connection is None:
++                logger.warning("GO2 connection missing; recreating before publish_request")
++                connection = make_connection(self.config.ip, self.config.g)
++                self.connection = connection
++            publish_call_entered = True
++            if timeout_s is None:
++                return connection.publish_request(topic, data)
++            return connection.publish_request(topic, data, timeout_s=timeout_s)  # type: ignore[call-arg]
++        except Exception as exc:
++            return {
++                "ok": False,
++                "error": "publish_request_failed",
++                "timed_out": False,
++                "phase": "publish_request",
++                "topic": topic,
++                "request": data,
++                "exception_type": exc.__class__.__name__,
++                "exception": str(exc),
++                "command_may_have_been_accepted": publish_call_entered,
++            }
++
++    @rpc
++    def get_robot_status(self) -> dict[str, Any]:
++        """Return the latest low-level Go2 status known to DimOS."""
++        return copy.deepcopy(self._latest_robot_status)
+ 
+     @skill
+-    def observe(self) -> Image | None:
++    def observe(self) -> list[dict[str, Any]] | None:
+         """Returns the latest video frame from the robot camera. Use this skill for any visual world queries.
+ 
+         This skill provides the current camera view for perception tasks.
+         Returns None if no frame has been captured yet.
+         """
+-        return self._latest_video_frame
++        if self._latest_video_frame is None:
++            return None
++        # Encode before crossing the LCM RPC boundary. Returning the raw Image
++        # object can exceed reliable RPC packet sizes on live Go2 video frames.
++        return self._latest_video_frame.agent_encode()
+ 
+ 
+ def deploy(dimos: ModuleCoordinator, ip: str, prefix: str = "") -> "ModuleProxy":
+diff --git a/dimos/robot/unitree/go2/connection_spec.py b/dimos/robot/unitree/go2/connection_spec.py
+index dd6aab9..b3ac4b7 100644
+--- a/dimos/robot/unitree/go2/connection_spec.py
++++ b/dimos/robot/unitree/go2/connection_spec.py
+@@ -14,8 +14,13 @@
+ 
+ from typing import Any, Protocol
+ 
++from dimos.msgs.geometry_msgs.Twist import Twist
+ from dimos.spec.utils import Spec
+ 
+ 
+ class GO2ConnectionSpec(Spec, Protocol):
+-    def publish_request(self, topic: str, data: dict[str, Any]) -> dict[Any, Any]: ...
++    def move(self, twist: Twist, duration: float = 0.0) -> bool | dict[str, Any]: ...
++    def publish_request(
++        self, topic: str, data: dict[str, Any], timeout_s: float | None = None
++    ) -> dict[Any, Any]: ...
++    def get_robot_status(self) -> dict[str, Any]: ...
+diff --git a/dimos/robot/unitree/mujoco_connection.py b/dimos/robot/unitree/mujoco_connection.py
+index 4c45589..777a06a 100644
+--- a/dimos/robot/unitree/mujoco_connection.py
++++ b/dimos/robot/unitree/mujoco_connection.py
+@@ -328,6 +328,10 @@ class MujocoConnection:
+     def odom_stream(self) -> Observable[Odometry]:
+         return self._create_stream(self.get_odom_message, ODOM_FREQUENCY, "Odom")
+ 
++    @functools.cache
++    def sport_mode_state_stream(self) -> Observable[Odometry]:
++        return self.odom_stream()
++
+     @functools.cache
+     def video_stream(self) -> Observable[Image]:
+         def get_video_as_image() -> Image | None:
+diff --git a/dimos/robot/unitree/unitree_skill_container.py b/dimos/robot/unitree/unitree_skill_container.py
+--- a/dimos/robot/unitree/unitree_skill_container.py
++++ b/dimos/robot/unitree/unitree_skill_container.py
+@@ -14,29 +14,115 @@
+ 
+ from __future__ import annotations
+ 
++import base64
+ import datetime
+ import difflib
++import json
+ import math
++import os
++from pathlib import Path
+ import time
+-
++from typing import Any, Literal
++
++from reactivex.disposable import Disposable
+ from unitree_webrtc_connect.constants import RTC_TOPIC
+ 
+-from dimos.agents.annotation import skill
++from dimos.agents.annotation import current_skill_context, skill
++from dimos.agents.capabilities import CAP_MOVEMENT
++from dimos.agents.harness.artifact_ledger import ArtifactLedger, resolve_artifact_dir
++from dimos.agents.harness.skill_timing import record_skill_duration
++from dimos.agents.harness.skill_trace import emit_skill_result_trace
++from dimos.agents.runtime_policy import resolve_agent_runtime_policy
++from dimos.agents.skill_result import SkillResult
+ from dimos.core.core import rpc
+ from dimos.core.module import Module
++from dimos.core.stream import In, Out
++from dimos.mapping.occupancy.agent_map import render_agent_occupancy_map
++from dimos.mapping.occupancy.floor_plan import FloorPlanConfig, render_clean_floor_plan
+ from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+ from dimos.msgs.geometry_msgs.Quaternion import Quaternion
++from dimos.msgs.geometry_msgs.Twist import Twist
+ from dimos.msgs.geometry_msgs.Vector3 import Vector3
++from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
++from dimos.msgs.sensor_msgs.Image import Image
++from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
+ from dimos.navigation.base import NavigationState
++from dimos.navigation.motion_diagnostics import build_motion_diagnostics
+ from dimos.navigation.navigation_spec import NavigationInterfaceSpec
++from dimos.navigation.skill_errors import NavigationError, NavigationSkillError
++from dimos.navigation.skill_metadata import odom_delta_metadata, pose_metadata
+ from dimos.robot.unitree.go2.connection_spec import GO2ConnectionSpec
+ from dimos.utils.logging_config import setup_logger
++from dimos.utils.trigonometry import angle_diff
+ 
+ logger = setup_logger()
+ 
++DEFAULT_ROTATE_IN_PLACE_MIN_EFFECTIVE_YAW_SPEED_RAD_S = 0.3
++DEFAULT_DRIVE_TIMEOUT_S = 12.0
++DRIVE_TIMEOUT_ENV = "DIMOS_GO2_DRIVE_TIMEOUT_S"
++DEFAULT_RELATIVE_MOVE_TIMEOUT_S = 100.0
++RELATIVE_MOVE_TIMEOUT_ENV = "DIMOS_GO2_RELATIVE_MOVE_TIMEOUT_S"
++DEFAULT_2D_SLAM_MAP_MAX_AGE_S = 3.0
++DEFAULT_2D_SLAM_MAP_SIZE_PX = 768
++DEFAULT_2D_SLAM_TRACE_MAX_POINTS = 200
++DEFAULT_2D_SLAM_MAP_VIEW_SIZE_M = 12.0
++DEFAULT_FLOOR_PLAN_MAX_AGE_S = 5.0
++DEFAULT_FLOOR_PLAN_SIZE_PX = 768
++DEFAULT_FLOOR_PLAN_MIN_COMPONENT_AREA_M2 = 0.35
++DEFAULT_FLOOR_PLAN_CLOSING_RADIUS_M = 0.05
++DEFAULT_FLOOR_PLAN_OPENING_RADIUS_M = 0.0
++DEFAULT_FLOOR_PLAN_OCCUPIED_THRESHOLD = 50
++DEFAULT_FLOOR_PLAN_FREE_SPACE_CLOSING_RADIUS_M = 0.25
++DEFAULT_FLOOR_PLAN_MAX_FILL_HOLE_AREA_M2 = 2.5
++DEFAULT_FLOOR_PLAN_BOUNDARY_WALL_WIDTH_M = 0.0
++DEFAULT_FLOOR_PLAN_STRUCTURAL_WALL_MIN_LENGTH_M = 4.0
++DEFAULT_FLOOR_PLAN_STRUCTURAL_WALL_WIDTH_M = 0.05
++DEFAULT_CAMERA_IMAGE_MAX_AGE_S = 3.0
++DEFAULT_TASK_RERUN_EXPORT_ENABLED = True
++DEFAULT_TASK_RERUN_POINT_VOXEL_SIZE_M = 0.05
++_MOVEMENT_IMAGE_ATTACHMENT_TOOLS = {
++    "drive",
++    "relative_move",
++    "rotate_in_place",
++}
++
++
++def _env_float(name: str, default: float) -> float:
++    try:
++        return float(os.environ.get(name, default))
++    except (TypeError, ValueError):
++        return default
++
++
++def _env_int(name: str, default: int) -> int:
++    try:
++        return int(os.environ.get(name, default))
++    except (TypeError, ValueError):
++        return default
++
++
++def _env_bool(name: str, default: bool) -> bool:
++    value = os.environ.get(name)
++    if value is None:
++        return default
++    return value.strip().lower() not in {"0", "false", "no", "off"}
++
++
++def _safe_task_token(value: str) -> str:
++    token = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in value.strip())
++    return token[:80] or "task"
++
++
++def _task_rerun_summary(task_id: str, task_goal: str | None) -> str:
++    lines = ["# DimOS Go2 Navigation Task", f"- task_id: {task_id}"]
++    if task_goal:
++        lines.append(f"- goal: {task_goal}")
++    lines.append("- recording: offline per-task Rerun export")
++    return "\n".join(lines)
++
+ 
+ UNITREE_WEBRTC_CONTROLS: list[tuple[str, int, str]] = [
+-    # ("Damp", 1001, "Lowers the robot to the ground fully."),
++    ("Damp", 1001, "Lowers the robot to the ground fully."),
+     (
+         "BalanceStand",
+         1002,
+@@ -191,27 +277,299 @@
+ }
+ 
+ 
++def _unitree_status_code(response: Any) -> int | None:
++    """Extract Unitree ``status.code`` from WebRTC responses when present."""
++
++    if not isinstance(response, dict):
++        return None
++
++    status = response.get("status")
++    if isinstance(status, dict) and "code" in status:
++        return _int_or_none(status.get("code"))
++
++    for key in ("code", "status_code", "statusCode"):
++        if key in response:
++            return _int_or_none(response.get(key))
++    return None
++
++
++def _unitree_publish_request_timed_out(response: Any) -> bool:
++    return isinstance(response, dict) and response.get("error") == "publish_request_timeout"
++
++
++def _unitree_publish_request_failed(response: Any) -> bool:
++    return isinstance(response, dict) and response.get("ok") is False
++
++
++def _int_or_none(value: Any) -> int | None:
++    try:
++        return int(value)
++    except (TypeError, ValueError):
++        return None
++
++
++def _diagnostic_state(value: Any, *, default: str) -> str:
++    if isinstance(value, dict):
++        return str(value.get("state") or default)
++    if value is None:
++        return default
++    return str(value)
++
++
++def _compact_state_payload(value: Any, *, keys: tuple[str, ...]) -> dict[str, Any]:
++    if not isinstance(value, dict):
++        return {"state": str(value or "unknown")}
++    return {key: value.get(key) for key in keys if key in value}
++
++
++def _compact_authority_payload(runtime_policy: dict[str, Any] | None) -> dict[str, Any]:
++    if not isinstance(runtime_policy, dict):
++        return {"available": False}
++    return {
++        "available": True,
++        "profile": runtime_policy.get("profile"),
++        "movement_mode": runtime_policy.get("movement_mode"),
++        "tool_scope": runtime_policy.get("tool_scope"),
++        "admin_override": runtime_policy.get("tool_policy_admin_override"),
++    }
++
++
+ class UnitreeSkillContainer(Module):
+     """Container for Unitree Go2 robot skills using the new framework."""
+ 
+     _navigation: NavigationInterfaceSpec
+     _connection: GO2ConnectionSpec
++    sport_odom: In[PoseStamped]
++    global_costmap: In[OccupancyGrid]
++    global_map: In[PointCloud2]
++    lidar: In[PointCloud2]
++    color_image: In[Image]
++    tele_cmd_vel: Out[Twist]
++    _latest_sport_odom: PoseStamped | None = None
++    _latest_sport_odom_received_at_s: float | None = None
++    _latest_global_costmap: OccupancyGrid | None = None
++    _latest_global_costmap_received_at_s: float | None = None
++    _latest_global_map: PointCloud2 | None = None
++    _latest_global_map_received_at_s: float | None = None
++    _latest_lidar: PointCloud2 | None = None
++    _latest_lidar_received_at_s: float | None = None
++    _latest_camera_image: Image | None = None
++    _latest_camera_image_received_at_s: float | None = None
++    _slam_pose_trace: list[PoseStamped]
++    _active_navigation_task_id: str | None = None
++    _task_rerun_export_count: int = 0
++    _relative_move_timeout_s: float = _env_float(
++        RELATIVE_MOVE_TIMEOUT_ENV,
++        DEFAULT_RELATIVE_MOVE_TIMEOUT_S,
++    )
++    _relative_move_settle_s: float = 1.0
++    _relative_move_poll_s: float = 0.1
++    _relative_move_linear_tolerance_m: float = 0.25
++    _relative_move_yaw_tolerance_deg: float = 15.0
++    _pure_rotation_linear_epsilon_m: float = 1e-3
++    _rotate_in_place_tolerance_deg: float = 5.0
++    _rotate_in_place_poll_s: float = 0.05
++    _rotate_in_place_min_effective_yaw_speed_rad_s: float = (
++        DEFAULT_ROTATE_IN_PLACE_MIN_EFFECTIVE_YAW_SPEED_RAD_S
++    )
++    _drive_timeout_s: float = _env_float(DRIVE_TIMEOUT_ENV, DEFAULT_DRIVE_TIMEOUT_S)
++    _drive_poll_s: float = 0.05
++    _drive_linear_gain: float = 0.9
++    _drive_yaw_gain: float = 1.2
++    _drive_max_linear_speed_mps: float = 0.45
++    _drive_max_yaw_speed_rad_s: float = 0.4
++    _direct_motion_initial_feedback_timeout_s: float = 1.75
++    _direct_motion_feedback_timeout_s: float = 0.5
++    _drive_min_feedback_progress_m: float = 0.01
++    _rotate_min_feedback_progress_deg: float = 2.0
++    _2d_slam_map_max_age_s: float = _env_float(
++        "DIMOS_GO2_2D_SLAM_MAP_MAX_AGE_S",
++        DEFAULT_2D_SLAM_MAP_MAX_AGE_S,
++    )
++    _2d_slam_map_size_px: int = _env_int(
++        "DIMOS_GO2_2D_SLAM_MAP_SIZE_PX",
++        DEFAULT_2D_SLAM_MAP_SIZE_PX,
++    )
++    _2d_slam_map_view_size_m: float = _env_float(
++        "DIMOS_GO2_2D_SLAM_MAP_VIEW_SIZE_M",
++        DEFAULT_2D_SLAM_MAP_VIEW_SIZE_M,
++    )
++    _2d_slam_trace_max_points: int = _env_int(
++        "DIMOS_GO2_2D_SLAM_TRACE_MAX_POINTS",
++        DEFAULT_2D_SLAM_TRACE_MAX_POINTS,
++    )
++    _floor_plan_max_age_s: float = _env_float(
++        "DIMOS_GO2_FLOOR_PLAN_MAX_AGE_S",
++        DEFAULT_FLOOR_PLAN_MAX_AGE_S,
++    )
++    _floor_plan_size_px: int = _env_int(
++        "DIMOS_GO2_FLOOR_PLAN_SIZE_PX",
++        DEFAULT_FLOOR_PLAN_SIZE_PX,
++    )
++    _floor_plan_min_component_area_m2: float = _env_float(
++        "DIMOS_GO2_FLOOR_PLAN_MIN_COMPONENT_AREA_M2",
++        DEFAULT_FLOOR_PLAN_MIN_COMPONENT_AREA_M2,
++    )
++    _floor_plan_closing_radius_m: float = _env_float(
++        "DIMOS_GO2_FLOOR_PLAN_CLOSING_RADIUS_M",
++        DEFAULT_FLOOR_PLAN_CLOSING_RADIUS_M,
++    )
++    _floor_plan_opening_radius_m: float = _env_float(
++        "DIMOS_GO2_FLOOR_PLAN_OPENING_RADIUS_M",
++        DEFAULT_FLOOR_PLAN_OPENING_RADIUS_M,
++    )
++    _floor_plan_occupied_threshold: int = _env_int(
++        "DIMOS_GO2_FLOOR_PLAN_OCCUPIED_THRESHOLD",
++        DEFAULT_FLOOR_PLAN_OCCUPIED_THRESHOLD,
++    )
++    _floor_plan_free_space_closing_radius_m: float = _env_float(
++        "DIMOS_GO2_FLOOR_PLAN_FREE_SPACE_CLOSING_RADIUS_M",
++        DEFAULT_FLOOR_PLAN_FREE_SPACE_CLOSING_RADIUS_M,
++    )
++    _floor_plan_max_fill_hole_area_m2: float = _env_float(
++        "DIMOS_GO2_FLOOR_PLAN_MAX_FILL_HOLE_AREA_M2",
++        DEFAULT_FLOOR_PLAN_MAX_FILL_HOLE_AREA_M2,
++    )
++    _floor_plan_boundary_wall_width_m: float = _env_float(
++        "DIMOS_GO2_FLOOR_PLAN_BOUNDARY_WALL_WIDTH_M",
++        DEFAULT_FLOOR_PLAN_BOUNDARY_WALL_WIDTH_M,
++    )
++    _floor_plan_structural_wall_min_length_m: float = _env_float(
++        "DIMOS_GO2_FLOOR_PLAN_STRUCTURAL_WALL_MIN_LENGTH_M",
++        DEFAULT_FLOOR_PLAN_STRUCTURAL_WALL_MIN_LENGTH_M,
++    )
++    _floor_plan_structural_wall_width_m: float = _env_float(
++        "DIMOS_GO2_FLOOR_PLAN_STRUCTURAL_WALL_WIDTH_M",
++        DEFAULT_FLOOR_PLAN_STRUCTURAL_WALL_WIDTH_M,
++    )
++    _camera_image_max_age_s: float = _env_float(
++        "DIMOS_GO2_CAMERA_IMAGE_MAX_AGE_S",
++        DEFAULT_CAMERA_IMAGE_MAX_AGE_S,
++    )
++    _task_rerun_export_enabled: bool = _env_bool(
++        "DIMOS_GO2_TASK_RERUN_EXPORT",
++        DEFAULT_TASK_RERUN_EXPORT_ENABLED,
++    )
++    _task_rerun_point_voxel_size_m: float = _env_float(
++        "DIMOS_GO2_TASK_RERUN_POINT_VOXEL_SIZE_M",
++        DEFAULT_TASK_RERUN_POINT_VOXEL_SIZE_M,
++    )
+ 
+     @rpc
+     def start(self) -> None:
+         super().start()
+         # Initialize TF early so it can start receiving transforms.
+         _ = self.tf
++        self.register_disposable(Disposable(self.sport_odom.subscribe(self._on_sport_odom)))
++        self.register_disposable(
++            Disposable(self.global_costmap.subscribe(self._on_global_costmap))
++        )
++        self.register_disposable(Disposable(self.global_map.subscribe(self._on_global_map)))
++        self.register_disposable(Disposable(self.lidar.subscribe(self._on_lidar)))
++        self.register_disposable(Disposable(self.color_image.subscribe(self._on_color_image)))
+ 
+     @rpc
+     def stop(self) -> None:
++        self._save_final_floor_plan()
+         super().stop()
+ 
++
++    def _on_sport_odom(self, pose: PoseStamped) -> None:
++        self._latest_sport_odom = pose
++        self._latest_sport_odom_received_at_s = time.monotonic()
++
++    def _on_global_costmap(self, occupancy_grid: OccupancyGrid) -> None:
++        self._latest_global_costmap = occupancy_grid
++        self._latest_global_costmap_received_at_s = time.monotonic()
++
++    def _on_global_map(self, pointcloud: PointCloud2) -> None:
++        self._latest_global_map = pointcloud
++        self._latest_global_map_received_at_s = time.monotonic()
++
++    def _on_lidar(self, pointcloud: PointCloud2) -> None:
++        self._latest_lidar = pointcloud
++        self._latest_lidar_received_at_s = time.monotonic()
++
++    def _on_color_image(self, image: Image) -> None:
++        self._latest_camera_image = image
++        self._latest_camera_image_received_at_s = time.monotonic()
++
++    def _publish_tele_cmd_vel(self, twist: Twist) -> tuple[bool, dict[str, Any]]:
++        try:
++            self.tele_cmd_vel.publish(twist)
++            return True, {"ok": True, "ack_waited": False, "transport": "tele_cmd_vel"}
++        except Exception as exc:
++            return False, {
++                "ok": False,
++                "error": "cmd_vel_publish_failed",
++                "timed_out": False,
++                "phase": "cmd_vel_publish",
++                "exception_type": exc.__class__.__name__,
++                "exception": str(exc),
++                "command_may_have_been_accepted": False,
++            }
++
+     @skill
+-    def relative_move(self, forward: float = 0.0, left: float = 0.0, degrees: float = 0.0) -> str:
+-        """Move the robot relative to its current position.
+-
+-        The `degrees` arguments refers to the rotation the robot should be at the end, relative to its current rotation.
++    def stop_movement(self) -> SkillResult[NavigationSkillError]:
++        """Stop active Go2 motion and cancel any active navigation goal.
++
++        This is the first recovery tool for stalls, protection blockers, or
++        uncertain motion. It sends zero velocity and returns whether navigation
++        cancel and zero-velocity publication were accepted; it is not a posture
++        command and does not make the robot sit or lie down.
++        """
++
++        started_at_s = time.monotonic()
++        command_sent, move_response = self._publish_tele_cmd_vel(Twist())
++        navigation_cancelled = self._navigation_cancel_goal(timeout_s=1.0)
++        metadata = {
++            "navigation_cancelled": navigation_cancelled,
++            "zero_velocity_sent": command_sent,
++        }
++        if not isinstance(move_response, bool):
++            metadata["zero_velocity_response"] = move_response
++        if not command_sent:
++            result = SkillResult.fail(
++                "EXECUTION_FAILED",
++                "Failed to send zero-velocity stop command to the robot connection.",
++                **metadata,
++            )
++            return self._trace_movement_skill_result(
++                "stop_movement",
++                result,
++                movement_kind="stop",
++                started_at_s=started_at_s,
++            )
++        result = SkillResult.ok("Stopped robot movement.", **metadata)
++        return self._trace_movement_skill_result(
++            "stop_movement",
++            result,
++            movement_kind="stop",
++            started_at_s=started_at_s,
++        )
++
++    @skill(
++        uses=[CAP_MOVEMENT],
++        requires_modules=["CostMapper", "ReplanningAStarPlanner"],
++    )
++    def relative_move(
++        self, forward: float = 0.0, left: float = 0.0, degrees: float = 0.0
++    ) -> SkillResult[NavigationSkillError]:
++        """Move the Go2 relative to its current pose using DimOS local planning.
++
++        This is a skill-level local move, not raw velocity. The request may be
++        clipped by local planning, collision/protection layers, odometry, or
++        timeout. A useful partial move is normal physical feedback, not
++        automatically a code failure. The result reports requested/measured
++        displacement, residual distance, heading drift, planner arrival,
++        odometry confirmation, `precision_class`, `agent_interpretation`, and
++        `recommended_next_action`. Treat `within_tolerance` as close enough,
++        `partial` as useful progress that may need observe/shorter follow-up,
++        `short_stop` or `blocked_or_protected` as a reason to stop/re-observe or
++        change angle, and `unknown` as requiring diagnostics. Pure yaw requests
++        are routed to `rotate_in_place`.
++
++        The `degrees` argument is the desired final relative heading.
+ 
+         Example calls:
+ 
+@@ -227,32 +585,1540 @@
+             # Move 3 meters left, and face that direction
+             relative_move(forward=0, left=3, degrees=90)
+         """
++        started_at_s = time.monotonic()
+         forward, left, degrees = float(forward), float(left), float(degrees)
++        if (
++            abs(forward) < self._pure_rotation_linear_epsilon_m
++            and abs(left) < self._pure_rotation_linear_epsilon_m
++            and abs(degrees) > 0.0
++        ):
++            return self.rotate_in_place(degrees=degrees)
++
++        requested = {
++            "forward_m": forward,
++            "left_m": left,
++            "yaw_deg": degrees,
++        }
++
++        if self._navigation_not_configured():
++            metadata = {
++                "requested": requested,
++                "status": "NOT_CONFIGURED",
++                "navigation_configured": False,
++                "command_may_be_active": False,
++            }
++            self._annotate_relative_move_contract(
++                metadata,
++                requested=requested,
++                planner_arrived=False,
++                odometry_confirmed=False,
++            )
++            result = SkillResult.fail(
++                "NOT_CONFIGURED",
++                self._relative_move_result_message(
++                    metadata,
++                    default="Relative move requires the navigation planner, but it is disabled.",
++                ),
++                **metadata,
++            )
++            return self._trace_movement_skill_result(
++                "relative_move",
++                result,
++                movement_kind="relative_move",
++                started_at_s=started_at_s,
++            )
+ 
+         tf = self.tf.get("world", "base_link")
+         if tf is None:
+-            return "Failed to get the position of the robot."
+-
+-        # TODO: Improve this. This is not a nice way to do it. I should
+-        # subscribe to arrival/cancellation events instead.
+-
+-        self._navigation.set_goal(self._generate_new_goal(tf.to_pose(), forward, left, degrees))
+-
+-        time.sleep(1.0)
++            metadata = {"requested": requested, "status": "NO_ODOM"}
++            self._annotate_relative_move_contract(
++                metadata,
++                requested=requested,
++                planner_arrived=False,
++                odometry_confirmed=False,
++            )
++            result = SkillResult.fail(
++                "NO_ODOM",
++                self._relative_move_result_message(
++                    metadata,
++                    default="Failed to get the current robot pose.",
++                ),
++                **metadata,
++            )
++            return self._trace_movement_skill_result(
++                "relative_move",
++                result,
++                movement_kind="relative_move",
++                started_at_s=started_at_s,
++            )
++
++        start_pose = tf.to_pose()
++        goal_pose = self._generate_new_goal(start_pose, forward, left, degrees)
++        metadata = {
++            "requested": requested,
++            "start": pose_metadata(start_pose),
++            "goal": pose_metadata(goal_pose),
++            "arrival_tolerance": {
++                "linear_m": self._relative_move_linear_tolerance_m,
++                "yaw_deg": self._relative_move_yaw_tolerance_deg,
++            },
++        }
++
++        timeout = self._relative_move_timeout_s
++        try:
++            accepted = self._navigation_call("set_goal", goal_pose, timeout_s=timeout)
++        except TimeoutError as exc:
++            metadata.update(
++                self._measured_delta_metadata(
++                    start_pose,
++                    navigation_state_error=f"{exc.__class__.__name__}: {exc}",
++                    goal_reached=False,
++                )
++            )
++            metadata["status"] = "TIMEOUT"
++            metadata["timeout_s"] = timeout
++            metadata["timeout_phase"] = "set_goal"
++            metadata["command_may_be_active"] = True
++            metadata["cancel_goal_sent"] = self._navigation_cancel_goal(timeout_s=1.0)
++            self._annotate_relative_move_contract(
++                metadata,
++                requested=requested,
++                planner_arrived=False,
++                odometry_confirmed=False,
++            )
++            result = SkillResult.fail(
++                "TIMEOUT",
++                self._relative_move_result_message(
++                    metadata,
++                    default="Navigation timed out while dispatching the relative movement goal.",
++                ),
++                **metadata,
++            )
++            return self._trace_movement_skill_result(
++                "relative_move",
++                result,
++                movement_kind="relative_move",
++                started_at_s=started_at_s,
++            )
++        metadata["set_goal_accepted"] = accepted
++        if not accepted:
++            reason = self._navigation_failure_or("NO_PATH")
++            metadata["status"] = reason
++            self._annotate_relative_move_contract(
++                metadata,
++                requested=requested,
++                planner_arrived=False,
++                odometry_confirmed=False,
++                precision_class="blocked_or_protected",
++            )
++            result = SkillResult.fail(
++                reason,
++                self._relative_move_result_message(
++                    metadata,
++                    default="Navigation planner did not accept the relative movement goal.",
++                ),
++                **metadata,
++            )
++            return self._trace_movement_skill_result(
++                "relative_move",
++                result,
++                movement_kind="relative_move",
++                started_at_s=started_at_s,
++            )
++
++        # TODO: Replace this polling with navigation completion events.
++        time.sleep(self._relative_move_settle_s)
+ 
+         start_time = time.monotonic()
+-        timeout = 100.0
+-        while self._navigation.get_state() == NavigationState.FOLLOWING_PATH:
+-            if time.monotonic() - start_time > timeout:
+-                return "Navigation timed out"
+-            time.sleep(0.1)
+-
+-        time.sleep(1.0)
+-
+-        if not self._navigation.is_goal_reached():
+-            return "Navigation was cancelled or failed"
++        state: NavigationState | None = None
++        state_error: str | None = None
++        while True:
++            remaining = timeout - (time.monotonic() - start_time)
++            if remaining <= 0.0:
++                state_error = None
++                break
++            try:
++                state = self._navigation_get_state(timeout_s=remaining)
++            except TimeoutError as exc:
++                state_error = f"{exc.__class__.__name__}: {exc}"
++                break
++            if state != NavigationState.FOLLOWING_PATH:
++                break
++            time.sleep(min(self._relative_move_poll_s, max(remaining, 0.0)))
++
++        if state is None or state == NavigationState.FOLLOWING_PATH:
++            self._navigation_cancel_goal(timeout_s=1.0)
++            metadata.update(
++                self._measured_delta_metadata(
++                    start_pose,
++                    navigation_state=state,
++                    navigation_state_error=state_error,
++                    goal_reached=False,
++                )
++            )
++            metadata["status"] = "TIMEOUT"
++            metadata["timeout_s"] = timeout
++            metadata["command_may_be_active"] = True
++            self._annotate_relative_move_contract(
++                metadata,
++                requested=requested,
++                planner_arrived=False,
++                odometry_confirmed=False,
++            )
++            result = SkillResult.fail(
++                "TIMEOUT",
++                self._relative_move_result_message(
++                    metadata,
++                    default="Navigation timed out before the relative movement completed.",
++                ),
++                **metadata,
++            )
++            return self._trace_movement_skill_result(
++                "relative_move",
++                result,
++                movement_kind="relative_move",
++                started_at_s=started_at_s,
++            )
++
++        time.sleep(self._relative_move_settle_s)
++
++        try:
++            goal_check_timeout = max(timeout - (time.monotonic() - start_time), 0.001)
++            goal_reached = self._navigation_is_goal_reached(timeout_s=goal_check_timeout)
++        except TimeoutError as exc:
++            metadata.update(
++                self._measured_delta_metadata(
++                    start_pose,
++                    navigation_state=state,
++                    navigation_state_error=f"{exc.__class__.__name__}: {exc}",
++                    goal_reached=False,
++                )
++            )
++            metadata["status"] = "TIMEOUT"
++            metadata["timeout_s"] = timeout
++            metadata["command_may_be_active"] = False
++            self._annotate_relative_move_contract(
++                metadata,
++                requested=requested,
++                planner_arrived=False,
++                odometry_confirmed=False,
++            )
++            result = SkillResult.fail(
++                "TIMEOUT",
++                self._relative_move_result_message(
++                    metadata,
++                    default="Navigation timed out while checking the final goal state.",
++                ),
++                **metadata,
++            )
++            return self._trace_movement_skill_result(
++                "relative_move",
++                result,
++                movement_kind="relative_move",
++                started_at_s=started_at_s,
++            )
++
++        metadata.update(
++            self._measured_delta_metadata(
++                start_pose,
++                navigation_state=state,
++                goal_reached=goal_reached,
++            )
++        )
++        if not goal_reached:
++            reason = self._navigation_failure_or("CANCELLED")
++            metadata["status"] = reason
++            self._annotate_relative_move_contract(
++                metadata,
++                requested=requested,
++                planner_arrived=False,
++                odometry_confirmed=False,
++            )
++            result = SkillResult.fail(
++                reason,
++                self._relative_move_result_message(
++                    metadata,
++                    default="Navigation was cancelled or failed before reaching the relative movement goal.",
++                ),
++                **metadata,
++            )
++            return self._trace_movement_skill_result(
++                "relative_move",
++                result,
++                movement_kind="relative_move",
++                started_at_s=started_at_s,
++            )
++
++        arrival_check = self._relative_move_arrival_check(requested, metadata.get("measured_delta"))
++        metadata["arrival_check"] = arrival_check
++        if not arrival_check["verified"]:
++            reason = (
++                "NO_ODOM"
++                if arrival_check["reason"] == "missing_measured_delta"
++                else "ARRIVAL_NOT_CONFIRMED"
++            )
++            metadata["status"] = reason
++            self._annotate_relative_move_contract(
++                metadata,
++                requested=requested,
++                planner_arrived=True,
++                odometry_confirmed=False,
++                precision_class=str(arrival_check.get("precision_class") or "unknown"),
++            )
++            result = SkillResult.fail(
++                reason,
++                self._relative_move_result_message(
++                    metadata,
++                    default=(
++                        "Navigation reported arrival, but measured odometry only "
++                        f"classified the movement as {metadata['precision_class']}."
++                    ),
++                ),
++                **metadata,
++            )
++            return self._trace_movement_skill_result(
++                "relative_move",
++                result,
++                movement_kind="relative_move",
++                started_at_s=started_at_s,
++            )
++
++        metadata["status"] = "ARRIVED"
++        self._annotate_relative_move_contract(
++            metadata,
++            requested=requested,
++            planner_arrived=True,
++            odometry_confirmed=True,
++            precision_class=str(arrival_check.get("precision_class") or "unknown"),
++        )
++        result = SkillResult.ok(
++            self._relative_move_result_message(
++                metadata,
++                default="Navigation goal reached.",
++            ),
++            **metadata,
++        )
++        return self._trace_movement_skill_result(
++            "relative_move",
++            result,
++            movement_kind="relative_move",
++            started_at_s=started_at_s,
++        )
++
++    @skill(uses=[CAP_MOVEMENT])
++    def drive(
++        self, forward: float = 0.0, left: float = 0.0, degrees: float = 0.0
++    ) -> SkillResult[NavigationSkillError]:
++        """Drive the Go2 with direct odometry-closed velocity, bypassing planning.
++
++        This is the lightweight VLN execution primitive for short bounded
++        translations. It publishes `tele_cmd_vel` fire-and-forget commands and
++        verifies progress with firmware sport-mode odometry; it does not call
++        the navigation planner or use lidar SLAM pose for closure.
++        Pure yaw requests are delegated to `rotate_in_place`.
++
++        Args:
++            forward: Requested forward displacement in meters.
++            left: Requested left displacement in meters.
++            degrees: Requested final relative yaw in degrees.
++        """
++        started_at_s = time.monotonic()
++        forward, left, degrees = float(forward), float(left), float(degrees)
++        if (
++            abs(forward) < self._pure_rotation_linear_epsilon_m
++            and abs(left) < self._pure_rotation_linear_epsilon_m
++            and abs(degrees) > 0.0
++        ):
++            return self.rotate_in_place(degrees=degrees)
++
++        requested = {
++            "forward_m": forward,
++            "left_m": left,
++            "yaw_deg": degrees,
++        }
++        requested_linear_m = math.hypot(forward, left)
++        linear_tolerance_m = self._relative_move_effective_linear_tolerance_m(requested_linear_m)
++        yaw_tolerance_deg = self._relative_move_yaw_tolerance_deg
++        timeout_s = max(self._drive_timeout_s, 0.001)
++        metadata: dict[str, Any] = {
++            "requested": requested,
++            "arrival_tolerance": {
++                "linear_m": linear_tolerance_m,
++                "yaw_deg": yaw_tolerance_deg,
++            },
++            "timeout_s": timeout_s,
++            "controller": {
++                "transport": "tele_cmd_vel",
++                "ack_waited": False,
++                "linear_gain": self._drive_linear_gain,
++                "yaw_gain": self._drive_yaw_gain,
++                "max_linear_speed_mps": self._drive_max_linear_speed_mps,
++                "max_yaw_speed_rad_s": self._drive_max_yaw_speed_rad_s,
++                "poll_s": self._drive_poll_s,
++                "feedback_source": "rt/lf/sportmodestate",
++                "max_feedback_age_s": self._direct_motion_feedback_timeout_s,
++                "initial_feedback_timeout_s": self._direct_motion_initial_feedback_timeout_s,
++                "feedback_timeout_s": self._direct_motion_feedback_timeout_s,
++                "min_feedback_progress_m": self._drive_min_feedback_progress_m,
++            },
++            "feedback_watchdog_triggered": False,
++        }
++
++        start_pose = self._current_direct_motion_pose()
++        if start_pose is None:
++            metadata.update(
++                {
++                    "start": None,
++                    "end": None,
++                    "measured_delta": None,
++                    "status": "NO_ODOM",
++                    "zero_velocity_sent": False,
++                }
++            )
++            self._annotate_drive_guidance(metadata)
++            result = SkillResult.fail(
++                "NO_ODOM",
++                metadata["agent_interpretation"],
++                **metadata,
++            )
++            return self._trace_direct_movement_skill_result(
++                "drive",
++                result,
++                movement_kind="drive",
++                started_at_s=started_at_s,
++            )
++
++        goal_pose = self._generate_new_goal(start_pose, forward, left, degrees)
++        metadata["start"] = pose_metadata(start_pose)
++        metadata["goal"] = pose_metadata(goal_pose)
++
++        if self._drive_goal_reached(
++            start_pose,
++            goal_pose,
++            linear_tolerance_m=linear_tolerance_m,
++            yaw_tolerance_deg=yaw_tolerance_deg,
++        ):
++            metadata.update(self._drive_measurement_metadata(start_pose, start_pose, goal_pose))
++            metadata["status"] = "ARRIVED"
++            metadata["zero_velocity_sent"] = False
++            self._annotate_drive_guidance(metadata)
++            result = SkillResult.ok(metadata["agent_interpretation"], **metadata)
++            return self._trace_direct_movement_skill_result(
++                "drive",
++                result,
++                movement_kind="drive",
++                started_at_s=started_at_s,
++            )
++
++        status = "TIMEOUT"
++        last_pose = start_pose
++        deadline = time.monotonic() + timeout_s
++        # Direct velocity must fail closed instead of running open-loop on frozen odometry.
++        feedback_anchor = start_pose
++        feedback_deadline = time.monotonic() + self._direct_motion_initial_feedback_timeout_s
++        try:
++            while time.monotonic() < deadline:
++                current_pose = self._current_direct_motion_pose()
++                if current_pose is None:
++                    status = "NO_ODOM"
++                    break
++                last_pose = current_pose
++                if self._drive_goal_reached(
++                    current_pose,
++                    goal_pose,
++                    linear_tolerance_m=linear_tolerance_m,
++                    yaw_tolerance_deg=yaw_tolerance_deg,
++                ):
++                    status = "ARRIVED"
++                    break
++
++                if (
++                    self._drive_residual_distance_m(current_pose, feedback_anchor)
++                    >= self._drive_min_feedback_progress_m
++                ):
++                    feedback_anchor = current_pose
++                    feedback_deadline = time.monotonic() + self._direct_motion_feedback_timeout_s
++                elif time.monotonic() >= feedback_deadline:
++                    status = "NO_PROGRESS"
++                    metadata["feedback_watchdog_triggered"] = True
++                    break
++
++                command = self._drive_command_toward_goal(current_pose, goal_pose)
++                command_sent, move_response = self._publish_tele_cmd_vel(command)
++                if not command_sent:
++                    status = "EXECUTION_FAILED"
++                    metadata["connection_move_response"] = move_response
++                    break
++                time.sleep(max(self._drive_poll_s, 0.0))
++        finally:
++            stop_sent, stop_response = self._publish_tele_cmd_vel(Twist())
++            metadata["zero_velocity_sent"] = stop_sent
++            if not stop_sent:
++                metadata["zero_velocity_response"] = stop_response
++
++        end_pose = self._current_direct_motion_pose() or last_pose
++        metadata.update(self._drive_measurement_metadata(start_pose, end_pose, goal_pose))
++        metadata["status"] = status
++        self._annotate_drive_guidance(metadata)
++
++        if status == "ARRIVED":
++            result = SkillResult.ok(metadata["agent_interpretation"], **metadata)
++        elif status == "NO_PROGRESS":
++            result = SkillResult.fail("NO_PROGRESS", metadata["agent_interpretation"], **metadata)
++        elif status == "NO_ODOM":
++            result = SkillResult.fail("NO_ODOM", metadata["agent_interpretation"], **metadata)
++        elif status == "EXECUTION_FAILED":
++            result = SkillResult.fail(
++                "EXECUTION_FAILED",
++                metadata["agent_interpretation"],
++                **metadata,
++            )
+         else:
+-            return "Navigation goal reached"
++            result = SkillResult.fail("TIMEOUT", metadata["agent_interpretation"], **metadata)
++        return self._trace_direct_movement_skill_result(
++            "drive",
++            result,
++            movement_kind="drive",
++            started_at_s=started_at_s,
++        )
++
++    @skill(uses=[CAP_MOVEMENT])
++    def rotate_in_place(
++        self,
++        degrees: float,
++        max_duration_s: float = 5.0,
++        angular_speed_limit: float = 0.4,
++    ) -> SkillResult[NavigationSkillError]:
++        """Rotate the robot in place using direct yaw velocity, not global navigation.
++
++        Rotation is calibrated for the Go2 yaw deadband, but the robot may still
++        drift in translation or stop short when protection/odometry intervenes.
++        Check the returned measured yaw and translation drift before using the
++        result for return-to-start math. For large rotations, re-observe or read
++        odometry before assuming the robot pivoted perfectly.
++
++        Args:
++            degrees: Requested yaw rotation in degrees. Positive turns left, negative turns right.
++            max_duration_s: Safety timeout for the rotation command.
++            angular_speed_limit: Maximum absolute yaw speed in radians per second.
++        """
++        started_at_s = time.monotonic()
++        degrees = float(degrees)
++        max_duration_s = float(max_duration_s)
++        angular_speed_limit = abs(float(angular_speed_limit))
++        requested = {
++            "yaw_deg": degrees,
++            "max_duration_s": max_duration_s,
++            "angular_speed_limit_rad_s": angular_speed_limit,
++            "min_effective_yaw_speed_rad_s": self._rotate_in_place_min_effective_yaw_speed_rad_s,
++            "tolerance_deg": self._rotate_in_place_tolerance_deg,
++        }
++
++        if max_duration_s <= 0.0 or angular_speed_limit <= 0.0:
++            result = SkillResult.fail(
++                "INVALID_INPUT",
++                "max_duration_s and angular_speed_limit must be positive.",
++                requested=requested,
++            )
++            return self._trace_movement_skill_result(
++                "rotate_in_place",
++                result,
++                movement_kind="rotation",
++                started_at_s=started_at_s,
++            )
++
++        start_pose = self._current_direct_motion_pose()
++        if start_pose is None:
++            result = SkillResult.fail(
++                "NO_ODOM",
++                "Failed to get the current robot pose before rotating.",
++                requested=requested,
++            )
++            return self._trace_movement_skill_result(
++                "rotate_in_place",
++                result,
++                movement_kind="rotation",
++                started_at_s=started_at_s,
++            )
++
++        target_rad = math.radians(degrees)
++        target_abs = abs(target_rad)
++        tolerance_rad = math.radians(self._rotate_in_place_tolerance_deg)
++        metadata = {
++            "requested": requested,
++            "start": pose_metadata(start_pose),
++            "target_yaw_rad": target_rad,
++            "tolerance_rad": tolerance_rad,
++            "feedback_watchdog": {
++                "source": "rt/lf/sportmodestate",
++                "max_age_s": self._direct_motion_feedback_timeout_s,
++                "initial_timeout_s": self._direct_motion_initial_feedback_timeout_s,
++                "timeout_s": self._direct_motion_feedback_timeout_s,
++                "min_yaw_progress_deg": self._rotate_min_feedback_progress_deg,
++            },
++            "feedback_watchdog_triggered": False,
++        }
++
++        if target_abs <= tolerance_rad:
++            metadata.update(self._rotation_measurement_metadata(start_pose, start_pose, 0.0))
++            metadata["status"] = "ARRIVED"
++            result = SkillResult.ok("Requested rotation is already within tolerance.", **metadata)
++            return self._trace_movement_skill_result(
++                "rotate_in_place",
++                result,
++                movement_kind="rotation",
++                started_at_s=started_at_s,
++            )
++
++        direction = 1.0 if target_rad > 0.0 else -1.0
++        min_effective_yaw_speed = self._rotate_in_place_min_effective_yaw_speed_rad_s
++        if angular_speed_limit < min_effective_yaw_speed:
++            metadata["status"] = "YAW_SPEED_BELOW_EFFECTIVE_MIN"
++            metadata["min_effective_yaw_speed_rad_s"] = min_effective_yaw_speed
++            result = SkillResult.fail(
++                "YAW_SPEED_BELOW_EFFECTIVE_MIN",
++                "angular_speed_limit is below the calibrated minimum effective Go2 yaw speed.",
++                **metadata,
++            )
++            return self._trace_movement_skill_result(
++                "rotate_in_place",
++                result,
++                movement_kind="rotation",
++                started_at_s=started_at_s,
++            )
++
++        # Direct teleop-style rotation should not fight an existing navigation goal,
++        # but this preemption must stay bounded on slow Jetson RPC links.
++        metadata["cancel_goal_sent"] = self._navigation_cancel_goal(timeout_s=1.0)
++
++        # ``max_duration_s`` is a safety deadline, not a requested motion
++        # duration.  Keep the commanded rate independent so callers can leave
++        # enough real-hardware margin without unintentionally slowing the turn.
++        yaw_speed = angular_speed_limit
++        command = Twist(
++            linear=Vector3(0.0, 0.0, 0.0), angular=Vector3(0.0, 0.0, direction * yaw_speed)
++        )
++
++        cumulative_yaw_rad = 0.0
++        feedback_anchor_yaw_rad = 0.0
++        last_pose = start_pose
++        deadline = time.monotonic() + max_duration_s
++        feedback_deadline = time.monotonic() + self._direct_motion_initial_feedback_timeout_s
++        status: NavigationError | Literal["ARRIVED"] = "TIMEOUT"
++        move_failed = False
++        try:
++            while time.monotonic() < deadline:
++                command_sent, move_response = self._publish_tele_cmd_vel(command)
++                if not command_sent:
++                    move_failed = True
++                    status = "EXECUTION_FAILED"
++                    metadata["connection_move_response"] = move_response
++                    break
++                time.sleep(self._rotate_in_place_poll_s)
++                current_pose = self._current_direct_motion_pose()
++                if current_pose is None:
++                    status = "NO_ODOM"
++                    break
++                cumulative_yaw_rad += angle_diff(current_pose.yaw, last_pose.yaw)
++                last_pose = current_pose
++                if direction * cumulative_yaw_rad >= target_abs - tolerance_rad:
++                    status = "ARRIVED"
++                    break
++                if abs(cumulative_yaw_rad - feedback_anchor_yaw_rad) >= math.radians(
++                    self._rotate_min_feedback_progress_deg
++                ):
++                    feedback_anchor_yaw_rad = cumulative_yaw_rad
++                    feedback_deadline = time.monotonic() + self._direct_motion_feedback_timeout_s
++                elif time.monotonic() >= feedback_deadline:
++                    status = "NO_PROGRESS"
++                    metadata["feedback_watchdog_triggered"] = True
++                    break
++        finally:
++            stop_sent, stop_response = self._publish_tele_cmd_vel(Twist())
++            metadata["zero_velocity_sent"] = stop_sent
++            if not stop_sent:
++                metadata["zero_velocity_response"] = stop_response
++
++        end_pose = self._current_direct_motion_pose() or last_pose
++        metadata.update(
++            self._rotation_measurement_metadata(start_pose, end_pose, cumulative_yaw_rad)
++        )
++        metadata["commanded_yaw_speed_rad_s"] = direction * yaw_speed
++        metadata["status"] = status
++
++        if status == "ARRIVED":
++            result = SkillResult.ok("Rotation completed.", **metadata)
++            return self._trace_movement_skill_result(
++                "rotate_in_place",
++                result,
++                movement_kind="rotation",
++                started_at_s=started_at_s,
++            )
++        if status == "NO_ODOM":
++            result = SkillResult.fail(
++                "NO_ODOM",
++                "Lost robot odometry while rotating.",
++                **metadata,
++            )
++            return self._trace_movement_skill_result(
++                "rotate_in_place",
++                result,
++                movement_kind="rotation",
++                started_at_s=started_at_s,
++            )
++        if status == "NO_PROGRESS":
++            result = SkillResult.fail(
++                "NO_PROGRESS",
++                "Rotation received fresh body odometry but made no measurable yaw progress.",
++                **metadata,
++            )
++            return self._trace_movement_skill_result(
++                "rotate_in_place",
++                result,
++                movement_kind="rotation",
++                started_at_s=started_at_s,
++            )
++        if move_failed:
++            result = SkillResult.fail(
++                "EXECUTION_FAILED",
++                "The robot connection rejected the rotation velocity command.",
++                **metadata,
++            )
++            return self._trace_movement_skill_result(
++                "rotate_in_place",
++                result,
++                movement_kind="rotation",
++                started_at_s=started_at_s,
++            )
++        result = SkillResult.fail(
++            "TIMEOUT",
++            "Rotation timed out before measured yaw reached the requested angle.",
++            **metadata,
++        )
++        return self._trace_movement_skill_result(
++            "rotate_in_place",
++            result,
++            movement_kind="rotation",
++            started_at_s=started_at_s,
++        )
++
++    def _trace_movement_skill_result(
++        self,
++        tool_name: str,
++        result: SkillResult[NavigationSkillError],
++        *,
++        started_at_s: float | None = None,
++        **context: object,
++    ) -> SkillResult[NavigationSkillError]:
++        if started_at_s is not None:
++            record_skill_duration(result, started_at_s)
++        self._update_active_navigation_task(tool_name)
++        self._attach_floor_plan(tool_name, result)
++        self._attach_2d_slam_map(tool_name, result)
++        self._attach_latest_camera_image(tool_name, result)
++        self._export_task_rerun_recording(tool_name, result)
++        self._record_latest_motion_result(tool_name, result, context)
++        return emit_skill_result_trace(
++            logger,
++            "movement_skill_result",
++            tool_name,
++            result,
++            **context,
++        )
++
++    def _trace_direct_movement_skill_result(
++        self,
++        tool_name: str,
++        result: SkillResult[NavigationSkillError],
++        *,
++        started_at_s: float | None = None,
++        **context: object,
++    ) -> SkillResult[NavigationSkillError]:
++        if started_at_s is not None:
++            record_skill_duration(result, started_at_s)
++        self._update_active_navigation_task(tool_name)
++        self._attach_floor_plan(tool_name, result)
++        self._attach_2d_slam_map(tool_name, result)
++        self._attach_latest_camera_image(tool_name, result)
++        self._export_task_rerun_recording(tool_name, result)
++        self._record_latest_motion_result(tool_name, result, context)
++        return emit_skill_result_trace(
++            logger,
++            "movement_skill_result",
++            tool_name,
++            result,
++            **context,
++        )
++
++    def _floor_plan_config(self) -> FloorPlanConfig:
++        return FloorPlanConfig(
++            occupied_threshold=self._floor_plan_occupied_threshold,
++            closing_radius_m=self._floor_plan_closing_radius_m,
++            opening_radius_m=self._floor_plan_opening_radius_m,
++            min_component_area_m2=self._floor_plan_min_component_area_m2,
++            free_space_closing_radius_m=self._floor_plan_free_space_closing_radius_m,
++            max_fill_hole_area_m2=self._floor_plan_max_fill_hole_area_m2,
++            boundary_wall_width_m=self._floor_plan_boundary_wall_width_m,
++            structural_wall_min_length_m=self._floor_plan_structural_wall_min_length_m,
++            structural_wall_width_m=self._floor_plan_structural_wall_width_m,
++            output_max_size_px=self._floor_plan_size_px,
++        )
++
++    def _attach_floor_plan(
++        self,
++        tool_name: str,
++        result: SkillResult[NavigationSkillError],
++    ) -> None:
++        if tool_name not in _MOVEMENT_IMAGE_ATTACHMENT_TOOLS:
++            return
++
++        metadata: dict[str, Any] = {
++            "status": "unavailable",
++            "source": "native_global_map_cleaned",
++        }
++        occupancy_grid = getattr(self, "_latest_global_costmap", None)
++        received_at_s = getattr(self, "_latest_global_costmap_received_at_s", None)
++        if occupancy_grid is None:
++            result.metadata["floor_plan"] = metadata
++            return
++
++        now_s = time.monotonic()
++        map_age_s = None if received_at_s is None else now_s - received_at_s
++        metadata.update(
++            {
++                "map_frame": occupancy_grid.frame_id,
++                "grid_ts": occupancy_grid.ts,
++                "grid_age_s": map_age_s,
++                "resolution_m_per_cell": occupancy_grid.resolution,
++            }
++        )
++        if map_age_s is None or map_age_s > self._floor_plan_max_age_s:
++            metadata["status"] = "stale"
++            metadata["max_age_s"] = self._floor_plan_max_age_s
++            result.metadata["floor_plan"] = metadata
++            return
++
++        pose = self._current_2d_slam_map_pose(tool_name)
++        try:
++            rendered = render_clean_floor_plan(
++                occupancy_grid,
++                config=self._floor_plan_config(),
++                pose=pose,
++            )
++        except Exception as exc:
++            metadata.update(
++                {
++                    "status": "render_failed",
++                    "error": f"{exc.__class__.__name__}: {exc}",
++                }
++            )
++            result.metadata["floor_plan"] = metadata
++            logger.exception("Failed to render clean floor plan for %s.", tool_name)
++            return
++
++        image_block = rendered.image_block
++        metadata.update(rendered.metadata)
++        metadata["status"] = "current"
++        metadata["grid_age_s"] = map_age_s
++        if pose is not None:
++            metadata["pose"] = pose_metadata(pose)
++        self._record_floor_plan_artifact(tool_name, image_block, metadata)
++        result.metadata["floor_plan"] = metadata
++        result.content_blocks.append(image_block)
++
++    def _attach_2d_slam_map(
++        self,
++        tool_name: str,
++        result: SkillResult[NavigationSkillError],
++    ) -> None:
++        if tool_name not in _MOVEMENT_IMAGE_ATTACHMENT_TOOLS:
++            return
++
++        metadata: dict[str, Any] = {
++            "status": "unavailable",
++            "source": "global_costmap",
++        }
++        occupancy_grid = getattr(self, "_latest_global_costmap", None)
++        received_at_s = getattr(self, "_latest_global_costmap_received_at_s", None)
++        if occupancy_grid is None:
++            result.metadata["2d_slam_map"] = metadata
++            return
++
++        now_s = time.monotonic()
++        map_age_s = None if received_at_s is None else now_s - received_at_s
++        metadata.update(
++            {
++                "map_frame": occupancy_grid.frame_id,
++                "grid_ts": occupancy_grid.ts,
++                "grid_age_s": map_age_s,
++                "resolution_m_per_cell": occupancy_grid.resolution,
++            }
++        )
++        if map_age_s is None or map_age_s > self._2d_slam_map_max_age_s:
++            metadata["status"] = "stale"
++            metadata["max_age_s"] = self._2d_slam_map_max_age_s
++            result.metadata["2d_slam_map"] = metadata
++            return
++
++        pose = self._current_2d_slam_map_pose(tool_name)
++        if pose is None:
++            metadata["status"] = "pose_unavailable"
++            result.metadata["2d_slam_map"] = metadata
++            return
++
++        trace = self._append_slam_trace_pose(pose)
++        try:
++            rendered = render_agent_occupancy_map(
++                occupancy_grid,
++                pose,
++                trace,
++                output_size_px=self._2d_slam_map_size_px,
++                view_size_m=self._2d_slam_map_view_size_m,
++            )
++        except Exception as exc:
++            metadata.update(
++                {
++                    "status": "render_failed",
++                    "error": f"{exc.__class__.__name__}: {exc}",
++                    "pose_frame": pose.frame_id,
++                }
++            )
++            result.metadata["2d_slam_map"] = metadata
++            logger.exception("Failed to render 2D SLAM occupancy map for %s.", tool_name)
++            return
++
++        image_block = rendered.image_block
++        metadata.update(rendered.metadata)
++        metadata["status"] = "current"
++        metadata["grid_age_s"] = map_age_s
++        metadata["pose"] = pose_metadata(pose)
++        metadata["pose_sequence"] = len(getattr(self, "_slam_pose_trace", []) or [])
++        self._record_2d_slam_map_artifact(tool_name, image_block, metadata)
++        result.metadata["2d_slam_map"] = metadata
++        result.content_blocks.append(image_block)
++
++    def _update_active_navigation_task(self, tool_name: str) -> None:
++        if tool_name not in _MOVEMENT_IMAGE_ATTACHMENT_TOOLS:
++            return
++        task = self._current_skill_task_context()
++        task_id = task.get("task_id")
++        if not task_id:
++            return
++        if getattr(self, "_active_navigation_task_id", None) == task_id:
++            return
++        self._active_navigation_task_id = task_id
++        self._task_rerun_export_count = 0
++        self._slam_pose_trace = []
++
++    def _export_task_rerun_recording(
++        self,
++        tool_name: str,
++        result: SkillResult[NavigationSkillError],
++    ) -> None:
++        if tool_name not in _MOVEMENT_IMAGE_ATTACHMENT_TOOLS:
++            return
++        if not getattr(self, "_task_rerun_export_enabled", DEFAULT_TASK_RERUN_EXPORT_ENABLED):
++            return
++
++        task = self._current_skill_task_context()
++        task_id = task.get("task_id")
++        if not task_id:
++            return
++
++        metadata: dict[str, Any] = {
++            "status": "unavailable",
++            "task_id": task_id,
++            "task_goal": task.get("task_goal"),
++            "source": "offline_rerun_export",
++        }
++        try:
++            artifact_dir = resolve_artifact_dir(runtime_config=self._runtime_config())
++        except Exception:
++            logger.exception("Failed to resolve artifact directory for task Rerun export.")
++            metadata["status"] = "artifact_dir_error"
++            result.metadata["rerun_recording"] = metadata
++            return
++        if artifact_dir is None:
++            metadata["status"] = "artifact_dir_unavailable"
++            result.metadata["rerun_recording"] = metadata
++            return
++
++        pose = self._current_2d_slam_map_pose(tool_name)
++        if pose is None:
++            metadata["status"] = "pose_unavailable"
++            result.metadata["rerun_recording"] = metadata
++            return
++
++        trace = getattr(self, "_slam_pose_trace", None)
++        if not isinstance(trace, list) or not trace:
++            trace = self._append_slam_trace_pose(pose)
++
++        rrd_path = Path(artifact_dir) / "rerun" / f"{_safe_task_token(task_id)}.rrd"
++        try:
++            export_metadata = self._write_task_rerun_recording(
++                rrd_path,
++                task_id=task_id,
++                task_goal=task.get("task_goal"),
++                pose=pose,
++                trace=trace,
++                global_costmap=getattr(self, "_latest_global_costmap", None),
++                global_map=getattr(self, "_latest_global_map", None),
++                lidar=getattr(self, "_latest_lidar", None),
++                sport_odom=getattr(self, "_latest_sport_odom", None),
++            )
++        except Exception as exc:
++            logger.exception("Failed to export task Rerun recording.", task_id=task_id)
++            metadata.update(
++                {
++                    "status": "export_failed",
++                    "error": f"{exc.__class__.__name__}: {exc}",
++                    "path": str(rrd_path),
++                }
++            )
++            result.metadata["rerun_recording"] = metadata
++            return
++
++        self._task_rerun_export_count = getattr(self, "_task_rerun_export_count", 0) + 1
++        metadata.update(export_metadata)
++        metadata.update(
++            {
++                "status": "current",
++                "path": str(rrd_path),
++                "export_count": self._task_rerun_export_count,
++            }
++        )
++        result.metadata["rerun_recording"] = metadata
++
++    def _write_task_rerun_recording(
++        self,
++        rrd_path: Path,
++        *,
++        task_id: str,
++        task_goal: str | None,
++        pose: PoseStamped,
++        trace: list[PoseStamped],
++        global_costmap: OccupancyGrid | None,
++        global_map: PointCloud2 | None,
++        lidar: PointCloud2 | None,
++        sport_odom: PoseStamped | None,
++    ) -> dict[str, Any]:
++        import rerun as rr
++
++        from dimos.visualization.rerun.init import rerun_init
++
++        rrd_path.parent.mkdir(parents=True, exist_ok=True)
++        rerun_init(f"dimos-go2-task-{task_id}")
++        rr.save(str(rrd_path))
++        try:
++            rr.set_time("movement_export", sequence=getattr(self, "_task_rerun_export_count", 0))
++
++            rr.log("task", rr.TextDocument(_task_rerun_summary(task_id, task_goal)), static=True)
++            if global_costmap is not None:
++                rr.log("world/global_costmap", global_costmap.to_rerun())
++            if global_map is not None:
++                global_map_rr, global_map_points = self._task_rerun_pointcloud_to_rerun(
++                    global_map,
++                    colors=[80, 180, 255],
++                )
++                rr.log(
++                    "world/global_map",
++                    global_map_rr,
++                )
++            else:
++                global_map_points = 0
++            if lidar is not None:
++                lidar_rr, lidar_points = self._task_rerun_pointcloud_to_rerun(
++                    lidar,
++                    colors=[255, 255, 255],
++                )
++                rr.log(
++                    "world/lidar",
++                    lidar_rr,
++                )
++            else:
++                lidar_points = 0
++            if sport_odom is not None:
++                rr.log("world/odom/sport", sport_odom.to_rerun())
++                rr.log("world/odom/sport_facing", sport_odom.to_rerun_arrow())
++            rr.log("world/robot/base_link", pose.to_rerun())
++            rr.log("world/robot/facing", pose.to_rerun_arrow())
++            trace_points = [[p.x, p.y, p.z] for p in trace]
++            if len(trace_points) >= 2:
++                rr.log(
++                    "world/robot/trace",
++                    rr.LineStrips3D([trace_points], colors=[0, 210, 230]),
++                )
++            elif trace_points:
++                rr.log(
++                    "world/robot/trace_points",
++                    rr.Points3D(trace_points, colors=[0, 210, 230]),
++                )
++        finally:
++            rr.rerun_shutdown()
++        return {
++            "global_costmap": global_costmap is not None,
++            "global_map": global_map is not None,
++            "lidar": lidar is not None,
++            "global_map_points": global_map_points,
++            "lidar_points": lidar_points,
++            "sport_odom": sport_odom is not None,
++            "robot_pose": True,
++            "trace_points": len(trace_points),
++        }
++
++    def _task_rerun_pointcloud_to_rerun(
++        self,
++        pointcloud: PointCloud2,
++        *,
++        colors: list[int],
++    ) -> tuple[Any, int]:
++        voxel_size = max(0.0, self._task_rerun_point_voxel_size_m)
++        export_cloud = pointcloud.voxel_downsample(voxel_size) if voxel_size > 0 else pointcloud
++        return (
++            export_cloud.to_rerun(
++                voxel_size=voxel_size,
++                colors=colors,
++                mode="points",
++            ),
++            len(export_cloud),
++        )
++
++    def _current_skill_task_context(self) -> dict[str, str]:
++        context = current_skill_context()
++        if not isinstance(context, dict):
++            return {}
++        task = context.get("task")
++        if isinstance(task, dict) and task.get("task_id"):
++            return {
++                key: str(value)
++                for key, value in task.items()
++                if key in {"task_id", "task_goal", "task_origin"} and value is not None
++            }
++        status_context = context.get("tool_status_context")
++        if not isinstance(status_context, dict):
++            return {}
++        movement_authority = status_context.get("movement_authority")
++        if not isinstance(movement_authority, dict) or not movement_authority.get("task_id"):
++            return {}
++        task_context = {"task_id": str(movement_authority["task_id"])}
++        task_goal = movement_authority.get("task_goal")
++        if task_goal is not None:
++            task_context["task_goal"] = str(task_goal)
++        return task_context
++
++    def _append_slam_trace_pose(self, pose: PoseStamped) -> list[PoseStamped]:
++        trace = getattr(self, "_slam_pose_trace", None)
++        if not isinstance(trace, list):
++            trace = []
++            self._slam_pose_trace = trace
++        trace.append(pose)
++        max_points = max(1, int(getattr(self, "_2d_slam_trace_max_points", 1)))
++        if len(trace) > max_points:
++            del trace[: len(trace) - max_points]
++        return list(trace)
++
++    def _record_2d_slam_map_artifact(
++        self,
++        tool_name: str,
++        image_block: dict[str, object],
++        metadata: dict[str, Any],
++    ) -> None:
++        self._record_movement_image_artifact(
++            tool_name,
++            image_block,
++            metadata,
++            kind="2d_slam_map",
++        )
++
++    def _record_floor_plan_artifact(
++        self,
++        tool_name: str,
++        image_block: dict[str, object],
++        metadata: dict[str, Any],
++    ) -> None:
++        self._record_movement_image_artifact(
++            tool_name,
++            image_block,
++            metadata,
++            kind="floor_plan",
++        )
++
++    def _save_final_floor_plan(self) -> None:
++        occupancy_grid = getattr(self, "_latest_global_costmap", None)
++        if occupancy_grid is None:
++            return
++        try:
++            rendered = render_clean_floor_plan(
++                occupancy_grid,
++                config=self._floor_plan_config(),
++                finalized=True,
++            )
++            artifact_dir = resolve_artifact_dir(runtime_config=self._runtime_config())
++            if artifact_dir is None:
++                return
++            slam_dir = Path(artifact_dir).parent / "slam"
++            slam_dir.mkdir(parents=True, exist_ok=True)
++            png_path = slam_dir / "floor_plan.png"
++            metadata_path = slam_dir / "floor_plan.json"
++            image_bytes = rendered.image_block.get("data")
++            if not isinstance(image_bytes, str):
++                raise ValueError("floor plan image did not encode to base64")
++
++            png_path.write_bytes(base64.b64decode(image_bytes))
++            metadata_path.write_text(json.dumps(rendered.metadata, indent=2), encoding="utf-8")
++            logger.info(
++                "Saved final clean floor plan",
++                path=str(png_path),
++                metadata_path=str(metadata_path),
++            )
++        except Exception:
++            logger.exception("Failed to save final clean floor plan.")
++
++
++    def _attach_latest_camera_image(
++        self,
++        tool_name: str,
++        result: SkillResult[NavigationSkillError],
++    ) -> None:
++        if tool_name not in _MOVEMENT_IMAGE_ATTACHMENT_TOOLS:
++            return
++
++        metadata: dict[str, Any] = {
++            "status": "unavailable",
++            "source": "color_image",
++        }
++        image = getattr(self, "_latest_camera_image", None)
++        received_at_s = getattr(self, "_latest_camera_image_received_at_s", None)
++        if image is None:
++            result.metadata["camera_image"] = metadata
++            return
++
++        now_s = time.monotonic()
++        image_age_s = None if received_at_s is None else now_s - received_at_s
++        metadata.update(
++            {
++                "frame_id": image.frame_id,
++                "image_ts": image.ts,
++                "image_age_s": image_age_s,
++                "width_px": image.width,
++                "height_px": image.height,
++                "format": image.format.value,
++            }
++        )
++        if image_age_s is None or image_age_s > self._camera_image_max_age_s:
++            metadata["status"] = "stale"
++            metadata["max_age_s"] = self._camera_image_max_age_s
++            result.metadata["camera_image"] = metadata
++            return
++
++        try:
++            encoded = image.agent_encode()
++            if not encoded or not isinstance(encoded[0], dict):
++                raise ValueError("camera image did not encode to a content block")
++            image_block = encoded[0]
++        except Exception as exc:
++            metadata.update(
++                {
++                    "status": "encode_failed",
++                    "error": f"{exc.__class__.__name__}: {exc}",
++                }
++            )
++            result.metadata["camera_image"] = metadata
++            logger.exception("Failed to encode latest camera image for %s.", tool_name)
++            return
++
++        metadata["status"] = "current"
++        self._record_movement_image_artifact(
++            tool_name,
++            image_block,
++            metadata,
++            kind="camera_image",
++        )
++        result.metadata["camera_image"] = metadata
++        result.content_blocks.append(image_block)
++
++    def _record_movement_image_artifact(
++        self,
++        tool_name: str,
++        image_block: dict[str, Any],
++        metadata: dict[str, Any],
++        *,
++        kind: str,
++    ) -> None:
++        try:
++            artifact_dir = resolve_artifact_dir(runtime_config=self._runtime_config())
++        except Exception:
++            logger.exception("Failed to resolve artifact directory for movement image.")
++            return
++        if artifact_dir is None:
++            return
++        try:
++            ref = ArtifactLedger(artifact_dir=artifact_dir).record_block(
++                image_block,
++                source=f"movement:{tool_name}:{kind}",
++                message_type="tool",
++            )
++        except Exception:
++            logger.exception("Failed to persist movement image artifact.", kind=kind)
++            return
++        metadata["artifact_id"] = ref.artifact_id
++        metadata["artifact_path"] = ref.path
++
++    def _current_2d_slam_map_pose(self, tool_name: str) -> PoseStamped | None:
++        try:
++            pose = self._current_direct_motion_pose()
++        except Exception:
++            logger.exception("Failed to read direct pose for 2D SLAM map.", tool_name=tool_name)
++            pose = None
++        if pose is not None:
++            return pose
++        try:
++            return self._current_base_pose()
++        except Exception:
++            logger.exception("Failed to read base pose for 2D SLAM map.", tool_name=tool_name)
++            return None
++
++    def _drive_command_toward_goal(
++        self, current_pose: PoseStamped, goal_pose: PoseStamped
++    ) -> Twist:
++        world_error = goal_pose.position - current_pose.position
++        world_error.z = 0.0
++        local_error = current_pose.orientation.conjugate().rotate_vector(world_error)
++        vx = local_error.x * self._drive_linear_gain
++        vy = local_error.y * self._drive_linear_gain
++        speed = math.hypot(vx, vy)
++        max_speed = max(self._drive_max_linear_speed_mps, 0.0)
++        if max_speed <= 0.0:
++            vx = 0.0
++            vy = 0.0
++        elif speed > max_speed:
++            scale = max_speed / speed
++            vx *= scale
++            vy *= scale
++
++        yaw_error = angle_diff(goal_pose.yaw, current_pose.yaw)
++        wz = self._clamp(
++            yaw_error * self._drive_yaw_gain,
++            -abs(self._drive_max_yaw_speed_rad_s),
++            abs(self._drive_max_yaw_speed_rad_s),
++        )
++        return Twist(linear=Vector3(vx, vy, 0.0), angular=Vector3(0.0, 0.0, wz))
++
++    def _drive_goal_reached(
++        self,
++        current_pose: PoseStamped,
++        goal_pose: PoseStamped,
++        *,
++        linear_tolerance_m: float,
++        yaw_tolerance_deg: float,
++    ) -> bool:
++        residual_m = self._drive_residual_distance_m(current_pose, goal_pose)
++        yaw_error_deg = abs(math.degrees(angle_diff(goal_pose.yaw, current_pose.yaw)))
++        return residual_m <= linear_tolerance_m and yaw_error_deg <= yaw_tolerance_deg
++
++    def _drive_measurement_metadata(
++        self,
++        start_pose: PoseStamped,
++        end_pose: PoseStamped,
++        goal_pose: PoseStamped,
++    ) -> dict[str, Any]:
++        heading_error_deg = math.degrees(angle_diff(goal_pose.yaw, end_pose.yaw))
++        return {
++            "end": pose_metadata(end_pose),
++            "measured_delta": self._direct_motion_delta_metadata(start_pose, end_pose),
++            "residual_distance_m": self._drive_residual_distance_m(end_pose, goal_pose),
++            "heading_error_deg": heading_error_deg,
++            "heading_drift_deg": heading_error_deg,
++        }
++
++    def _direct_motion_delta_metadata(
++        self, start_pose: PoseStamped, end_pose: PoseStamped
++    ) -> dict[str, Any]:
++        delta = odom_delta_metadata(start_pose, end_pose)
++        assert delta is not None
++        delta["linear_m"] = self._drive_residual_distance_m(start_pose, end_pose)
++        return delta
++
++    def _drive_residual_distance_m(
++        self, current_pose: PoseStamped, goal_pose: PoseStamped
++    ) -> float:
++        dx = goal_pose.position.x - current_pose.position.x
++        dy = goal_pose.position.y - current_pose.position.y
++        return math.hypot(dx, dy)
++
++    def _annotate_drive_guidance(self, metadata: dict[str, Any]) -> None:
++        requested = metadata.get("requested")
++        measured_delta = metadata.get("measured_delta")
++        has_measurement = isinstance(measured_delta, dict) and metadata.get("end") is not None
++        requested_displacement_m = (
++            math.hypot(
++                self._float_metadata(requested.get("forward_m")),
++                self._float_metadata(requested.get("left_m")),
++            )
++            if isinstance(requested, dict)
++            else 0.0
++        )
++        measured_displacement_m = (
++            abs(self._float_metadata(measured_delta.get("linear_m"))) if has_measurement else None
++        )
++        residual_distance_m = self._float_metadata(metadata.get("residual_distance_m"))
++        heading_error_deg = abs(self._float_metadata(metadata.get("heading_error_deg")))
++        linear_tolerance_m = self._float_metadata(
++            metadata.get("arrival_tolerance", {}).get("linear_m")
++            if isinstance(metadata.get("arrival_tolerance"), dict)
++            else None
++        )
++        yaw_tolerance_deg = self._float_metadata(
++            metadata.get("arrival_tolerance", {}).get("yaw_deg")
++            if isinstance(metadata.get("arrival_tolerance"), dict)
++            else None
++        )
++        translation_ok = has_measurement and residual_distance_m <= linear_tolerance_m
++        yaw_ok = has_measurement and heading_error_deg <= yaw_tolerance_deg
++        progress_ratio = (
++            min((measured_displacement_m or 0.0) / requested_displacement_m, 1.0)
++            if has_measurement and requested_displacement_m > 0.0
++            else None
++        )
++        if not has_measurement:
++            reason = "missing_measured_delta"
++        elif translation_ok and yaw_ok:
++            reason = "within_tolerance"
++        elif translation_ok:
++            reason = "yaw_out_of_tolerance"
++        elif yaw_ok:
++            reason = "translation_out_of_tolerance"
++        else:
++            reason = "translation_and_yaw_out_of_tolerance"
++
++        if not has_measurement:
++            precision_class = "unknown"
++        elif requested_displacement_m <= 0.0:
++            precision_class = "within_tolerance" if yaw_ok else "partial"
++        elif translation_ok and yaw_ok:
++            precision_class = "exact" if residual_distance_m <= 0.05 else "within_tolerance"
++        elif progress_ratio is None or progress_ratio < 0.25:
++            precision_class = "short_stop"
++        else:
++            precision_class = "partial"
++
++        metadata.update(
++            {
++                "requested_displacement_m": requested_displacement_m,
++                "measured_displacement_m": measured_displacement_m,
++                "precision_class": precision_class,
++                "arrival_check": {
++                    "verified": translation_ok and yaw_ok,
++                    "reason": reason,
++                    "translation_ok": translation_ok,
++                    "yaw_ok": yaw_ok,
++                    "requested_linear_m": requested_displacement_m,
++                    "measured_linear_m": measured_displacement_m,
++                    "linear_progress_ratio": progress_ratio,
++                    "linear_tolerance_m": linear_tolerance_m,
++                    "yaw_error_deg": heading_error_deg,
++                    "yaw_tolerance_deg": yaw_tolerance_deg,
++                },
++            }
++        )
++        interpretation, next_action = self._drive_agent_guidance(metadata)
++        metadata["agent_interpretation"] = interpretation
++        metadata["recommended_next_action"] = next_action
++
++    def _drive_agent_guidance(self, metadata: dict[str, Any]) -> tuple[str, str]:
++        status = str(metadata.get("status") or "")
++        precision_class = str(metadata.get("precision_class") or "unknown")
++        if status == "ARRIVED":
++            return (
++                "Drive reached the requested odometry target within tolerance.",
++                "Continue the VLN task; use observe only if the next decision needs fresh scene evidence.",
++            )
++        if status == "TIMEOUT" and precision_class == "partial":
++            return (
++                "Drive made useful odometry progress but timed out before confirmed arrival.",
++                "Use the measured_delta/residual_distance fields before deciding to retry a shorter drive or observe.",
++            )
++        if status == "TIMEOUT":
++            return (
++                "Drive timed out before useful confirmed completion.",
++                "Do not repeat blindly; check pose/situation, then choose a shorter bounded drive or stop.",
++            )
++        if status == "NO_PROGRESS":
++            return (
++                "Drive received fresh body odometry but made no measurable progress.",
++                "Do not repeat blindly; check for protection, traction, or an obstacle before trying a safer move.",
++            )
++        if status == "NO_ODOM":
++            return (
++                "Drive cannot be verified because odometry is unavailable.",
++                "Do not issue blind translation; restore odometry or ask the operator for a safety check.",
++            )
++        if status == "EXECUTION_FAILED":
++            return (
++                "Drive could not publish a velocity command to the robot connection.",
++                "Stop movement if needed and inspect cmd_vel transport before retrying.",
++            )
++        return (
++            "Drive result is uncertain.",
++            "Inspect measured_delta and current situation before issuing another movement.",
++        )
++
++    @staticmethod
++    def _clamp(value: float, lower: float, upper: float) -> float:
++        return min(max(value, lower), upper)
++
++    def _record_latest_motion_result(
++        self,
++        tool_name: str,
++        result: SkillResult[NavigationSkillError],
++        context: dict[str, object],
++    ) -> None:
++        navigation = getattr(self, "_navigation", None)
++        record_motion_result = getattr(navigation, "record_motion_result", None)
++        if not callable(record_motion_result):
++            return
++        heading_drift_deg = result.metadata.get("heading_drift_deg")
++        if heading_drift_deg is None:
++            heading_drift_deg = result.metadata.get("heading_error_deg")
++        try:
++            record_motion_result(
++                {
++                    "tool_name": tool_name,
++                    "movement_kind": context.get("movement_kind"),
++                    "success": result.success,
++                    "error_code": result.error_code,
++                    "message": result.message,
++                    "duration_ms": round(result.duration_ms, 1),
++                    "status": result.metadata.get("status"),
++                    "requested": result.metadata.get("requested"),
++                    "measured_delta": result.metadata.get("measured_delta"),
++                    "arrival_check": result.metadata.get("arrival_check"),
++                    "precision_class": result.metadata.get("precision_class"),
++                    "residual_distance_m": result.metadata.get("residual_distance_m"),
++                    "heading_drift_deg": heading_drift_deg,
++                    "odometry_confirmed": result.metadata.get("odometry_confirmed"),
++                    "planner_arrived": result.metadata.get("planner_arrived"),
++                    "agent_interpretation": result.metadata.get("agent_interpretation"),
++                    "recommended_next_action": result.metadata.get("recommended_next_action"),
++                    "goal_reached": result.metadata.get("goal_reached"),
++                    "navigation_state": result.metadata.get("navigation_state"),
++                    "physically_satisfied": self._motion_physically_satisfied(result),
++                }
++            )
++        except Exception:
++            logger.exception("Failed to record latest motion result.", tool_name=tool_name)
++
++    def _motion_physically_satisfied(
++        self, result: SkillResult[NavigationSkillError]
++    ) -> bool | None:
++        arrival_check = result.metadata.get("arrival_check")
++        if isinstance(arrival_check, dict):
++            return bool(arrival_check.get("verified"))
++        if result.metadata.get("status") == "ARRIVED":
++            return True
++        if result.metadata.get("measured_delta") is not None:
++            return False if not result.success else None
++        return None
+ 
+     def _generate_new_goal(
+         self, current_pose: PoseStamped, forward: float, left: float, degrees: float
+@@ -266,7 +2132,381 @@
+         goal_euler = Vector3(current_euler.roll, current_euler.pitch, goal_yaw)
+         goal_orientation = Quaternion.from_euler(goal_euler)
+ 
+-        return PoseStamped(position=goal_position, orientation=goal_orientation)
++        return PoseStamped(
++            position=goal_position,
++            orientation=goal_orientation,
++            frame_id=current_pose.frame_id,
++        )
++
++    def _navigation_not_configured(self) -> bool:
++        from dimos.core.coordination.blueprints import DisabledModuleProxy
++
++        return isinstance(getattr(self, "_navigation", None), DisabledModuleProxy)
++
++    def _navigation_call(
++        self, name: str, *args: Any, timeout_s: float | None = None, **kwargs: Any
++    ) -> Any:
++        method = getattr(self._navigation, name)
++        call_with_timeout = getattr(method, "call_with_timeout", None)
++        if timeout_s is not None and callable(call_with_timeout):
++            return call_with_timeout(max(timeout_s, 0.001), *args, **kwargs)
++        return method(*args, **kwargs)
++
++    def _navigation_get_state(self, *, timeout_s: float | None = None) -> NavigationState:
++        return self._navigation_call("get_state", timeout_s=timeout_s)
++
++    def _navigation_is_goal_reached(self, *, timeout_s: float | None = None) -> bool:
++        return bool(self._navigation_call("is_goal_reached", timeout_s=timeout_s))
++
++    def _navigation_cancel_goal(self, *, timeout_s: float | None = None) -> bool:
++        try:
++            return bool(self._navigation_call("cancel_goal", timeout_s=timeout_s))
++        except TimeoutError:
++            return False
++
++    def _measured_delta_metadata(
++        self,
++        start_pose: PoseStamped,
++        *,
++        navigation_state: NavigationState | None = None,
++        navigation_state_error: str | None = None,
++        goal_reached: bool | None = None,
++    ) -> dict[str, object]:
++        end_pose = self._current_base_pose()
++        metadata: dict[str, object] = {
++            "end": pose_metadata(end_pose),
++            "measured_delta": odom_delta_metadata(start_pose, end_pose),
++        }
++        if navigation_state is not None:
++            metadata["navigation_state"] = navigation_state.value
++        if navigation_state_error is not None:
++            metadata["navigation_state_error"] = navigation_state_error
++        if goal_reached is not None:
++            metadata["goal_reached"] = goal_reached
++        if "navigation_state" not in metadata and navigation_state_error is None:
++            metadata["navigation_state"] = self._navigation.get_state().value
++        if "goal_reached" not in metadata:
++            metadata["goal_reached"] = self._navigation.is_goal_reached()
++        return metadata
++
++    def _relative_move_arrival_check(
++        self,
++        requested: dict[str, float],
++        measured_delta: Any,
++    ) -> dict[str, Any]:
++        if not isinstance(measured_delta, dict):
++            return {
++                "verified": False,
++                "reason": "missing_measured_delta",
++                "precision_class": "unknown",
++            }
++
++        requested_linear_m = math.hypot(requested["forward_m"], requested["left_m"])
++        requested_yaw_signed_deg = self._normalize_degrees(requested["yaw_deg"])
++        requested_yaw_deg = abs(requested_yaw_signed_deg)
++        measured_linear_m = abs(self._float_metadata(measured_delta.get("linear_m")))
++        measured_yaw_signed_deg = self._normalize_degrees(
++            self._float_metadata(measured_delta.get("yaw_deg"))
++        )
++        measured_yaw_deg = abs(measured_yaw_signed_deg)
++        linear_error_m = max(0.0, requested_linear_m - measured_linear_m)
++        signed_yaw_error_deg = self._normalize_degrees(
++            measured_yaw_signed_deg - requested_yaw_signed_deg
++        )
++        yaw_error_deg = abs(signed_yaw_error_deg) if requested_yaw_deg > 0.0 else 0.0
++        linear_tolerance_m = self._relative_move_effective_linear_tolerance_m(requested_linear_m)
++        linear_ok = linear_error_m <= linear_tolerance_m
++        yaw_ok = yaw_error_deg <= self._relative_move_yaw_tolerance_deg
++        yaw_wrong_direction = (
++            requested_yaw_deg > self._relative_move_yaw_tolerance_deg
++            and measured_yaw_deg > self._relative_move_yaw_tolerance_deg
++            and math.copysign(1.0, requested_yaw_signed_deg)
++            != math.copysign(1.0, measured_yaw_signed_deg)
++        )
++        yaw_overshoot = (
++            requested_yaw_deg > 0.0
++            and not yaw_wrong_direction
++            and measured_yaw_deg > requested_yaw_deg + self._relative_move_yaw_tolerance_deg
++        )
++        progress_ratio = (
++            min(measured_linear_m / requested_linear_m, 1.0) if requested_linear_m > 0.0 else None
++        )
++        precision_class = self._relative_move_precision_class(
++            requested_linear_m=requested_linear_m,
++            linear_ok=linear_ok,
++            yaw_ok=yaw_ok,
++            linear_error_m=linear_error_m,
++            progress_ratio=progress_ratio,
++        )
++        reason = self._relative_move_arrival_reason(
++            linear_ok=linear_ok,
++            yaw_ok=yaw_ok,
++            yaw_wrong_direction=yaw_wrong_direction,
++            yaw_overshoot=yaw_overshoot,
++        )
++        return {
++            "verified": linear_ok and yaw_ok,
++            "reason": reason,
++            "precision_class": precision_class,
++            "translation_ok": linear_ok,
++            "yaw_ok": yaw_ok,
++            "requested_linear_m": requested_linear_m,
++            "measured_linear_m": measured_linear_m,
++            "linear_error_m": linear_error_m,
++            "linear_tolerance_m": linear_tolerance_m,
++            "configured_linear_tolerance_m": self._relative_move_linear_tolerance_m,
++            "linear_progress_ratio": progress_ratio,
++            "requested_yaw_deg": requested_yaw_deg,
++            "requested_yaw_signed_deg": requested_yaw_signed_deg,
++            "measured_yaw_deg": measured_yaw_deg,
++            "measured_yaw_signed_deg": measured_yaw_signed_deg,
++            "signed_yaw_error_deg": signed_yaw_error_deg,
++            "yaw_error_deg": yaw_error_deg,
++            "heading_drift_deg": measured_yaw_signed_deg if requested_yaw_deg == 0.0 else 0.0,
++            "yaw_tolerance_deg": self._relative_move_yaw_tolerance_deg,
++        }
++
++    def _relative_move_arrival_reason(
++        self,
++        *,
++        linear_ok: bool,
++        yaw_ok: bool,
++        yaw_wrong_direction: bool,
++        yaw_overshoot: bool,
++    ) -> str:
++        if linear_ok and yaw_ok:
++            return "within_tolerance"
++        if linear_ok and yaw_wrong_direction:
++            return "yaw_wrong_direction"
++        if linear_ok and yaw_overshoot:
++            return "yaw_overshoot"
++        if linear_ok and not yaw_ok:
++            return "yaw_out_of_tolerance"
++        if yaw_ok:
++            return "measured_delta_out_of_tolerance"
++        if yaw_wrong_direction:
++            return "translation_and_yaw_wrong_direction"
++        if yaw_overshoot:
++            return "translation_and_yaw_overshoot"
++        return "translation_and_yaw_out_of_tolerance"
++
++    def _relative_move_effective_linear_tolerance_m(self, requested_linear_m: float) -> float:
++        if requested_linear_m <= 0.0:
++            return self._relative_move_linear_tolerance_m
++        proportional = max(0.05, requested_linear_m * 0.30)
++        return min(self._relative_move_linear_tolerance_m, proportional)
++
++    def _relative_move_precision_class(
++        self,
++        *,
++        requested_linear_m: float,
++        linear_ok: bool,
++        yaw_ok: bool,
++        linear_error_m: float,
++        progress_ratio: float | None,
++    ) -> str:
++        if requested_linear_m <= 0.0:
++            return "within_tolerance" if yaw_ok else "partial"
++        if linear_ok and yaw_ok:
++            return "exact" if linear_error_m <= 0.05 else "within_tolerance"
++        if progress_ratio is None:
++            return "unknown"
++        if progress_ratio < 0.25:
++            return "short_stop"
++        return "partial"
++
++    def _annotate_relative_move_contract(
++        self,
++        metadata: dict[str, Any],
++        *,
++        requested: dict[str, float],
++        planner_arrived: bool,
++        odometry_confirmed: bool,
++        precision_class: str | None = None,
++    ) -> None:
++        measured_delta = metadata.get("measured_delta")
++        requested_displacement_m = math.hypot(requested["forward_m"], requested["left_m"])
++        measured_displacement_m = (
++            abs(self._float_metadata(measured_delta.get("linear_m")))
++            if isinstance(measured_delta, dict)
++            else None
++        )
++        heading_drift_deg = (
++            self._float_metadata(measured_delta.get("yaw_deg"))
++            if isinstance(measured_delta, dict)
++            else None
++        )
++        residual_distance_m = (
++            max(0.0, requested_displacement_m - measured_displacement_m)
++            if measured_displacement_m is not None
++            else None
++        )
++        inferred_precision = precision_class
++        if inferred_precision is None:
++            if measured_delta is None:
++                inferred_precision = "unknown"
++            elif metadata.get("status") in {"NO_PATH", "NO_SAFE_GOAL", "OBSTACLE", "LEASE_DENIED"}:
++                inferred_precision = "blocked_or_protected"
++            elif metadata.get("status") in {"CANCELLED", "TIMEOUT"}:
++                inferred_precision = (
++                    "partial" if (measured_displacement_m or 0.0) > 0.0 else "short_stop"
++                )
++            else:
++                inferred_precision = "unknown"
++        metadata.update(
++            {
++                "requested_displacement_m": requested_displacement_m,
++                "measured_displacement_m": measured_displacement_m,
++                "residual_distance_m": residual_distance_m,
++                "heading_drift_deg": heading_drift_deg,
++                "planner_arrived": planner_arrived,
++                "odometry_confirmed": odometry_confirmed,
++                "precision_class": inferred_precision,
++            }
++        )
++        self._annotate_relative_move_agent_guidance(metadata)
++
++    def _annotate_relative_move_agent_guidance(self, metadata: dict[str, Any]) -> None:
++        interpretation, next_action = self._relative_move_agent_guidance(metadata)
++        metadata["agent_interpretation"] = interpretation
++        metadata["recommended_next_action"] = next_action
++
++    def _relative_move_result_message(self, metadata: dict[str, Any], *, default: str) -> str:
++        interpretation = metadata.get("agent_interpretation")
++        if isinstance(interpretation, str) and interpretation:
++            return interpretation
++        return default
++
++    def _relative_move_agent_guidance(self, metadata: dict[str, Any]) -> tuple[str, str]:
++        status = str(metadata.get("status") or "")
++        precision_class = str(metadata.get("precision_class") or "unknown")
++        arrival_check = metadata.get("arrival_check")
++        reason = (
++            str(arrival_check.get("reason") or "")
++            if isinstance(arrival_check, dict)
++            else status.lower()
++        )
++
++        if status == "ARRIVED" and precision_class == "exact":
++            return (
++                "Relative move reached the requested target within odometry tolerance.",
++                "Continue the task; do not re-diagnose this move unless the scene changed.",
++            )
++        if status == "ARRIVED" and precision_class == "within_tolerance":
++            return (
++                "Relative move is close enough for the requested task; minor physical error is expected on Go2.",
++                "Continue the task or observe only if the next decision depends on precise placement.",
++            )
++        if precision_class == "partial":
++            if reason.startswith("yaw_") or "_yaw_" in reason:
++                return (
++                    "Relative move made useful translation progress, but the final heading was not exact; this is expected physical feedback, not a system failure.",
++                    "If heading matters, correct with rotate_in_place or observe once before the next bounded move; otherwise continue.",
++                )
++            return (
++                "Relative move made useful partial progress but did not exactly satisfy the request; this can happen with Go2 local planning or protection.",
++                "If closer approach still matters, observe once or try a shorter bounded move; otherwise accept the progress and continue.",
++            )
++        if precision_class == "short_stop":
++            return (
++                "Relative move barely progressed, which usually means protection, local planning, or an obstacle limited the command.",
++                "Do not repeat blindly; observe, rotate for a clearer angle, or choose a shorter safer move.",
++            )
++        if precision_class == "blocked_or_protected" or status in {
++            "NO_PATH",
++            "NO_SAFE_GOAL",
++            "OBSTACLE",
++            "LEASE_DENIED",
++        }:
++            return (
++                "Relative move was blocked or protection-limited before useful progress.",
++                "Stop if still moving, observe the scene, then choose a safer shorter motion or different angle.",
++            )
++        if status == "TIMEOUT":
++            return (
++                "Relative move timed out before confirmed completion; this is a runtime budget issue, not proof that the task is impossible.",
++                "Check current pose/situation before deciding whether to continue, retry shorter, or stop.",
++            )
++        if status == "NO_ODOM":
++            return (
++                "Relative move cannot be verified because odometry is unavailable.",
++                "Do not issue more blind movement; restore pose tracking or ask the operator for a safety check.",
++            )
++        if status == "NOT_CONFIGURED":
++            return (
++                "Relative move is unavailable because the navigation planner is disabled or not configured.",
++                "Use rotate_in_place plus observe/odometry, or restart with navigation enabled for planned relative motion.",
++            )
++        if status in {"CANCELLED", "ARRIVAL_NOT_CONFIRMED"}:
++            return (
++                "Relative move did not reach a confirmed final state.",
++                "Inspect compact situation or observe before retrying with a smaller or safer command.",
++            )
++        return (
++            "Relative move result is uncertain.",
++            "Use compact situation or raw diagnostics before issuing another movement.",
++        )
++
++    def _float_metadata(self, value: Any) -> float:
++        try:
++            return float(value)
++        except (TypeError, ValueError):
++            return 0.0
++
++    def _normalize_degrees(self, value: float) -> float:
++        normalized = (float(value) + 180.0) % 360.0 - 180.0
++        if normalized == -180.0:
++            return 180.0
++        return normalized
++
++    def _navigation_failure_or(self, fallback: NavigationError) -> NavigationError:
++        get_last_failure = getattr(self._navigation, "get_last_failure", None)
++        reason = get_last_failure() if callable(get_last_failure) else None
++        if reason in (
++            "NO_ODOM",
++            "NO_SAFE_GOAL",
++            "NO_PATH",
++            "TARGET_NOT_FOUND",
++            "VISION_UNAVAILABLE",
++            "ARRIVAL_NOT_CONFIRMED",
++            "CANCELLED",
++            "OBSTACLE",
++            "TIMEOUT",
++            "LEASE_DENIED",
++            "RETRY_LIMIT_EXCEEDED",
++        ):
++            return reason  # type: ignore[return-value]
++        return fallback
++
++    def _current_base_pose(self) -> PoseStamped | None:
++        tf = self.tf.get("world", "base_link")
++        return tf.to_pose() if tf is not None else None
++
++    def _current_direct_motion_pose(self) -> PoseStamped | None:
++        received_at_s = self._latest_sport_odom_received_at_s
++        if received_at_s is not None and (
++            time.monotonic() - received_at_s <= self._direct_motion_feedback_timeout_s
++        ):
++            return self._latest_sport_odom
++        # Sport-mode odometry (rt/lf/sportmodestate) is sparse/throttled on
++        # compute-limited edge hosts (Jetson: ~3Hz with >0.5s gaps), so its strict
++        # freshness window is often empty and drive would hard-fail NO_ODOM. Fall
++        # back to the TF base pose (world->base_link) used before the sport-odom
++        # closure change (97f4799) so drive stays closed-loop and usable.
++        return self._current_base_pose()
++
++    def _rotation_measurement_metadata(
++        self,
++        start_pose: PoseStamped,
++        end_pose: PoseStamped,
++        cumulative_yaw_rad: float,
++    ) -> dict[str, object]:
++        return {
++            "end": pose_metadata(end_pose),
++            "measured_delta": self._direct_motion_delta_metadata(start_pose, end_pose),
++            "measured_cumulative_yaw_rad": cumulative_yaw_rad,
++            "measured_cumulative_yaw_deg": math.degrees(cumulative_yaw_rad),
++        }
+ 
+     @skill
+     def wait(self, seconds: float) -> str:
+@@ -284,21 +2524,477 @@
+         return str(datetime.datetime.now())
+ 
+     @skill
+-    def execute_sport_command(self, command_name: str) -> str:
++    def go2_robot_status(self) -> SkillResult[NavigationSkillError]:
++        """Get the latest read-only Unitree Go2 status known to DimOS.
++
++        The payload includes low-state battery/motor summaries when available.
++        Unitree firmware protection fields remain explicit as unknown until a
++        live SDK signal is connected.
++        """
++
++        get_robot_status = getattr(self._connection, "get_robot_status", None)
++        if not callable(get_robot_status):
++            return SkillResult.fail(
++                "NOT_CONFIGURED",
++                "The Go2 connection does not expose read-only robot status.",
++                robot_status_available=False,
++            )
++        try:
++            status = get_robot_status()
++        except Exception as e:
++            return SkillResult.fail(
++                "EXECUTION_FAILED",
++                "Failed to read Go2 robot status from the connection.",
++                error=f"{e.__class__.__name__}: {e}",
++            )
++        self._record_robot_status(status)
++        return SkillResult.ok(
++            "Go2 robot status is available.",
++            robot_status=status if isinstance(status, dict) else {"value": status},
++        )
++
++    def _record_robot_status(self, status: Any) -> None:
++        record_robot_status = getattr(self._navigation, "record_robot_status", None)
++        if not callable(record_robot_status) or not isinstance(status, dict):
++            return
++        try:
++            record_robot_status(status)
++        except Exception:
++            logger.exception("Failed to record Go2 robot status for diagnostics.")
++
++    @skill
++    def motion_safety_status(self) -> SkillResult[NavigationSkillError]:
++        """Get current motion safety status and blocker classification."""
++
++        diagnostics, failure = self._motion_diagnostics_payload()
++        if failure is not None:
++            return failure
++        assert diagnostics is not None
++        return SkillResult.ok(
++            self._motion_diagnostics_message("Motion safety status", diagnostics),
++            diagnostics=diagnostics,
++        )
++
++    @skill
++    def go2_situation(self) -> SkillResult[NavigationSkillError]:
++        """Get a compact Go2 motion situation summary for action selection."""
++
++        diagnostics, failure = self._motion_diagnostics_payload()
++        if failure is not None:
++            return failure
++        assert diagnostics is not None
++        situation = self._compact_motion_situation(diagnostics)
++        return SkillResult.ok(
++            self._go2_situation_message(situation),
++            situation=situation,
++        )
++
++    @skill
++    def last_motion_diagnostics(self) -> SkillResult[NavigationSkillError]:
++        """Get the latest motion command diagnostics and recommended next action."""
++
++        diagnostics, failure = self._motion_diagnostics_payload()
++        if failure is not None:
++            return failure
++        assert diagnostics is not None
++        return SkillResult.ok(
++            self._motion_diagnostics_message("Latest motion diagnostics", diagnostics),
++            diagnostics=diagnostics,
++        )
++
++    @skill
++    def robot_protection_status(self) -> SkillResult[NavigationSkillError]:
++        """Get robot protection status known to DimOS."""
++
++        diagnostics, failure = self._motion_diagnostics_payload()
++        if failure is not None:
++            return failure
++        assert diagnostics is not None
++        return SkillResult.ok(
++            self._robot_protection_message(diagnostics),
++            robot_protection_status={
++                "posture_mode": diagnostics.get("posture_mode"),
++                "collision_obstacle_protection": diagnostics.get("collision_obstacle_protection"),
++                "unitree_protection": diagnostics.get("unitree_protection"),
++                "battery_status": diagnostics.get("battery_status"),
++                "motor_status": diagnostics.get("motor_status"),
++                "blocker": diagnostics.get("blocker"),
++                "recommended_next_action": diagnostics.get("recommended_next_action"),
++            },
++            diagnostics=diagnostics,
++        )
++
++    def _motion_diagnostics_payload(
++        self,
++    ) -> tuple[dict[str, Any] | None, SkillResult[NavigationSkillError] | None]:
++        backend, failure = self._backend_motion_diagnostics()
++        if failure is not None:
++            return None, failure
++        assert backend is not None
++        runtime_policy = self._runtime_policy_payload()
++        runtime_allowed = None
++        scope_allowed = None
++        if runtime_policy is not None:
++            runtime_allowed = runtime_policy.get("movement_mode") != "deny"
++            scope_allowed = runtime_policy.get("tool_scope") != "readonly"
++        robot_status = backend.get("robot_status")
++        diagnostics = build_motion_diagnostics(
++            navigation_state=backend.get("navigation_state") or self._safe_navigation_state(),
++            last_failure=backend.get("last_failure") or self._safe_last_navigation_failure(),
++            last_stop_reason=backend.get("last_stop_reason"),
++            last_stop_time=backend.get("last_stop_time"),
++            obstacle_avoidance_config=self._obstacle_avoidance_config(),
++            measured_result=backend.get("measured_result"),
++            battery_status=self._battery_status_from_backend(backend),
++            motor_status=self._motor_status_from_backend(backend),
++            runtime_allowed=runtime_allowed,
++            scope_allowed=scope_allowed,
++            robot_status=robot_status if isinstance(robot_status, dict) else None,
++        )
++        diagnostics["runtime_policy"] = runtime_policy
++        diagnostics["backend"] = backend
++        return diagnostics, None
++
++    def _backend_motion_diagnostics(
++        self,
++    ) -> tuple[dict[str, Any] | None, SkillResult[NavigationSkillError] | None]:
++        get_motion_diagnostics = getattr(self._navigation, "get_motion_diagnostics", None)
++        if not callable(get_motion_diagnostics):
++            return None, SkillResult.fail(
++                "NOT_CONFIGURED",
++                "The navigation backend does not expose motion diagnostics.",
++                diagnostics_available=False,
++            )
++        try:
++            payload = get_motion_diagnostics()
++        except Exception as e:
++            logger.exception("Failed to read navigation motion diagnostics.")
++            return None, SkillResult.fail(
++                "EXECUTION_FAILED",
++                "Failed to read motion diagnostics from the navigation backend.",
++                error=f"{e.__class__.__name__}: {e}",
++            )
++        if not isinstance(payload, dict):
++            return None, SkillResult.fail(
++                "EXECUTION_FAILED",
++                "Navigation backend returned an invalid motion diagnostics payload.",
++                diagnostics_type=type(payload).__name__,
++            )
++        return payload, None
++
++    def _runtime_policy_payload(self) -> dict[str, Any] | None:
++        try:
++            config = self._runtime_config()
++            return resolve_agent_runtime_policy(config).model_dump() if config is not None else None
++        except Exception:
++            logger.exception("Failed to resolve runtime policy for Go2 status tools.")
++            return None
++
++    def _runtime_config(self) -> Any | None:
++        config = getattr(self, "config", None)
++        return getattr(config, "g", None)
++
++    def _obstacle_avoidance_config(self) -> bool | None:
++        config = self._runtime_config()
++        return getattr(config, "obstacle_avoidance", None) if config is not None else None
++
++    def _battery_status_from_backend(self, backend: dict[str, Any]) -> Any:
++        robot_status = backend.get("robot_status")
++        if isinstance(robot_status, dict) and "battery" in robot_status:
++            return robot_status.get("battery")
++        return "unknown"
++
++    def _motor_status_from_backend(self, backend: dict[str, Any]) -> Any:
++        robot_status = backend.get("robot_status")
++        if isinstance(robot_status, dict) and "motors" in robot_status:
++            return robot_status.get("motors")
++        return "unknown"
++
++    def _safe_navigation_state(self) -> str | None:
++        try:
++            return self._navigation.get_state().value
++        except Exception:
++            return None
++
++    def _safe_last_navigation_failure(self) -> str | None:
++        get_last_failure = getattr(self._navigation, "get_last_failure", None)
++        if not callable(get_last_failure):
++            return None
++        try:
++            failure = get_last_failure()
++        except Exception:
++            logger.exception("Failed to read last navigation failure.")
++            return None
++        return str(failure) if failure else None
++
++    def _motion_diagnostics_message(self, prefix: str, diagnostics: dict[str, Any]) -> str:
++        blocker = str(diagnostics.get("blocker") or "unknown")
++        action = str(diagnostics.get("recommended_next_action") or "").strip()
++        message = f"{prefix}: blocker={blocker}."
++        if action:
++            message += f" Recommended next action: {action}."
++        return message
++
++    def _robot_protection_message(self, diagnostics: dict[str, Any]) -> str:
++        collision = _diagnostic_state(
++            diagnostics.get("collision_obstacle_protection"),
++            default="unknown",
++        )
++        unitree = _diagnostic_state(diagnostics.get("unitree_protection"), default="unknown")
++        battery = _diagnostic_state(diagnostics.get("battery_status"), default="unknown")
++        motor = _diagnostic_state(diagnostics.get("motor_status"), default="unknown")
++        return (
++            self._motion_diagnostics_message("Robot protection status", diagnostics)
++            + f" Protection states: local_obstacle={collision}, unitree={unitree}, "
++            + f"battery={battery}, motor={motor}."
++        )
++
++    def _compact_motion_situation(self, diagnostics: dict[str, Any]) -> dict[str, Any]:
++        measured = diagnostics.get("measured_result")
++        measured_payload = measured if isinstance(measured, dict) else {}
++        runtime_policy = diagnostics.get("runtime_policy")
++        return {
++            "blocker": diagnostics.get("blocker") or "unknown",
++            "recommended_next_action": diagnostics.get("recommended_next_action") or "inspect",
++            "navigation_state": diagnostics.get("navigation_state"),
++            "battery": _compact_state_payload(
++                diagnostics.get("battery_status"),
++                keys=("state", "soc_percent", "severity", "source"),
++            ),
++            "unitree_protection": _compact_state_payload(
++                diagnostics.get("unitree_protection"),
++                keys=("state", "available", "needs_live_sdk_probe"),
++            ),
++            "collision_obstacle_protection": _compact_state_payload(
++                diagnostics.get("collision_obstacle_protection"),
++                keys=("state", "enabled", "source", "last_trigger_time"),
++            ),
++            "motor": _compact_state_payload(
++                diagnostics.get("motor_status"),
++                keys=("state", "lost_count", "max_temperature_c", "severity", "source"),
++            ),
++            "authority": _compact_authority_payload(
++                runtime_policy if isinstance(runtime_policy, dict) else None
++            ),
++            "last_motion": {
++                "tool_name": measured_payload.get("tool_name"),
++                "status": measured_payload.get("status"),
++                "success": measured_payload.get("success"),
++                "precision_class": measured_payload.get("precision_class"),
++                "physically_satisfied": measured_payload.get("physically_satisfied"),
++                "residual_distance_m": measured_payload.get("residual_distance_m"),
++                "heading_drift_deg": measured_payload.get("heading_drift_deg"),
++                "measured_delta": measured_payload.get("measured_delta"),
++            },
++        }
++
++    def _go2_situation_message(self, situation: dict[str, Any]) -> str:
++        blocker = str(situation.get("blocker") or "unknown")
++        action = str(situation.get("recommended_next_action") or "inspect")
++        battery = situation.get("battery") if isinstance(situation.get("battery"), dict) else {}
++        soc = battery.get("soc_percent") if isinstance(battery, dict) else None
++        last_motion = (
++            situation.get("last_motion") if isinstance(situation.get("last_motion"), dict) else {}
++        )
++        precision = last_motion.get("precision_class") if isinstance(last_motion, dict) else None
++        parts = [f"Go2 situation: blocker={blocker}"]
++        if soc is not None:
++            parts.append(f"battery={soc}%")
++        if precision:
++            parts.append(f"last_motion_precision={precision}")
++        parts.append(f"next={action}")
++        return "; ".join(parts) + "."
++
++    @skill(uses=[CAP_MOVEMENT])
++    def execute_sport_command(self, command_name: str) -> SkillResult[NavigationSkillError]:
++        started_at_s = time.monotonic()
+         if command_name not in _UNITREE_COMMANDS:
+             suggestions = difflib.get_close_matches(
+                 command_name, _UNITREE_COMMANDS.keys(), n=3, cutoff=0.6
+             )
+-            return f"There's no '{command_name}' command. Did you mean: {suggestions}"
++            result = SkillResult.fail(
++                "INVALID_INPUT",
++                f"Unknown Unitree sport command: '{command_name}'.",
++                command_name=command_name,
++                suggestions=suggestions,
++            )
++            return self._trace_movement_skill_result(
++                "execute_sport_command",
++                result,
++                movement_kind="sport_command",
++                started_at_s=started_at_s,
++            )
+ 
+         id_, _ = _UNITREE_COMMANDS[command_name]
+-
++        return self._execute_known_sport_command(
++            command_name,
++            id_,
++            tool_name="execute_sport_command",
++            started_at_s=started_at_s,
++        )
++
++    @skill(uses=[CAP_MOVEMENT])
++    def full_lie_down(self) -> SkillResult[NavigationSkillError]:
++        """Lower the Go2 fully to the ground using the Unitree Damp command.
++
++        Use this when the operator asks the robot to completely lie down or power
++        down posture. This is different from `Sit` and from `StandDown`, which
++        may fail or stop at a higher posture on Go2 Air.
++        """
++
++        started_at_s = time.monotonic()
++        id_, _ = _UNITREE_COMMANDS["Damp"]
++        return self._execute_known_sport_command(
++            "Damp",
++            id_,
++            tool_name="full_lie_down",
++            started_at_s=started_at_s,
++            success_message="Go2 full lie-down command accepted.",
++        )
++
++    @skill(uses=[CAP_MOVEMENT])
++    def lie_down(self) -> SkillResult[NavigationSkillError]:
++        """Alias for `full_lie_down`; lower the Go2 fully to the ground."""
++
++        started_at_s = time.monotonic()
++        id_, _ = _UNITREE_COMMANDS["Damp"]
++        return self._execute_known_sport_command(
++            "Damp",
++            id_,
++            tool_name="lie_down",
++            started_at_s=started_at_s,
++            success_message="Go2 lie-down command accepted.",
++        )
++
++    @skill(uses=[CAP_MOVEMENT])
++    def stand_up(self) -> SkillResult[NavigationSkillError]:
++        """Raise the Go2 from prone/sitting into a standing posture.
++
++        This narrow startup posture tool wraps the Unitree `StandUp` command so
++        agents do not need broad `execute_sport_command` access just to begin a
++        live test. Follow with `balance_stand` before local motion when the
++        robot has just powered on or recovered from lying down.
++        """
++
++        started_at_s = time.monotonic()
++        id_, _ = _UNITREE_COMMANDS["StandUp"]
++        return self._execute_known_sport_command(
++            "StandUp",
++            id_,
++            tool_name="stand_up",
++            started_at_s=started_at_s,
++            success_message="Go2 stand-up command accepted.",
++        )
++
++    @skill(uses=[CAP_MOVEMENT])
++    def balance_stand(self) -> SkillResult[NavigationSkillError]:
++        """Put the Go2 into balanced standing mode before local motion.
++
++        Use this after `stand_up` and before navigation/local movement. It wraps
++        only the Unitree `BalanceStand` command and is intentionally narrower
++        than broad sport-command access.
++        """
++
++        started_at_s = time.monotonic()
++        id_, _ = _UNITREE_COMMANDS["BalanceStand"]
++        return self._execute_known_sport_command(
++            "BalanceStand",
++            id_,
++            tool_name="balance_stand",
++            started_at_s=started_at_s,
++            success_message="Go2 balance-stand command accepted.",
++        )
++
++    def _execute_known_sport_command(
++        self,
++        command_name: str,
++        api_id: int,
++        *,
++        tool_name: str,
++        started_at_s: float,
++        success_message: str | None = None,
++    ) -> SkillResult[NavigationSkillError]:
+         try:
+-            self._connection.publish_request(RTC_TOPIC["SPORT_MOD"], {"api_id": id_})
+-            return f"'{command_name}' command executed successfully."
++            response = self._connection.publish_request(RTC_TOPIC["SPORT_MOD"], {"api_id": api_id})
++            metadata = {
++                "command_name": command_name,
++                "api_id": api_id,
++                "command_response": response,
++            }
++            if _unitree_publish_request_timed_out(response):
++                result = SkillResult.fail(
++                    "TIMEOUT",
++                    (
++                        f"Unitree sport command '{command_name}' did not return before the "
++                        "WebRTC request timeout. The command may or may not have been accepted; "
++                        "check observe/status before retrying."
++                    ),
++                    **metadata,
++                )
++                return self._trace_movement_skill_result(
++                    tool_name,
++                    result,
++                    movement_kind="sport_command",
++                    started_at_s=started_at_s,
++                )
++            if _unitree_publish_request_failed(response):
++                reason = str(response.get("error") or "publish_request_failed")
++                exception = response.get("exception")
++                detail = f": {exception}" if exception else ""
++                result = SkillResult.fail(
++                    "EXECUTION_FAILED",
++                    f"Unitree sport command '{command_name}' did not complete ({reason}{detail}).",
++                    **metadata,
++                )
++                return self._trace_movement_skill_result(
++                    tool_name,
++                    result,
++                    movement_kind="sport_command",
++                    started_at_s=started_at_s,
++                )
++            status_code = _unitree_status_code(response)
++            if status_code is not None:
++                metadata["unitree_status_code"] = status_code
++            if status_code not in (None, 0):
++                result = SkillResult.fail(
++                    "EXECUTION_FAILED",
++                    (
++                        f"Unitree rejected sport command '{command_name}' "
++                        f"with status.code={status_code}."
++                    ),
++                    **metadata,
++                )
++                return self._trace_movement_skill_result(
++                    tool_name,
++                    result,
++                    movement_kind="sport_command",
++                    started_at_s=started_at_s,
++                )
++            result = SkillResult.ok(
++                success_message or f"Executed Unitree sport command '{command_name}'.",
++                **metadata,
++            )
++            return self._trace_movement_skill_result(
++                tool_name,
++                result,
++                movement_kind="sport_command",
++                started_at_s=started_at_s,
++            )
+         except Exception as e:
+             logger.error(f"Failed to execute {command_name}: {e}")
+-            return "Failed to execute the command."
++            result = SkillResult.fail(
++                "EXECUTION_FAILED",
++                f"Failed to execute Unitree sport command '{command_name}'.",
++                command_name=command_name,
++                api_id=api_id,
++                error=f"{e.__class__.__name__}: {e}",
++            )
++            return self._trace_movement_skill_result(
++                tool_name,
++                result,
++                movement_kind="sport_command",
++                started_at_s=started_at_s,
++            )
+ 
+ 
+ _commands = "\n".join(

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Let udev finish renaming CDC Ethernet devices before examining the set.
+sleep 2
+
+for iface_path in /sys/class/net/*; do
+    iface="${iface_path##*/}"
+    props="$(udevadm info --query=property --path="$iface_path" 2>/dev/null || true)"
+    [[ "$(sed -n 's/^ID_VENDOR_ID=//p' <<<"$props" | head -n1)" == 2672 ]] || continue
+    serial="$(sed -n 's/^ID_SERIAL_SHORT=//p' <<<"$props" | head -n1)"
+    [[ "$serial" =~ ^[[:alnum:]_.-]+$ ]] || continue
+
+    mac="$(<"${iface_path}/address")"
+    profile="gopro-${serial}"
+    nmcli device set "$iface" managed yes >/dev/null
+
+    if nmcli --terse --fields NAME connection show | grep -Fxq "$profile"; then
+        nmcli connection modify "$profile" \
+            connection.interface-name "$iface" \
+            802-3-ethernet.mac-address "$mac" \
+            connection.autoconnect yes connection.autoconnect-priority 100 \
+            ipv4.method auto ipv4.addresses "" ipv4.gateway "" ipv4.dns "" \
+            ipv4.never-default yes ipv6.method disabled
+    else
+        nmcli connection add type ethernet \
+            connection.id "$profile" \
+            connection.interface-name "$iface" \
+            802-3-ethernet.mac-address "$mac" \
+            connection.autoconnect yes connection.autoconnect-priority 100 \
+            ipv4.method auto ipv4.never-default yes ipv6.method disabled >/dev/null
+    fi
+
+    nmcli --wait 50 connection up "$profile" ifname "$iface" >/dev/null
+    printf 'configured %s (%s) using %s\n' "$serial" "$iface" "$profile"
+done

@@ -1,0 +1,23 @@
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -41,6 +41,7 @@
+     "**/*.js",
+     "**/*.tcss",
+     "rxpy_backpressure/*.txt",
++    "agents/skills/**/*.md",
+ ]
+ 
+ [tool.setuptools.exclude-package-data]
+diff --git a/MANIFEST.in b/MANIFEST.in
+--- a/MANIFEST.in
++++ b/MANIFEST.in
+@@ -10,6 +10,8 @@
+ # loading a new data type — never go back to per-package globs.
+ recursive-include dimos *.yaml *.yml *.json *.urdf *.html *.css *.js *.tcss
+ recursive-include dimos/rxpy_backpressure *.txt
++# Operator skills are runtime Markdown assets, not general documentation.
++recursive-include dimos/agents/skills *.md
+ 
+ # --- Exclusions (must come after the includes above so they win) ---
+ # Test fixtures must never ship.

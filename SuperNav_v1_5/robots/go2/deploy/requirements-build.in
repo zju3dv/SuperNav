@@ -1,0 +1,4 @@
+# Build the in-tree A* extension without an unpinned isolated build environment.
+setuptools==80.9.0
+wheel==0.45.1
+pybind11==2.13.6

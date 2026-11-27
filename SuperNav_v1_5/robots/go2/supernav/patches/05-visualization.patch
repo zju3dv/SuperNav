@@ -1,0 +1,489 @@
+diff --git a/dimos/visualization/rerun/bridge.py b/dimos/visualization/rerun/bridge.py
+index 2f5fb1e..416f277 100644
+--- a/dimos/visualization/rerun/bridge.py
++++ b/dimos/visualization/rerun/bridge.py
+@@ -18,10 +18,12 @@ from __future__ import annotations
+ 
+ from collections.abc import Callable
+ from dataclasses import field
++from pathlib import Path
+ import signal
+ import socket
+ import subprocess
+ import sys
++import threading
+ import time
+ from typing import (
+     Any,
+@@ -176,6 +178,12 @@ class Config(ModuleConfig):
+     topic_to_entity: Callable[[Any], str] | None = None
+     connect_url: str | None = None
+     memory_limit: str = "25%"
++    # Backpressure guard: when the rerun sink stalls (slow network/viewer),
++    # stop feeding the SDK and coalesce pending data to latest-per-entity,
++    # instead of letting the SDK-side unbounded buffer grow (see _RerunOutbox).
++    backpressure: bool = True
++    backpressure_flush_interval_s: float = 1.0
++    backpressure_flush_timeout_s: float = 5.0
+     rerun_open: RerunOpenOption = RERUN_OPEN_DEFAULT
+     rerun_web: bool = RERUN_ENABLE_WEB
+     web_port: int = RERUN_WEB_VIEWER_PORT
+@@ -185,6 +193,274 @@ class Config(ModuleConfig):
+ Config.model_rebuild(_types_namespace={"Archetype": Archetype, "Blueprint": Blueprint})
+ 
+ 
++def _topic_filter_values(bridge: "RerunBridgeModule", topic: Any) -> set[str]:
++    topic_str = getattr(topic, "name", None) or str(topic)
++    topic_base = topic_str.split("#", 1)[0]
++    values = {topic_str, topic_base, bridge._get_entity_path(topic)}
++    if topic_base.startswith("/"):
++        values.add(topic_base[1:])
++    return values
++
++
++def _matches_any_filter(patterns: tuple[str, ...], values: set[str]) -> bool:
++    return any(
++        pattern_matches(Glob(pattern), value)
++        if any(ch in pattern for ch in "*?")
++        else pattern_matches(pattern, value)
++        for pattern in patterns
++        for value in values
++    )
++
++
++class OfflineRerunRecorder:
++    """Record pubsub messages to a .rrd file without starting live Rerun transports."""
++
++    def __init__(
++        self,
++        *,
++        out: str | Path,
++        bridge: "RerunBridgeModule",
++        include: tuple[str, ...] = (),
++        exclude: tuple[str, ...] = (),
++    ) -> None:
++        self.out = Path(out)
++        self.bridge = bridge
++        self.include = include
++        self.exclude = exclude
++        self._unsubscribes: list[Callable[[], None]] = []
++        self._started_pubsubs: list[Any] = []
++        self._started = False
++
++    def start(self) -> None:
++        if self._started:
++            return
++        self.out.parent.mkdir(parents=True, exist_ok=True)
++        self.bridge._last_log = {}
++        self.bridge._frame_attached = {}
++        self.bridge._min_intervals = {
++            entity: 1.0 / hz for entity, hz in self.bridge.config.max_hz.items() if hz > 0
++        }
++
++        rerun_init("dimos-rerun-record", start_grpc=False)
++        rr.save(str(self.out))
++        self._started = True
++        if self.bridge.config.blueprint:
++            rr.send_blueprint(_with_graph_tab(self.bridge.config.blueprint()))
++
++        for pubsub in self.bridge.config.pubsubs:
++            logger.info(f"recording Rerun data from {pubsub.__class__.__name__}")
++            if hasattr(pubsub, "start"):
++                pubsub.start()
++                self._started_pubsubs.append(pubsub)
++            self._unsubscribes.append(pubsub.subscribe_all(self._on_message))
++
++        self.bridge._log_static()
++
++    def stop(self) -> None:
++        if not self._started:
++            return
++        try:
++            for unsubscribe in reversed(self._unsubscribes):
++                unsubscribe()
++            for pubsub in reversed(self._started_pubsubs):
++                if hasattr(pubsub, "stop"):
++                    pubsub.stop()
++        finally:
++            self._unsubscribes.clear()
++            self._started_pubsubs.clear()
++            self.bridge._override_cache.clear()
++            self.bridge._frame_attached.clear()
++            rr.rerun_shutdown()
++            self._started = False
++
++    def _on_message(self, msg: Any, topic: Any) -> None:
++        values = _topic_filter_values(self.bridge, topic)
++        if self.include and not _matches_any_filter(self.include, values):
++            return
++        if self.exclude and _matches_any_filter(self.exclude, values):
++            return
++        self.bridge._on_message(msg, topic)
++
++
++def run_recording(
++    out: str | Path,
++    *,
++    include: tuple[str, ...] = (),
++    exclude: tuple[str, ...] = (),
++    max_hz: dict[str, float] | None = None,
++    memory_limit: str = "25%",
++) -> Path:
++    """Record Rerun data to a .rrd file until interrupted by the user."""
++    autoconf(check_only=True)
++
++    out_path = Path(out)
++    bridge = RerunBridgeModule(
++        memory_limit=memory_limit,
++        max_hz=max_hz or {},
++        pubsubs=[LCM()],
++    )
++    recorder = OfflineRerunRecorder(
++        out=out_path,
++        bridge=bridge,
++        include=include,
++        exclude=exclude,
++    )
++
++    should_stop = False
++
++    def _shutdown(*_: object) -> None:
++        nonlocal should_stop
++        should_stop = True
++
++    old_sigint = signal.getsignal(signal.SIGINT)
++    old_sigterm = signal.getsignal(signal.SIGTERM)
++    signal.signal(signal.SIGINT, _shutdown)
++    signal.signal(signal.SIGTERM, _shutdown)
++    try:
++        recorder.start()
++        print(f"Recording Rerun data to {out_path}")
++        while not should_stop:
++            signal.pause()
++    finally:
++        recorder.stop()
++        signal.signal(signal.SIGINT, old_sigint)
++        signal.signal(signal.SIGTERM, old_sigterm)
++    print(f"Wrote {out_path}")
++    return out_path
++
++
++class _RerunOutbox:
++    """Bounded, latest-wins outbox between pubsub subscribers and ``rr.log``.
++
++    Subscriber threads only enqueue raw messages (a cheap dict replace). A
++    single drain thread converts and logs them. A monitor thread periodically
++    flushes the SDK pipeline; when the flush times out, the sink is stalled
++    (slow network/viewer) and the drain pauses so no new data enters the
++    SDK's unbounded internal buffer. Pending messages coalesce to the newest
++    per entity, so memory stays bounded no matter how long the stall lasts.
++    """
++
++    def __init__(
++        self,
++        log_fn: Callable[[str, Any], None],
++        *,
++        flush_interval_s: float,
++        flush_timeout_s: float,
++    ) -> None:
++        self._log_fn = log_fn
++        self._flush_interval_s = flush_interval_s
++        self._flush_timeout_s = flush_timeout_s
++        self._pending: dict[str, tuple[str, Any]] = {}
++        self._cond = threading.Condition()
++        self._stop = threading.Event()
++        self.stalled = threading.Event()
++        self.submitted = 0
++        self.coalesced = 0
++        self.logged = 0
++        self._drain_thread: threading.Thread | None = None
++        self._monitor_thread: threading.Thread | None = None
++
++    @property
++    def pending_count(self) -> int:
++        with self._cond:
++            return len(self._pending)
++
++    def start(self) -> None:
++        self._drain_thread = threading.Thread(
++            target=self._drain_loop, name="rerun-outbox-drain", daemon=True
++        )
++        self._monitor_thread = threading.Thread(
++            target=self._monitor_loop, name="rerun-outbox-monitor", daemon=True
++        )
++        self._drain_thread.start()
++        self._monitor_thread.start()
++
++    def stop(self) -> None:
++        self._stop.set()
++        with self._cond:
++            self._pending.clear()
++            self._cond.notify_all()
++        for thread in (self._drain_thread, self._monitor_thread):
++            if thread is not None:
++                thread.join(timeout=2.0)
++        self._drain_thread = None
++        self._monitor_thread = None
++
++    def submit(self, entity_path: str, msg: Any) -> None:
++        """Enqueue a raw message, replacing any unconsumed message for the entity."""
++        with self._cond:
++            if entity_path in self._pending:
++                self.coalesced += 1
++            self._pending[entity_path] = (entity_path, msg)
++            self.submitted += 1
++            self._cond.notify()
++
++    def _take_batch(self) -> list[tuple[str, Any]]:
++        with self._cond:
++            while not self._stop.is_set():
++                if self._pending and not self.stalled.is_set():
++                    batch = list(self._pending.values())
++                    self._pending.clear()
++                    return batch
++                self._cond.wait(timeout=0.5)
++            return []
++
++    def _log_batch(self, batch: list[tuple[str, Any]]) -> int:
++        logged = 0
++        for entity_path, msg in batch:
++            try:
++                self._log_fn(entity_path, msg)
++                logged += 1
++            except Exception:  # one bad message must not kill the drain thread
++                logger.warning("rerun outbox failed to log %s", entity_path, exc_info=True)
++        self.logged += logged
++        return logged
++
++    def drain_pending(self) -> int:
++        """Log one pending batch synchronously (no-op while stalled). For tests."""
++        if self.stalled.is_set():
++            return 0
++        with self._cond:
++            batch = list(self._pending.values())
++            self._pending.clear()
++        return self._log_batch(batch)
++
++    def _drain_loop(self) -> None:
++        while not self._stop.is_set():
++            self._log_batch(self._take_batch())
++
++    def monitor_step(self) -> bool:
++        """Probe the SDK pipeline once; False means the sink is stalled. For tests."""
++        recording = rr.get_global_data_recording()
++        try:
++            recording.flush(timeout_sec=self._flush_timeout_s)
++        except Exception:  # noqa: BLE001 — any flush failure means the sink is unhealthy
++            return False
++        return True
++
++    def _on_probe_result(self, healthy: bool) -> None:
++        if healthy and self.stalled.is_set():
++            self.stalled.clear()
++            logger.info(
++                "rerun sink recovered, resuming feed (pending=%d coalesced=%d)",
++                self.pending_count,
++                self.coalesced,
++            )
++            with self._cond:
++                self._cond.notify_all()
++        elif not healthy and not self.stalled.is_set():
++            self.stalled.set()
++            logger.warning(
++                "rerun sink stalled (flush did not complete within %.1fs); "
++                "pausing feed and coalescing to latest per entity to bound memory",
++                self._flush_timeout_s,
++            )
++
++    def _monitor_loop(self) -> None:
++        while not self._stop.wait(self._flush_interval_s):
++            self._on_probe_result(self.monitor_step())
++
++
+ class RerunBridgeModule(Module):
+     """Bridge that logs messages from pubsubs to Rerun.
+ 
+@@ -215,6 +491,7 @@ class RerunBridgeModule(Module):
+         self._last_log = {}
+         self._override_cache: dict[str, Callable[[Any], RerunData | None]] = {}
+         self._frame_attached: dict[str, str] = {}
++        self._outbox: _RerunOutbox | None = None
+ 
+     @property
+     def host(self) -> str:
+@@ -284,6 +561,17 @@ class RerunBridgeModule(Module):
+                 return
+             self._last_log[entity_path] = now
+ 
++        # Live mode: hand the raw message to the bounded outbox; conversion and
++        # logging happen on the drain thread so a stalled sink cannot build up
++        # memory or burn CPU here. Offline/inline mode logs synchronously.
++        outbox = self._outbox
++        if outbox is not None:
++            outbox.submit(entity_path, msg)
++            return
++        self._log_converted(entity_path, msg)
++
++    def _log_converted(self, entity_path: str, msg: Any) -> None:
++        """Convert a message to rerun archetypes and log them (drain/inline path)."""
+         rerun_data: RerunData | None = self._visual_override_for_entity_path(entity_path)(msg)
+ 
+         if not rerun_data:
+@@ -330,6 +618,8 @@ class RerunBridgeModule(Module):
+ 
+         parsed = urlparse(connect_url.replace("rerun+", "", 1))
+         grpc_port = parsed.port or RERUN_GRPC_PORT
++        viewer_ws_host = "127.0.0.1" if self.host in ("0.0.0.0", "::") else self.host
++        viewer_ws_url = f"ws://{viewer_ws_host}:{self.config.g.rerun_websocket_server_port}/ws"
+ 
+         if self.config.rerun_open not in get_args(RerunOpenOption):
+             logger.warning(
+@@ -347,7 +637,7 @@ class RerunBridgeModule(Module):
+                 rerun_bindings.spawn(
+                     executable_name="dimos-viewer",
+                     memory_limit=self.config.memory_limit,
+-                    extra_args=["--connect", server_uri],
++                    extra_args=["--connect", server_uri, "--ws-url", viewer_ws_url],
+                 )
+                 spawned = True
+             except ImportError:
+@@ -390,6 +680,21 @@ class RerunBridgeModule(Module):
+         if self.config.blueprint:
+             rr.send_blueprint(_with_graph_tab(self.config.blueprint()))
+ 
++        if self.config.backpressure:
++            get_recording = getattr(rr, "get_global_data_recording", None)
++            recording = get_recording() if get_recording is not None else None
++            if hasattr(recording, "flush"):
++                self._outbox = _RerunOutbox(
++                    self._log_converted,
++                    flush_interval_s=self.config.backpressure_flush_interval_s,
++                    flush_timeout_s=self.config.backpressure_flush_timeout_s,
++                )
++                self._outbox.start()
++            else:
++                logger.warning(
++                    "rerun SDK has no flush-capable recording; backpressure guard disabled"
++                )
++
+         for pubsub in self.config.pubsubs:
+             logger.info(f"bridge listening on {pubsub.__class__.__name__}")
+             if hasattr(pubsub, "start"):
+@@ -506,6 +811,9 @@ class RerunBridgeModule(Module):
+ 
+     @rpc
+     def stop(self) -> None:
++        if self._outbox is not None:
++            self._outbox.stop()
++            self._outbox = None
+         self._override_cache.clear()
+         self._frame_attached.clear()
+         super().stop()
+diff --git a/dimos/visualization/rerun/init.py b/dimos/visualization/rerun/init.py
+index c10d3ff..e20c509 100644
+--- a/dimos/visualization/rerun/init.py
++++ b/dimos/visualization/rerun/init.py
+@@ -74,6 +74,7 @@ def rerun_init(
+             server_uri = rr.serve_grpc(
+                 grpc_port=grpc_port,
+                 server_memory_limit=server_memory_limit,
++                cors_allow_origin=["*"],
+             )
+             logger.info(f"Rerun gRPC server ready at {server_uri}")
+ 
+diff --git a/dimos/visualization/rerun/websocket_server.py b/dimos/visualization/rerun/websocket_server.py
+index 3b29666..87709bd 100644
+--- a/dimos/visualization/rerun/websocket_server.py
++++ b/dimos/visualization/rerun/websocket_server.py
+@@ -17,6 +17,7 @@ from __future__ import annotations
+ import asyncio
+ import json
+ import logging
++import math
+ import threading
+ from typing import Any, Literal, TypedDict, Union
+ 
+@@ -38,7 +39,7 @@ class ClickMsg(TypedDict):
+     type: Literal["click"]
+     x: float
+     y: float
+-    z: float
++    z: float | None
+     entity_path: str
+     timestamp_ms: int
+ 
+@@ -64,6 +65,30 @@ class HeartbeatMsg(TypedDict):
+ 
+ ViewerMsg = Union[ClickMsg, TwistMsg, StopMsg, HeartbeatMsg]
+ 
++_PIXEL_CLICK_ENTITIES = {
++    "color_image",
++    "pixel_goal_image",
++    "surround_front_image",
++    "surround_right_image",
++    "surround_back_image",
++    "surround_left_image",
++}
++
++
++def _is_pixel_click_entity(entity_path: str) -> bool:
++    return bool(_PIXEL_CLICK_ENTITIES.intersection(entity_path.strip("/").split("/")))
++
++
++def _finite_float(value: Any, *, default: float | None = None) -> float:
++    if value is None:
++        if default is None:
++            raise ValueError("required numeric field is null")
++        return default
++    result = float(value)
++    if not math.isfinite(result):
++        raise ValueError("numeric field must be finite")
++    return result
++
+ 
+ def _handshake_noise_filter(record: logging.LogRecord) -> bool:
+     """Drop noisy "opening handshake failed" records from port scanners etc."""
+@@ -75,6 +100,7 @@ class RerunWebSocketServer(Module):
+     """This handles outputs from dimos-viewer (like keyboard controls)"""
+ 
+     clicked_point: Out[PointStamped]
++    pixel_click: Out[PointStamped]
+     tele_cmd_vel: Out[Twist]
+ 
+     def __init__(self, **kwargs: Any) -> None:
+@@ -152,15 +178,27 @@ class RerunWebSocketServer(Module):
+         msg_type = msg.get("type")
+ 
+         if msg_type == "click":
+-            self.clicked_point.publish(
+-                PointStamped(
+-                    x=float(msg.get("x", 0)),
+-                    y=float(msg.get("y", 0)),
+-                    z=float(msg.get("z", 0)),
+-                    ts=float(msg.get("timestamp_ms", 0)) / 1000.0,
+-                    frame_id=str(msg.get("entity_path", "")),
++            is_2d_click = msg.get("z") is None
++            try:
++                point = PointStamped(
++                    x=_finite_float(msg.get("x")),
++                    y=_finite_float(msg.get("y")),
++                    z=_finite_float(msg.get("z"), default=0.0),
++                    ts=_finite_float(msg.get("timestamp_ms"), default=0.0) / 1000.0,
++                    frame_id=str(msg.get("entity_path") or ""),
+                 )
+-            )
++            except (TypeError, ValueError):
++                logger.warning("RerunWebSocketServer: ignoring click with invalid coordinates")
++                return
++            if _is_pixel_click_entity(point.frame_id):
++                self.pixel_click.publish(point)
++            elif is_2d_click:
++                logger.warning(
++                    "RerunWebSocketServer: ignoring 2D click from unknown entity",
++                    entity_path=point.frame_id,
++                )
++            else:
++                self.clicked_point.publish(point)
+ 
+         elif msg_type == "twist":
+             self.tele_cmd_vel.publish(

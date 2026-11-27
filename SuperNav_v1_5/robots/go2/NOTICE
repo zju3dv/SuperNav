@@ -1,0 +1,10 @@
+SuperNav Go2 PixelGoal integration
+
+DimOS is provided by the public dimensionalOS/dimos submodule under Apache-2.0.
+Upstream URL: https://github.com/dimensionalOS/dimos
+Pinned version: 79c9ed163ec6b1abd278a9161f0c74f4562f1231
+
+SuperNav overlays and patches include modified and extracted DimOS code.
+Original copyright and license notices are retained in source files.
+The overlay and patch directories identify integration changes; the public
+submodule is distributed unmodified. Dependencies retain their own licenses.

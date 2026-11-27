@@ -1,0 +1,4 @@
+# Maintainer resolution input; ordinary installs use requirements-jetson.lock.
+# Install the composed runtime; the public submodule remains unmodified.
+# lock-python.sh selects CPU PyTorch for this policy-free PixelGoal profile.
+-e ./runtime/dimos[unitree]

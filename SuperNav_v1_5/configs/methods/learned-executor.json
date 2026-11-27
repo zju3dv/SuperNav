@@ -1,0 +1,40 @@
+{
+  "benchmark_profile": "global_task",
+  "skill_runtime": {
+    "root": "skills",
+    "skill_set_id": "habitat-gs-native-v1",
+    "visibility_gate": "required",
+    "visibility_timeout_s": 120
+  },
+  "mcp": {
+    "environment": {
+      "HAB_ENABLE_ORACLE_LOCAL_NAV": "1",
+      "HAB_MCP_GATE_ENABLED": "0",
+      "HAB_SENSOR_WIDTH": "640",
+      "HAB_SENSOR_HEIGHT": "480"
+    }
+  },
+  "arms": {
+    "default": {
+      "movement": "localnav",
+      "skill_mode": "native",
+      "skill_name": "global-navigation-learned-executor",
+      "environment": {
+        "NAV_LOCALNAV_DONE_THRESHOLD": "0.5",
+        "NAV_LOCALNAV_EXEC_ACTIONS": "2"
+      },
+      "tool_whitelist": [
+        "hab_init_scene",
+        "hab_turn",
+        "hab_local_navigate",
+        "hab_localnav_status",
+        "hab_localnav_stop",
+        "hab_close_session"
+      ],
+      "skill_names": [
+        "global-navigation-learned-executor",
+        "localnav-pointnav"
+      ]
+    }
+  }
+}

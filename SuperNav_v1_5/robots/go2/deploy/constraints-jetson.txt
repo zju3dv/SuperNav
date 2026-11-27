@@ -1,0 +1,9 @@
+# Release constraints; runtime locks pin the complete resolved dependency set.
+unitree-webrtc-connect==2.2.0
+# Match the upstream lock: 0.23.1 makes plum 2.5.7's Quaternion copy dispatch ambiguous.
+beartype==0.22.9
+
+# The pinned upstream SDK is no longer indexed on PyPI. These original public
+# wheels and hashes come from the pinned DimOS uv.lock; keep SDK/viewer aligned.
+rerun-sdk @ https://files.pythonhosted.org/packages/ab/97/1daa4751a281bdb6cda3473229b2746779093ffaba70dd868a3074ef3392/rerun_sdk-0.32.0a1-cp310-abi3-manylinux_2_28_aarch64.whl#sha256=0a821b30f287dabbf694aa1715e4dad0e31990cf4b612757c895f096885512e9 ; sys_platform == "linux" and platform_machine == "aarch64"
+rerun-sdk @ https://files.pythonhosted.org/packages/06/9d/84170e6722a09294b57d578fc1d01266c6e78408a544876f5271ecfa66a9/rerun_sdk-0.32.0a1-cp310-abi3-manylinux_2_28_x86_64.whl#sha256=8045beb820372e092a6cf100fb87091fa804168e5cf8a0c29f97cdee56b134d8 ; sys_platform == "linux" and platform_machine == "x86_64"

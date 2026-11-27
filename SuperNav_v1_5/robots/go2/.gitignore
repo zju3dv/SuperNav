@@ -1,0 +1,8 @@
+.venv/
+runtime/
+dist/
+deploy/config/*.env
+!deploy/config/*.env.example
+__pycache__/
+*.pyc
+.DS_Store

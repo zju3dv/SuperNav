@@ -1,0 +1,6 @@
+[submodule "robots/go2/dimos"]
+	path = robots/go2/dimos
+	url = https://github.com/dimensionalOS/dimos.git
+[submodule "third_party/cartographer"]
+	path = third_party/cartographer
+	url = https://github.com/cartographer-project/cartographer.git

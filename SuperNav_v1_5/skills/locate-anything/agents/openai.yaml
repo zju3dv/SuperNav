@@ -1,0 +1,4 @@
+interface:
+  display_name: "LocateAnything"
+  short_description: "Phrase guidance for visual grounding"
+  default_prompt: "Use $locate-anything to choose concise image-visible phrases for visual grounding."

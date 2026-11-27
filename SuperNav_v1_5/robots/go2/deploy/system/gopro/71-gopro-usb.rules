@@ -1,0 +1,2 @@
+# Configure DHCP by camera serial whenever a GoPro Connect interface appears.
+ACTION=="add", SUBSYSTEM=="net", ATTRS{idVendor}=="2672", TAG+="systemd", ENV{SYSTEMD_WANTS}+="gopro-usb-reconcile.service", RUN+="/bin/systemctl --no-block restart gopro-usb-reconcile.service"

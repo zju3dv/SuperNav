@@ -1,0 +1,17 @@
+{
+  "extends": [
+    "../agents/codex-user.json",
+    "../models/gpt-6-astra-medium.json",
+    "../backends/habitat.json",
+    "../methods/learned-executor.json"
+  ],
+  "workspace_root": ".",
+  "output_dir": "data/runs/habitat-learned-executor",
+  "scene_dataset_config_file": "${SUPERNAV_SCENE_DATASET_CONFIG}",
+  "bridge": {
+    "host": "127.0.0.1",
+    "port": 18911
+  },
+  "instructions_file": null,
+  "prompts_dir": "configs/benchmarks/global_task/prompts"
+}

@@ -1,0 +1,183 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="340" viewBox="0 0 1160 340" role="img" aria-labelledby="title description">
+  <title id="title">SuperNav1.5</title>
+  <desc id="description">A quadruped explores the SuperNav wordmark. The 1.5 lettering starts as an unfilled outline. Each visited route node pulses together with a corresponding map node, progressively revealing the map inside the lettering. The robot relocalizes and reuses the remembered route. A 24-second loop.</desc>
+  <!-- SuperNav 使用原作品的 Space Grotesk SemiBold 轮廓；数字以房间平面图构成，机器人沿用原作品的几何造型。 -->
+  <style>
+    :root { --ink:#050505; --paper:#fff; --pop:#ff7f00; --far:#74746e; --floor:#fff3dc; }
+    @media (prefers-color-scheme:dark) { :root { --ink:#f0f6fc; --paper:#0d1117; --far:#a2a29c; --floor:#332617; } }
+    .ink { fill:var(--ink); } .orange { fill:var(--pop); }
+    .route { fill:none; stroke:var(--ink); stroke-opacity:.32; stroke-width:9; stroke-linecap:round; stroke-dasharray:0 .005912; }
+    .trail { fill:none; stroke:var(--pop); stroke-width:12; stroke-linecap:round; }
+    .casing { fill:none; stroke:var(--paper); stroke-width:26; stroke-linecap:round; }
+    .memory-node { fill:var(--paper); stroke:var(--pop); stroke-width:2.5; }
+    .memory-core { fill:var(--ink); }
+    .dog-limb path { fill:none; stroke:var(--ink); stroke-width:22; stroke-linecap:round; stroke-linejoin:round; }
+    .dog-limb.is-far path { stroke:var(--far); }
+    .still { display:none; }
+    @media (prefers-reduced-motion:reduce) { .animated { display:none; } .still { display:inline; } }
+  </style>
+  <defs>
+    <g id="letters" transform="translate(24 240) scale(.2 -.2)">
+      <g class="ink">
+        <path id="glyph-s" d="M310 -14Q230 -14 168.5 14.5Q107 43 72 97Q37 151 37 229V255H156V229Q156 160 198 126Q240 92 310 92Q381 92 417 121Q453 150 453 196Q453 227 436 246.5Q419 266 386.5 278Q354 290 308 301L278 307Q209 323 158.5 347.5Q108 372 81 411Q54 450 54 513Q54 576 84 621Q114 666 169 690Q224 714 298 714Q372 714 430 689Q488 664 521.5 614Q555 564 555 489V456H436V489Q436 532 419 558Q402 584 371 596Q340 608 298 608Q236 608 204 584Q172 560 172 516Q172 488 186.5 468.5Q201 449 229.5 436.5Q258 424 301 415L331 408Q403 392 457 367.5Q511 343 541.5 303Q572 263 572 199Q572 136 539.5 88Q507 40 448.5 13Q390 -14 310 -14Z"/>
+        <path id="glyph-u" transform="translate(548)" d="M262 -8Q205 -8 161 17.5Q117 43 93 89.5Q69 136 69 198V494H183V207Q183 147 212.5 118Q242 89 296 89Q357 89 392.5 129Q428 169 428 244V494H542V0H430V69H413Q400 42 365.5 17Q331 -8 262 -8Z"/>
+        <path id="glyph-p" transform="translate(1103)" d="M73 -200V494H186V429H203Q220 460 257.5 484Q295 508 365 508Q425 508 476.5 478.5Q528 449 559 392Q590 335 590 255V239Q590 159 559 102Q528 45 477 15.5Q426 -14 365 -14Q318 -14 286.5 -3Q255 8 235.5 26Q216 44 205 62H188V-200ZM331 86Q394 86 434.5 126.5Q475 167 475 242V252Q475 328 434 368Q393 408 331 408Q269 408 227.5 368Q186 328 186 252V242Q186 167 227.5 126.5Q269 86 331 86Z"/>
+        <path id="glyph-e" transform="translate(1682)" d="M299 -14Q225 -14 168.5 17.5Q112 49 80.5 106.5Q49 164 49 241V253Q49 331 80 388Q111 445 167 476.5Q223 508 296 508Q368 508 422 476.5Q476 445 506 388Q536 331 536 255V214H165Q167 156 206 121Q245 86 302 86Q358 86 385 110.5Q412 135 426 166L521 117Q507 90 480.5 59.5Q454 29 410 7.5Q366 -14 299 -14ZM166 301H419Q415 350 381.5 379Q348 408 295 408Q240 408 207 379Q174 350 166 301Z"/>
+        <path id="glyph-r" transform="translate(2203)" d="M73 0V494H186V437H203Q214 468 240 482Q266 496 302 496H362V394H300Q250 394 219 367.5Q188 341 188 286V0Z"/>
+      </g>
+      <g class="orange">
+        <path id="glyph-n" transform="translate(2534)" d="M69 0V700H299L464 81H480V700H599V0H370L205 619H188V0Z"/>
+        <path id="glyph-a" transform="translate(3142)" d="M226 -14Q174 -14 132 4.5Q90 23 65.5 58Q41 93 41 144Q41 194 65.5 228Q90 262 133 279.5Q176 297 231 297H374V327Q374 366 350 390.5Q326 415 275 415Q225 415 199.5 391.5Q174 368 166 331L60 366Q72 405 98.5 437Q125 469 169 488.5Q213 508 277 508Q374 508 429.5 459.5Q485 411 485 319V125Q485 95 513 95H555V0H474Q438 0 415 18Q392 36 392 67V69H375Q369 55 354 35Q339 15 308.5 .5Q278 -14 226 -14ZM245 80Q302 80 338 112.5Q374 145 374 200V210H238Q201 210 178 194Q155 178 155 147Q155 117 179 98.5Q203 80 245 80Z"/>
+        <path id="glyph-v" transform="translate(3631)" d="M182 0 20 494H142L264 84H281L404 494H526L364 0Z"/>
+      </g>
+    </g>
+    <g id="digits">
+      <path id="digit-one" d="M880 134L911 100H951V240H908V145L898 156Z"/>
+      <circle id="digit-dot" cx="982" cy="225" r="17"/>
+      <path id="digit-five" d="M1008 100H1112V132H1040V155H1080Q1116 155 1116 187V208Q1116 240 1082 240H1008V208H1076Q1084 208 1084 200V195Q1084 187 1076 187H1008Z"/>
+    </g>
+    <clipPath id="digit-clip"><use href="#digit-one"/><use href="#digit-dot"/><use href="#digit-five"/></clipPath>
+    <path id="route" pathLength="1" d="M261 -721.2C265 -721.2 277 -721.6 285 -721.7C293 -721.8 301 -722.0 309 -721.8C317 -721.6 325 -721.2 333 -720.5C341 -719.8 349 -718.8 357 -717.5C365 -716.3 373 -714.8 381 -712.9C389 -711.1 397 -708.9 405 -706.3C413 -703.7 421 -700.9 429 -697.4C437 -693.9 445 -689.4 453 -685.4C461 -681.5 469 -677.6 477 -673.6C485 -669.7 493 -665.7 501 -661.7C509 -657.8 517 -653.9 525 -650.0C533 -646.1 541 -642.3 549 -638.5C557 -634.8 565 -631.0 573 -627.4C581 -623.7 589 -620.1 597 -616.6C605 -613.0 613 -609.6 621 -606.2C629 -602.8 637 -599.5 645 -596.3C653 -593.1 661 -589.9 669 -586.9C677 -583.9 685 -580.9 693 -578.1C701 -575.2 709 -572.5 717 -569.8C725 -567.1 733 -564.6 741 -562.1C749 -559.6 757 -557.3 765 -555.0C773 -552.8 781 -550.6 789 -548.5C797 -546.5 805 -544.5 813 -542.6C821 -540.8 829 -539.0 837 -537.3C845 -535.6 853 -534.1 861 -532.6C869 -531.1 877 -529.7 885 -528.3C893 -527.0 901 -525.8 909 -524.6C917 -523.5 925 -522.4 933 -521.4C941 -520.4 949 -519.5 957 -518.6C965 -517.8 973 -517.0 981 -516.3C989 -515.6 997 -514.9 1005 -514.3C1013 -513.7 1021 -513.2 1029 -512.7C1037 -512.2 1045 -511.8 1053 -511.4C1061 -511.1 1069 -510.7 1077 -510.5C1085 -510.2 1093 -509.9 1101 -509.7C1109 -509.5 1117 -509.4 1125 -509.2C1133 -509.1 1141 -509.0 1149 -508.9C1157 -508.9 1165 -508.8 1173 -508.8C1181 -508.8 1189 -508.9 1197 -508.9C1205 -509.0 1213 -509.0 1221 -509.1C1229 -509.2 1237 -509.3 1245 -509.5C1253 -509.6 1261 -509.7 1269 -509.9C1277 -510.1 1285 -510.3 1293 -510.5C1301 -510.7 1309 -510.9 1317 -511.1C1325 -511.3 1333 -511.5 1341 -511.8C1349 -512.0 1357 -512.3 1365 -512.5C1373 -512.8 1381 -513.0 1389 -513.3C1397 -513.6 1405 -513.9 1413 -514.1C1421 -514.4 1429 -514.7 1437 -515.0C1445 -515.2 1453 -515.7 1461 -515.8C1469 -516.0 1477 -515.7 1485 -515.7C1493 -515.6 1501 -515.6 1509 -515.5C1517 -515.5 1525 -515.4 1533 -515.4C1541 -515.3 1549 -515.3 1557 -515.3C1565 -515.2 1573 -515.2 1581 -515.1C1589 -515.1 1597 -515.1 1605 -515.0C1613 -515.0 1621 -515.0 1629 -514.9C1637 -514.9 1645 -514.9 1653 -514.8C1661 -514.8 1669 -514.8 1677 -514.8C1685 -514.8 1693 -514.8 1701 -514.8C1709 -514.8 1717 -514.8 1725 -514.8C1733 -514.8 1741 -514.8 1749 -514.8C1757 -514.8 1765 -514.8 1773 -514.8C1781 -514.9 1789 -514.9 1797 -514.9C1805 -514.9 1813 -515.0 1821 -515.0C1829 -515.1 1837 -515.1 1845 -515.2C1853 -515.2 1861 -515.3 1869 -515.4C1877 -515.5 1885 -515.5 1893 -515.6C1901 -515.7 1909 -515.8 1917 -516.0C1925 -516.1 1933 -516.2 1941 -516.4C1949 -516.5 1957 -516.7 1965 -516.9C1973 -517.1 1981 -517.3 1989 -517.5C1997 -517.8 2005 -518.1 2013 -518.4C2021 -518.7 2029 -519.0 2037 -519.4C2045 -519.8 2053 -520.2 2061 -520.7C2069 -521.2 2077 -521.7 2085 -522.3C2093 -522.9 2101 -523.5 2109 -524.2C2117 -525.0 2125 -525.7 2133 -526.6C2141 -527.5 2149 -528.4 2157 -529.4C2165 -530.5 2173 -531.6 2181 -532.8C2189 -534.0 2197 -535.3 2205 -536.7C2213 -538.1 2221 -539.6 2229 -541.2C2237 -542.9 2245 -544.6 2253 -546.5C2261 -548.3 2269 -550.3 2277 -552.4C2285 -554.5 2293 -556.7 2301 -559.1C2309 -561.4 2317 -563.9 2325 -566.5C2333 -569.1 2341 -571.9 2349 -574.7C2357 -577.6 2365 -580.6 2373 -583.7C2381 -586.8 2389 -590.1 2397 -593.5C2405 -596.8 2413 -600.3 2421 -604.0C2429 -607.6 2437 -611.3 2445 -615.1C2453 -619.0 2461 -622.9 2469 -627.0C2477 -631.0 2485 -635.2 2493 -639.4C2501 -643.6 2509 -647.9 2517 -652.3C2525 -656.7 2533 -661.2 2541 -665.7C2549 -670.1 2557 -674.6 2565 -679.1C2573 -683.6 2581 -688.1 2589 -692.9C2597 -697.7 2605 -705.5 2613 -708.0C2621 -710.5 2629 -708.0 2637 -708.0C2645 -708.0 2653 -708.0 2661 -708.0C2669 -708.0 2677 -708.0 2685 -708.0C2693 -708.0 2701 -708.0 2709 -708.0C2717 -708.0 2725 -708.0 2733 -708.0C2741 -708.0 2749 -708.0 2757 -708.0C2765 -708.0 2773 -708.0 2781 -708.0C2789 -708.0 2797 -708.0 2805 -708.0C2813 -708.0 2821 -708.0 2829 -708.0C2837 -708.0 2845 -708.0 2853 -708.0C2861 -708.0 2869 -708.0 2877 -708.0C2885 -708.0 2893 -708.0 2901 -708.0C2909 -708.0 2917 -708.0 2925 -708.0C2933 -708.0 2941 -708.0 2949 -708.0C2957 -708.0 2965 -708.0 2973 -708.0C2981 -708.0 2989 -708.0 2997 -708.0C3005 -708.0 3013 -708.0 3021 -708.0C3029 -708.0 3037 -708.0 3045 -708.0C3053 -708.0 3061 -708.0 3069 -708.0C3077 -708.0 3085 -708.0 3093 -708.0C3101 -708.0 3109 -710.1 3117 -708.0C3125 -705.9 3133 -699.4 3141 -695.2C3149 -690.9 3157 -686.9 3165 -682.6C3173 -678.2 3181 -673.6 3189 -669.2C3197 -664.8 3205 -660.5 3213 -656.2C3221 -651.9 3229 -647.7 3237 -643.5C3245 -639.4 3253 -635.3 3261 -631.3C3269 -627.3 3277 -623.3 3285 -619.5C3293 -615.7 3301 -612.0 3309 -608.3C3317 -604.7 3325 -601.2 3333 -597.7C3341 -594.3 3349 -591.0 3357 -587.8C3365 -584.6 3373 -581.5 3381 -578.5C3389 -575.5 3397 -572.6 3405 -569.9C3413 -567.1 3421 -564.5 3429 -561.9C3437 -559.4 3445 -557.0 3453 -554.7C3461 -552.3 3469 -550.1 3477 -548.0C3485 -545.9 3493 -544.0 3501 -542.1C3509 -540.2 3517 -538.4 3525 -536.7C3533 -535.0 3541 -533.4 3549 -531.9C3557 -530.4 3565 -529.0 3573 -527.7C3581 -526.3 3589 -525.1 3597 -523.9C3605 -522.8 3613 -521.7 3621 -520.7C3629 -519.6 3637 -518.7 3645 -517.8C3653 -516.9 3661 -516.1 3669 -515.3C3677 -514.5 3685 -513.8 3693 -513.2C3701 -512.5 3709 -511.9 3717 -511.3C3725 -510.8 3733 -510.3 3741 -509.8C3749 -509.3 3757 -508.9 3765 -508.4C3773 -508.0 3781 -507.7 3789 -507.3C3797 -507.0 3806 -506.6 3813 -506.4C3820 -506.1 3830 -505.8 3833 -505.7C4030 -500 4210 -708 4410 -708H5180"/>
+    <g id="dog-body" class="ink">
+      <rect x="-24.4" y="-31.2" width="47.2" height="13.2" rx="6.6"/>
+      <rect x="-6.8" y="-36.4" width="10.8" height="6" rx="1.6"/>
+      <rect x="18.8" y="-34" width="13.6" height="10.4" rx="3.4"/>
+      <circle class="orange" cx="28" cy="-28.8" r="2"/>
+    </g>
+    <g id="dog-standing"><path d="M-12.8 -20L-18 -10L-12 -.4M17.2 -20L12 -10L18 -.4" fill="none" stroke="var(--far)" stroke-width="4.4" stroke-linecap="round" stroke-linejoin="round"/><use href="#dog-body"/><path d="M-15.6 -20L-20.8 -10L-14.8 -.4M14.4 -20L9.2 -10L15.2 -.4" fill="none" stroke="var(--ink)" stroke-width="4.4" stroke-linecap="round" stroke-linejoin="round"/></g>
+    <g id="pin"><path class="ink" d="M0 0C-3.2-7.2-10.8-12.4-10.8-21.2A10.8 10.8 0 1 1 10.8-21.2C10.8-12.4 3.2-7.2 0 0Z"/><circle cy="-21.2" r="3.8" fill="var(--paper)"/></g>
+    <g id="node"><circle class="memory-node" r="5.8"/><circle class="memory-core" r="2"/></g>
+    <g id="pulse-a" opacity="0">
+      <animate attributeName="opacity" dur="24s" repeatCount="indefinite" values="0;0;1;.7;0;0" keyTimes="0;.1049;.1069;.1269;.1569;1"/>
+      <circle class="orange" r="5"/>
+      <circle fill="none" stroke="var(--pop)" stroke-width="3" r="7"><animate attributeName="r" dur="24s" repeatCount="indefinite" values="7;7;19;19" keyTimes="0;.1069;.1569;1"/></circle>
+    </g>
+    <g id="pulse-b" opacity="0">
+      <animate attributeName="opacity" dur="24s" repeatCount="indefinite" values="0;0;1;.7;0;0" keyTimes="0;.2313;.2333;.2533;.2833;1"/>
+      <circle class="orange" r="5"/>
+      <circle fill="none" stroke="var(--pop)" stroke-width="3" r="7"><animate attributeName="r" dur="24s" repeatCount="indefinite" values="7;7;19;19" keyTimes="0;.2333;.2833;1"/></circle>
+    </g>
+    <g id="pulse-c" opacity="0">
+      <animate attributeName="opacity" dur="24s" repeatCount="indefinite" values="0;0;1;.7;0;0" keyTimes="0;.3387;.3407;.3607;.3907;1"/>
+      <circle class="orange" r="5"/>
+      <circle fill="none" stroke="var(--pop)" stroke-width="3" r="7"><animate attributeName="r" dur="24s" repeatCount="indefinite" values="7;7;19;19" keyTimes="0;.3407;.3907;1"/></circle>
+    </g>
+    <g id="map-decoration" clip-path="url(#digit-clip)">
+      <g id="map-floors" fill="var(--floor)">
+        <path d="M887 134L913 105H946V235H913V132L898 148Z"/>
+        <path d="M1013 105H1107V127H1035V160H1080Q1111 160 1111 187V208Q1111 235 1082 235H1013V213H1076Q1089 213 1089 200V195Q1089 182 1076 182H1013Z"/>
+      </g>
+      <use href="#digits" fill="none" stroke="var(--ink)" stroke-width="4" stroke-linejoin="round"/>
+      <path id="room-walls" d="M908 144H923M937 144H951M908 190H924M938 190H951M1059 100V110M1059 122V132M1008 149H1018M1031 149H1040M1058 155V164M1058 177V187M1084 205H1093M1105 205H1116M1050 208V218M1050 231V240" fill="none" stroke="var(--ink)" stroke-width="4"/>
+      <path id="door-swings" d="M923 144V130A14 14 0 0 1 937 144M924 190V176A14 14 0 0 1 938 190M1059 110H1071A12 12 0 0 1 1059 122M1018 149V136A13 13 0 0 1 1031 149M1058 164H1071A13 13 0 0 1 1058 177M1093 205V193A12 12 0 0 1 1105 205M1050 218H1063A13 13 0 0 1 1050 231" fill="none" stroke="var(--ink)" stroke-width="1.8"/>
+      <path id="map-corridors" d="M929 121V215M1030 116H1024V171H1080Q1100 171 1100 190V209Q1100 224 1080 224H1029" fill="none" stroke="var(--pop)" stroke-width="3.2" stroke-linecap="round" stroke-dasharray="1 6"/>
+      <g id="room-fixtures" fill="none" stroke="var(--ink)" stroke-width="2">
+        <path d="M916 157H925V169H916ZM916 161H925M938 201H944V224H938ZM1078 108H1099V120H1078ZM1084 108V120M1016 157H1021V176H1016Z"/>
+      </g>
+    </g>
+    <g id="map-node"><circle r="7.5" fill="var(--paper)" stroke="var(--ink)" stroke-width="2.5"/><circle r="3.5" class="orange"/></g>
+    <g id="map-landmarks">
+      <use href="#map-node" x="929" y="121"/><use href="#map-node" x="929" y="215"/>
+      <path d="M982 212V218M982 232V238M969 225H975M989 225H995" fill="none" stroke="var(--paper)" stroke-width="2.5"/><circle cx="982" cy="225" r="4" fill="var(--paper)"/>
+      <use href="#map-node" x="1030" y="116"/><use href="#map-node" x="1100" y="185"/><use href="#map-node" x="1029" y="224"/>
+    </g>
+    <mask id="memory-reveal" maskUnits="userSpaceOnUse" x="870" y="92" width="250" height="158" style="mask-type:luminance">
+      <g fill="white">
+        <circle cx="929" cy="121" r="0"><animate attributeName="r" dur="24s" repeatCount="indefinite" values="0;0;78;78;0;0" keyTimes="0;.1069;.1969;.92;.97;1"/></circle>
+        <circle cx="929" cy="215" r="0"><animate attributeName="r" dur="24s" repeatCount="indefinite" values="0;0;35;35;0;0" keyTimes="0;.1219;.2119;.92;.97;1"/></circle>
+        <circle cx="982" cy="225" r="0"><animate attributeName="r" dur="24s" repeatCount="indefinite" values="0;0;24;24;0;0" keyTimes="0;.2333;.2833;.92;.97;1"/></circle>
+        <circle cx="1030" cy="116" r="0"><animate attributeName="r" dur="24s" repeatCount="indefinite" values="0;0;85;85;0;0" keyTimes="0;.2333;.3133;.92;.97;1"/></circle>
+        <circle cx="1100" cy="185" r="0"><animate attributeName="r" dur="24s" repeatCount="indefinite" values="0;0;82;82;0;0" keyTimes="0;.3407;.4207;.92;.97;1"/></circle>
+        <circle cx="1029" cy="224" r="0"><animate attributeName="r" dur="24s" repeatCount="indefinite" values="0;0;64;64;0;0" keyTimes="0;.3557;.4357;.92;.97;1"/></circle>
+      </g>
+    </mask>
+  </defs>
+  <use href="#letters" class="still"/>
+  <g class="animated">
+    <g id="responsive-letters" transform="translate(24 240) scale(.2 -.2)">
+      <g class="ink">
+        <use href="#glyph-s" id="letter-s"><animateTransform attributeName="transform" type="translate" dur="24s" repeatCount="indefinite" values="0 0;0 0;0 -28;0 0;0 0" keyTimes="0;.0207;.0287;.0527;1"/></use>
+        <use href="#glyph-u" id="letter-u"><animateTransform attributeName="transform" type="translate" dur="24s" repeatCount="indefinite" values="0 0;0 0;0 -28;0 0;0 0" keyTimes="0;.0668;.0788;.1028;1"/></use>
+        <use href="#glyph-p" id="letter-p"><animateTransform attributeName="transform" type="translate" dur="24s" repeatCount="indefinite" values="0 0;0 0;0 -28;0 0;0 0" keyTimes="0;.1167;.1287;.1527;1"/></use>
+        <use href="#glyph-e" id="letter-e"><animateTransform attributeName="transform" type="translate" dur="24s" repeatCount="indefinite" values="0 0;0 0;0 -28;0 0;0 0" keyTimes="0;.163;.175;.199;1"/></use>
+        <use href="#glyph-r" id="letter-r"><animateTransform attributeName="transform" type="translate" dur="24s" repeatCount="indefinite" values="0 0;0 0;0 -28;0 0;0 0" keyTimes="0;.2023;.2143;.2383;1"/></use>
+      </g>
+      <g class="orange">
+        <use href="#glyph-n" id="letter-n"><animateTransform attributeName="transform" type="translate" dur="24s" repeatCount="indefinite" values="0 0;0 0;0 -28;0 0;0 0;0 -28;0 0;0 0" keyTimes="0;.243;.255;.279;.5873;.5953;.6113;1"/></use>
+        <use href="#glyph-a" id="letter-a"><animateTransform attributeName="transform" type="translate" dur="24s" repeatCount="indefinite" values="0 0;0 0;0 -28;0 0;0 0;0 -28;0 0;0 0" keyTimes="0;.2949;.3069;.3309;.624;.632;.648;1"/></use>
+        <use href="#glyph-v" id="letter-v"><animateTransform attributeName="transform" type="translate" dur="24s" repeatCount="indefinite" values="0 0;0 0;0 -28;0 0;0 0;0 -28;0 0;0 0" keyTimes="0;.3351;.3471;.3711;.6523;.6603;.6763;1"/></use>
+      </g>
+    </g>
+    <defs>
+    <clipPath id="one-region"><rect x="870" y="90" width="88" height="166"/></clipPath>
+    <clipPath id="dot-region"><rect x="958" y="90" width="44" height="166"/></clipPath>
+    <clipPath id="five-region"><rect x="1002" y="90" width="118" height="166"/></clipPath>
+    <g id="memory-art">
+      <!-- Keep the empty letter outlines visible before and between reveals. -->
+      <use href="#digits" fill="none" stroke="var(--ink)" stroke-width="4" stroke-linejoin="round"/>
+      <g mask="url(#memory-reveal)">
+      <use href="#digits" class="orange" opacity=".2"/>
+      <use href="#digits" class="orange" id="solid-digits" opacity="0"><animate attributeName="opacity" dur="24s" repeatCount="indefinite" values="0;0;1;1" keyTimes="0;.46;.58;1"/></use>
+      <g id="map-detail"><use href="#map-decoration"/></g>
+      <g id="digit-memories"><use href="#map-landmarks"/></g>
+      </g>
+    </g>
+    </defs>
+    <g id="mapped-digits">
+      <g clip-path="url(#one-region)"><use href="#memory-art" id="letter-one"><animateTransform attributeName="transform" type="translate" dur="24s" repeatCount="indefinite" values="0 0;0 0;0 5.6;0 0;0 0;0 5.6;0 0;0 0" keyTimes="0;.3857;.3977;.4217;.6881;.6961;.7121;1"/></use></g>
+      <g clip-path="url(#dot-region)"><use href="#memory-art"/></g>
+      <g clip-path="url(#five-region)"><use href="#memory-art" id="letter-five"><animateTransform attributeName="transform" type="translate" dur="24s" repeatCount="indefinite" values="0 0;0 0;0 5.6;0 0;0 0;0 5.6;0 0;0 0" keyTimes="0;.448;.46;.484;.732;.74;.764;1"/></use></g>
+    </g>
+    <g id="navigation" opacity="1">
+      <animate attributeName="opacity" dur="24s" repeatCount="indefinite" values="1;1;0;0" keyTimes="0;.92;.97;1"/>
+      <use href="#route" class="route" transform="translate(24 240) scale(.2)"/>
+      <g id="exploration-trail" transform="translate(24 240) scale(.2)">
+        <use href="#route" class="casing" stroke-dasharray="1 1" stroke-dashoffset="1"><animate attributeName="stroke-dashoffset" dur="24s" repeatCount="indefinite" values="1;1;0;0" keyTimes="0;.025;.46;1"/></use>
+        <use href="#route" class="trail" stroke-dasharray="1 1" stroke-dashoffset="1"><animate attributeName="stroke-dashoffset" dur="24s" repeatCount="indefinite" values="1;1;0;0" keyTimes="0;.025;.46;1"/><animate attributeName="opacity" dur="24s" repeatCount="indefinite" values="1;1;.35;.35;1;1" keyTimes="0;.46;.50;.58;.74;1"/></use>
+      </g>
+      <g id="route-memory-a" opacity="0"><animate attributeName="opacity" dur="24s" repeatCount="indefinite" values="0;0;1;1" keyTimes="0;.0869;.1069;1"/><use href="#node" x="260" y="138"/></g>
+      <g id="route-memory-b" opacity="0"><animate attributeName="opacity" dur="24s" repeatCount="indefinite" values="0;0;1;1" keyTimes="0;.2133;.2333;1"/><use href="#node" x="547" y="98.4"/></g>
+      <g id="route-memory-c" opacity="0"><animate attributeName="opacity" dur="24s" repeatCount="indefinite" values="0;0;1;1" keyTimes="0;.3207;.3407;1"/><use href="#node" x="790" y="138.8"/></g>
+      <g id="memory-links">
+        <use id="source-a" href="#pulse-a" x="260" y="138"/><use id="target-a" href="#pulse-a" x="929" y="121"/>
+        <use id="source-b" href="#pulse-b" x="547" y="98.4"/><use id="target-b" href="#pulse-b" x="1030" y="116"/>
+        <use id="source-c" href="#pulse-c" x="790" y="138.8"/><use id="target-c" href="#pulse-c" x="1100" y="185"/>
+      </g>
+      <g transform="translate(1110 98.4)" id="goal">
+        <use href="#pin"/>
+        <ellipse rx="1" ry="1" fill="none" stroke="var(--pop)" stroke-width="2" opacity="0"><animate attributeName="rx" dur="24s" repeatCount="indefinite" values="1;1;24;24" keyTimes="0;.74;.8;1"/><animate attributeName="ry" dur="24s" repeatCount="indefinite" values="1;1;7;7" keyTimes="0;.74;.8;1"/><animate attributeName="opacity" dur="24s" repeatCount="indefinite" values="0;0;.8;0;0" keyTimes="0;.74;.75;.8;1"/></ellipse>
+      </g>
+      <g id="relocalization" transform="translate(547 98.4)" opacity="0">
+        <animate attributeName="opacity" dur="24s" repeatCount="indefinite" values="0;0;1;1;0;0" keyTimes="0;.51;.53;.57;.60;1"/>
+        <g fill="none" stroke="var(--pop)" stroke-width="1.6">
+          <path d="M-23 -46H-31V-38M23 -46H31V-38M-31 2V10H-23M31 2V10H23"><animateTransform attributeName="transform" type="translate" dur="24s" repeatCount="indefinite" values="14 -9;14 -9;0 0;0 0" keyTimes="0;.51;.56;1"/></path>
+          <ellipse cy="1" rx="19" ry="5"/>
+        </g>
+      </g>
+      <g transform="translate(24 240) scale(.2)"><g id="robot" opacity="0">
+        <animateMotion dur="24s" repeatCount="indefinite" calcMode="linear" rotate="auto" keyPoints="0;0;1;1;.478748;.478748;1;1" keyTimes="0;.025;.46;.50;.5001;.58;.74;1"><mpath href="#route"/></animateMotion>
+        <animate attributeName="opacity" dur="24s" repeatCount="indefinite" values="0;1;1;0;0;1;1" keyTimes="0;.025;.465;.49;.51;.53;1"/>
+        <g transform="scale(5.5)"><g id="robot-rig">
+        <g id="robot-gait">
+          <animate attributeName="opacity" dur="24s" repeatCount="indefinite" values="1;1;0;0;1;1;0;0" keyTimes="0;.456;.46;.58;.584;.736;.74;1"/>
+          <g transform="scale(.2)"><g id="dog-stride">
+            <animateTransform attributeName="transform" type="translate" additive="sum" values="0 0;0 -6;0 0" dur="0.21s" repeatCount="indefinite"/>
+            <g class="dog-limb is-far" id="far-hind-leg" transform="translate(-64 -100)"><path d="M0 0L-26 50L4 98"/><animateTransform attributeName="transform" type="rotate" additive="sum" values="-17;17;-17" dur="0.42s" begin="-0.00s" repeatCount="indefinite"/></g>
+            <g class="dog-limb is-far" id="far-front-leg" transform="translate(86 -100)"><path d="M0 0L-26 50L4 98"/><animateTransform attributeName="transform" type="rotate" additive="sum" values="-17;17;-17" dur="0.42s" begin="-0.21s" repeatCount="indefinite"/></g>
+            <use href="#dog-body" transform="scale(5)"/>
+            <g class="dog-limb" id="near-hind-leg" transform="translate(-78 -100)"><path d="M0 0L-26 50L4 98"/><animateTransform attributeName="transform" type="rotate" additive="sum" values="-17;17;-17" dur="0.42s" begin="-0.21s" repeatCount="indefinite"/></g>
+            <g class="dog-limb" id="near-front-leg" transform="translate(72 -100)"><path d="M0 0L-26 50L4 98"/><animateTransform attributeName="transform" type="rotate" additive="sum" values="-17;17;-17" dur="0.42s" begin="-0.00s" repeatCount="indefinite"/></g>
+          </g></g>
+        </g>
+        <use href="#dog-standing" id="robot-rest" opacity="0"><animate attributeName="opacity" dur="24s" repeatCount="indefinite" values="0;0;1;1;0;0;1;1" keyTimes="0;.456;.46;.58;.584;.736;.74;1"/></use>
+      </g></g></g></g>
+    </g>
+  </g>
+  <g class="still">
+    <use href="#digits" class="orange"/>
+    <use href="#map-decoration"/><use href="#map-landmarks"/>
+    <g transform="translate(24 240) scale(.2)"><use href="#route" class="casing"/><use href="#route" class="trail"/></g>
+    <use href="#node" x="260" y="138"/><use href="#node" x="547" y="98.4"/><use href="#node" x="790" y="138.8"/>
+    <use href="#dog-standing" transform="translate(1060 98.4) scale(1.1)"/><use href="#pin" x="1110" y="98.4"/>
+  </g>
+</svg>

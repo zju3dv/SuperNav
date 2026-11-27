@@ -1,0 +1,1 @@
+You do not start with a global map, route, coordinates, or object list. You must choose navigation targets from what you can see in the returned surround images. Your own visual inspection of those images is the primary success signal.

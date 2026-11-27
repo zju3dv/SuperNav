@@ -1,0 +1,131 @@
+{
+  "schema": "supernav-go2-snapshot-audit/v1",
+  "audited_at": "2026-11-26",
+  "approved_snapshot": {
+    "base_commit": "ae8160cc9c7ea0494b18a47395799e2698d6c891",
+    "audited_backports": [
+      "0994c45781c000fe00e4597e88f65105d53163a1",
+      "1cffa526fa1ed604fb8ef75c2c3891df9dd46295",
+      "c8351bd594a6490579813c5f69254755cf04e802"
+    ]
+  },
+  "public_upstream_commit": "79c9ed163ec6b1abd278a9161f0c74f4562f1231",
+  "source_checks": 914,
+  "source_failures": [],
+  "source_checks_sha256": "f62b341614fa8fec7ef012285abbef029e74420dadd4fe57f65d351212635acd",
+  "behavior": {
+    "groups": 20,
+    "differences": [],
+    "results": {
+      "agent_geometry_visibility": {
+        "sha256": "95e310403ed8b03d0b6e7842bb5971ce01afeb868494e4c8f87c005b12e1d2ad",
+        "matches_snapshot": true
+      },
+      "astar_paths": {
+        "sha256": "128fa050a5b862d968471a1faa24e0ba2a2b0e280d2315f6652969331b025591",
+        "matches_snapshot": true
+      },
+      "attachment_tool_sets": {
+        "sha256": "79aca5b167ecf25b45054443e27a912aae816da8b16d8b74e3e89296ca55937a",
+        "matches_snapshot": true
+      },
+      "caption_selection": {
+        "sha256": "342d07240702bddf5d5475d028eea0dcca6badc65d8676b33df84da56b4696a0",
+        "matches_snapshot": true
+      },
+      "caption_transport_and_persistence": {
+        "sha256": "b38d08ded0890c4217a96086d6a17090da8facfb53819d3a8507d653c4f88453",
+        "matches_snapshot": true
+      },
+      "durable_shutdown_order": {
+        "sha256": "82c1ba74e3f64c409833eb37286f26ffb18381f84616e2bc13cdda00460138b5",
+        "matches_snapshot": true
+      },
+      "generated_prompt_and_skills": {
+        "sha256": "f863b6b0c977f9ee097196fe8c214abea1c08835372c43d23c5602ccb22d17ac",
+        "matches_snapshot": true
+      },
+      "map_availability": {
+        "sha256": "789ebdaac47fdec486ca797813e0a4e13f3b2bc66caa875ca5e5bce550969dda",
+        "matches_snapshot": true
+      },
+      "memory_navigation": {
+        "sha256": "bc5ef6979b732fb1b62bf1e7bbfb3b603e5836d6da13736835e0dec56ea1e87a",
+        "matches_snapshot": true
+      },
+      "memory_target_resolution": {
+        "sha256": "4f7f302b62dc65dca3148b9616836c4c67961f0556edad99c8dbc84a05c9b66d",
+        "matches_snapshot": true
+      },
+      "persisted_memory": {
+        "sha256": "0fb90cd16c9a2724c4a6872c07e54131d8db3f23cf55b0661e892fadeeb490e9",
+        "matches_snapshot": true
+      },
+      "pixelgoal_terminal_maps": {
+        "sha256": "dcbb7904c59c1b4e9515a1f3ac57b7eb63a11fe85ff0f3a17255c8e300fd28fa",
+        "matches_snapshot": true
+      },
+      "proxy_forwarded_calls": {
+        "sha256": "0d6c5f56dc77da9679dcff151674460b8dfdb3b81838544e9047d3059ef6e9b9",
+        "matches_snapshot": true
+      },
+      "proxy_tool_results": {
+        "sha256": "607d402e485f03121dead7cd9dc76950ad2f22d8caa9e9247291d961b4a1113f",
+        "matches_snapshot": true
+      },
+      "relocalization_forced_prior": {
+        "sha256": "8b262a106de76d2fd15c4aeb9eddc0230d1b428b777cc6470497f81e3a6da4ee",
+        "matches_snapshot": true
+      },
+      "relocalization_prior_crop": {
+        "sha256": "3ab654290fb988c9a43c6ec80d9536d272dbbef478bc18e8563c30c07c377782",
+        "matches_snapshot": true
+      },
+      "segmentation_and_annotation": {
+        "sha256": "ba5e16ddc9b6303a78a0fe986ad951418ef269ca35989687fef8f98bdbd1405f",
+        "matches_snapshot": true
+      },
+      "tool_map_attachments": {
+        "sha256": "08d7e23686c7d5b078521bcf168b419077e8d6a8209f7d764d0f8c690fecc0a1",
+        "matches_snapshot": true
+      },
+      "visible_tools_authorized": {
+        "sha256": "97b4dfe464d55b1f56e2eca8de12a4b76b285dea05d8f753d7c053996168045d",
+        "matches_snapshot": true
+      },
+      "visible_tools_without_authority": {
+        "sha256": "35da0b61e423608afb4e72ec3f88c68c74a281bdb6d860ffde2759d0b34e1a7f",
+        "matches_snapshot": true
+      }
+    }
+  },
+  "tests": {
+    "documented_functional": {
+      "passed": 43,
+      "failed": 0
+    },
+    "focused_unitree_skills": {
+      "passed": 9,
+      "failed": 0
+    },
+    "packaging_deployment_audit": {
+      "passed": 28,
+      "failed": 0
+    },
+    "broader_common_snapshot_tests": {
+      "common": 191,
+      "passed_in_both": 166,
+      "failed_in_both": 25,
+      "different_outcomes": 0,
+      "omitted_snapshot_only_test": "test_blueprint_backend_selection (unsupported policy backend)"
+    }
+  },
+  "limitations": [
+    "Offline differential fixtures, not live robot navigation or SLAM/ICP convergence.",
+    "Hardware/MCP transport, planner completion, model HTTP responses, clocks, and artifact destinations are controlled; real map, memory, caption, target resolution, and A* implementations execute.",
+    "Both processes use the freshly built C++ extension after its source has been checked byte-for-byte.",
+    "Validation uses a local Python 3.12 CPU environment, not a fresh installation from the deployment dependency locks.",
+    "The broader snapshot suite is not fully green; inherited assertion failures and timing-sensitive motion-recorder teardown behavior are not changed by this migration."
+  ],
+  "reproduce": "python -m supernav.audit_snapshot --snapshot \"$SNAPSHOT_DIR\" --behavior --report runtime/snapshot-audit.json"
+}

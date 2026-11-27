@@ -1,0 +1,8 @@
+{
+  "extends": "spatial-memory.json",
+  "mcp": {
+    "environment": {
+      "HAB_SLAM_AREA_CAPTION_ENABLED": "0"
+    }
+  }
+}

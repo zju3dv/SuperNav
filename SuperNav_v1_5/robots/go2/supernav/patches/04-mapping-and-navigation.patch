@@ -1,0 +1,1035 @@
+diff --git a/dimos/mapping/voxels.py b/dimos/mapping/voxels.py
+index 11acb38..858b0ed 100644
+--- a/dimos/mapping/voxels.py
++++ b/dimos/mapping/voxels.py
+@@ -14,12 +14,20 @@
+ 
+ from __future__ import annotations
+ 
++import json
++import os
++from pathlib import Path
++import shutil
++import threading
+ import time
+ from typing import TYPE_CHECKING, Any
+ 
+ import open3d as o3d  # type: ignore[import-untyped]
+ import open3d.core as o3c  # type: ignore[import-untyped]
++import numpy as np
++from pydantic import Field
+ 
++from dimos.constants import STATE_DIR
+ from dimos.core.core import rpc
+ from dimos.core.module import ModuleConfig
+ from dimos.core.stream import In, Out
+@@ -37,6 +45,116 @@ if TYPE_CHECKING:
+ 
+ logger = setup_logger()
+ 
++VOXEL_MAP_SNAPSHOT_VERSION = 1
++DEFAULT_VOXEL_MAP_SAVE_NAME = "global_voxel_map.npz"
++DEFAULT_LATEST_VOXEL_MAP_SAVE_NAME = "latest_global_voxel_map.npz"
++DEFAULT_VOXEL_MAP_RESET_SIGNAL_NAME = "voxel_map_reset_signal.json"
++
++
++def _env_float(name: str, default: float) -> float:
++    try:
++        return float(os.environ.get(name, default))
++    except (TypeError, ValueError):
++        return default
++
++
++def _env_int(name: str, default: int) -> int:
++    try:
++        return int(os.environ.get(name, default))
++    except (TypeError, ValueError):
++        return default
++
++
++def _env_bool(name: str, default: bool) -> bool:
++    value = os.environ.get(name)
++    if value is None:
++        return default
++    return value.strip().lower() not in {"0", "false", "no", "off", ""}
++
++
++def _env_str(name: str, default: str) -> str:
++    return str(os.environ.get(name, default))
++
++
++def default_voxel_map_snapshot_path() -> Path | None:
++    """Return the per-run voxel-map snapshot path, if a run log dir is configured."""
++
++    from dimos.utils.logging_config import get_run_log_dir
++
++    run_log_dir = get_run_log_dir()
++    if run_log_dir is None:
++        env_log_dir = os.environ.get("DIMOS_RUN_LOG_DIR")
++        if not env_log_dir:
++            return None
++        run_log_dir = Path(env_log_dir)
++    return Path(run_log_dir) / "slam" / DEFAULT_VOXEL_MAP_SAVE_NAME
++
++
++def latest_voxel_map_snapshot_path() -> Path:
++    """Return the cross-run latest voxel-map snapshot path."""
++
++    return STATE_DIR / "slam" / DEFAULT_LATEST_VOXEL_MAP_SAVE_NAME
++
++
++def default_voxel_map_reset_signal_path() -> Path:
++    """Return the cross-process reset marker watched by live voxel mappers."""
++
++    return STATE_DIR / "slam" / DEFAULT_VOXEL_MAP_RESET_SIGNAL_NAME
++
++
++def write_voxel_map_reset_signal(
++    *,
++    source: str = "manual",
++    reason: str | None = None,
++    path: str | Path | None = None,
++) -> Path:
++    """Request live voxel mappers to discard accumulated map state."""
++
++    signal_path = Path(path) if path else default_voxel_map_reset_signal_path()
++    signal_path.parent.mkdir(parents=True, exist_ok=True)
++    payload = {
++        "source": source,
++        "reason": reason,
++        "created_at_epoch_s": time.time(),
++        "created_at_monotonic_s": time.monotonic(),
++    }
++    signal_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
++    return signal_path
++
++
++def _reset_signal_marker(path: str | Path | None) -> int | None:
++    if not path:
++        return None
++    try:
++        return Path(path).stat().st_mtime_ns
++    except FileNotFoundError:
++        return None
++    except OSError as exc:
++        logger.warning(
++            "Failed to inspect voxel map reset signal",
++            path=str(path),
++            error=f"{exc.__class__.__name__}: {exc}",
++        )
++        return None
++
++
++def _input_frame_due(frame_ts: float, last_ingest_ts: float | None, max_input_hz: float) -> bool:
++    return (
++        max_input_hz <= 0
++        or last_ingest_ts is None
++        or frame_ts - last_ingest_ts >= 1.0 / max_input_hz
++    )
++
++
++def _downsample_input_pcd(
++    pcd: o3d.t.geometry.PointCloud, voxel_size: float
++) -> o3d.t.geometry.PointCloud:
++    return pcd.voxel_down_sample(voxel_size) if voxel_size > 0 else pcd
++
++
++def _release_cache_due(device: Any, frame_count: int, release_every: int) -> bool:
++    return str(device).startswith("CUDA") and release_every > 0 and frame_count % release_every == 0
++
+ 
+ class VoxelGrid:
+     """Pure voxel grid accumulator using Open3D VoxelBlockGrid.
+@@ -53,10 +171,15 @@ class VoxelGrid:
+         carve_columns: bool = True,
+         frame_id: str = "world",
+         show_startup_log: bool = True,
++        input_downsample_voxel_size: float = 0.0,
++        release_cache_every: int = 1,
+     ) -> None:
+         self._voxel_size = voxel_size
++        self._block_count = block_count
+         self._carve_columns = carve_columns
+         self._frame_id = frame_id
++        self._input_downsample_voxel_size = input_downsample_voxel_size
++        self._release_cache_every = release_cache_every
+ 
+         dev = (
+             o3c.Device(device)
+@@ -81,8 +204,55 @@ class VoxelGrid:
+         self._voxel_hashmap = self.vbg.hashmap()
+         self._key_dtype = self._voxel_hashmap.key_tensor().dtype
+         self._latest_frame_ts: float = 0.0
++        self._frame_count = 0
+         self._disposed = False
+ 
++    @classmethod
++    def load_snapshot(
++        cls,
++        path: str | Path,
++        *,
++        voxel_size: float | None = None,
++        block_count: int | None = None,
++        device: str | None = None,
++        carve_columns: bool | None = None,
++        frame_id: str | None = None,
++        show_startup_log: bool = True,
++        input_downsample_voxel_size: float | None = None,
++        release_cache_every: int | None = None,
++    ) -> VoxelGrid:
++        """Create a voxel grid initialized from a saved snapshot."""
++
++        snapshot_path = Path(path)
++        with np.load(snapshot_path, allow_pickle=False) as payload:
++            keys = np.asarray(payload["voxel_keys"], dtype=np.int64)
++            metadata = json.loads(str(payload["metadata_json"].item()))
++
++        grid = cls(
++            voxel_size=voxel_size if voxel_size is not None else float(metadata["voxel_size"]),
++            block_count=block_count if block_count is not None else int(metadata["block_count"]),
++            device=device if device is not None else str(metadata["device"]),
++            carve_columns=(
++                carve_columns if carve_columns is not None else bool(metadata["carve_columns"])
++            ),
++            frame_id=frame_id if frame_id is not None else str(metadata["frame_id"]),
++            show_startup_log=show_startup_log,
++            input_downsample_voxel_size=(
++                input_downsample_voxel_size
++                if input_downsample_voxel_size is not None
++                else float(metadata.get("input_downsample_voxel_size", 0.0))
++            ),
++            release_cache_every=(
++                release_cache_every
++                if release_cache_every is not None
++                else int(metadata.get("release_cache_every", 1))
++            ),
++        )
++        grid._restore_snapshot_keys(keys)
++        grid._latest_frame_ts = float(metadata.get("latest_frame_ts", 0.0) or 0.0)
++        grid._frame_count = int(metadata.get("frame_count", 0) or 0)
++        return grid
++
+     def _check_disposed(self) -> None:
+         if self._disposed:
+             raise RuntimeError("VoxelGrid has been disposed and cannot be used")
+@@ -93,6 +263,7 @@ class VoxelGrid:
+             self._latest_frame_ts = frame.ts
+ 
+         pcd = ensure_tensor_pcd(frame.pointcloud, self._dev)
++        pcd = _downsample_input_pcd(pcd, self._input_downsample_voxel_size)
+ 
+         if pcd.is_empty():
+             return
+@@ -108,13 +279,13 @@ class VoxelGrid:
+ 
+         self.get_global_pointcloud.invalidate_cache(self)
+         self.get_global_pointcloud2.invalidate_cache(self)
++        self._frame_count += 1
+ 
+-        # Return Open3D's CUDA caching pool to the driver. The ops above
++        # Periodically return Open3D's CUDA caching pool to the driver. The ops above
+         # (HashMap construction in carving, key_tensor()[idx], find(),
+         # activate()) allocate per-call device buffers; Open3D's caching
+-        # allocator holds them in pool indefinitely once the Python wrappers
+-        # are released. Without this call, VRAM grows ~0.8 MB/call until OOM.
+-        if str(self._dev).startswith("CUDA"):
++        # allocator holds them in pool after Python wrappers are released.
++        if _release_cache_due(self._dev, self._frame_count, self._release_cache_every):
+             o3c.cuda.release_cache()
+ 
+     def _carve_and_insert(self, new_keys: o3c.Tensor) -> None:
+@@ -152,6 +323,55 @@ class VoxelGrid:
+ 
+         self._voxel_hashmap.activate(new_keys)
+ 
++    def save_snapshot(self, path: str | Path, *, source_run_id: str | None = None) -> Path:
++        """Persist active voxel keys and metadata as a compressed ``.npz`` snapshot."""
++
++        self._check_disposed()
++        snapshot_path = Path(path)
++        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
++        keys = self._active_voxel_keys_numpy()
++        metadata = {
++            "version": VOXEL_MAP_SNAPSHOT_VERSION,
++            "frame_id": self._frame_id,
++            "voxel_size": self._voxel_size,
++            "block_count": self._block_count,
++            "device": str(self._dev),
++            "carve_columns": self._carve_columns,
++            "input_downsample_voxel_size": self._input_downsample_voxel_size,
++            "release_cache_every": self._release_cache_every,
++            "frame_count": self._frame_count,
++            "latest_frame_ts": self._latest_frame_ts,
++            "voxel_count": int(keys.shape[0]),
++            "source_run_id": source_run_id,
++            "created_at": time.time(),
++        }
++        with snapshot_path.open("wb") as snapshot_file:
++            np.savez_compressed(
++                snapshot_file,
++                voxel_keys=keys,
++                metadata_json=np.array(json.dumps(metadata, ensure_ascii=True)),
++            )
++        return snapshot_path
++
++    def _active_voxel_keys_numpy(self) -> np.ndarray:
++        self._check_disposed()
++        active_indices = self._voxel_hashmap.active_buf_indices()
++        if active_indices.shape[0] == 0:
++            return np.zeros((0, 3), dtype=np.int64)
++        keys = self._voxel_hashmap.key_tensor()[active_indices]
++        return np.asarray(keys.to(o3c.Device("CPU:0")).numpy(), dtype=np.int64)
++
++    def _restore_snapshot_keys(self, keys: np.ndarray) -> None:
++        self._check_disposed()
++        if keys.size == 0:
++            return
++        if keys.ndim != 2 or keys.shape[1] != 3:
++            raise ValueError(f"Voxel snapshot keys must have shape (N, 3), got {keys.shape}")
++        tensor = o3c.Tensor(keys, dtype=self._key_dtype).to(self._dev).contiguous()
++        self._voxel_hashmap.activate(tensor)
++        self.get_global_pointcloud.invalidate_cache(self)
++        self.get_global_pointcloud2.invalidate_cache(self)
++
+     @simple_mcache
+     def get_global_pointcloud2(self) -> PointCloud2:
+         self._check_disposed()
+@@ -205,9 +425,41 @@ class VoxelMapTransformer(Transformer[PointCloud2, PointCloud2]):
+         **grid_kwargs: Forwarded to ``VoxelGrid()``.
+     """
+ 
+-    def __init__(self, *, emit_every: int = 1, **grid_kwargs: Any) -> None:
++    def __init__(
++        self,
++        *,
++        emit_every: int = 1,
++        max_input_hz: float = 0.0,
++        save_on_stop: bool = True,
++        load_on_start: str = "none",
++        load_path: str = "",
++        save_snapshot_path: str = "",
++        latest_snapshot_path: str = "",
++        reset_signal_path: str = "",
++        **grid_kwargs: Any,
++    ) -> None:
+         self.emit_every = emit_every
++        self.max_input_hz = max_input_hz
++        self.save_on_stop = save_on_stop
++        self.load_on_start = load_on_start
++        self.load_path = load_path
++        self.save_snapshot_path = save_snapshot_path
++        self.latest_snapshot_path = latest_snapshot_path
++        self.reset_signal_path = reset_signal_path
+         self._grid_kwargs = grid_kwargs
++        self._reset_requested = threading.Event()
++        self._reset_complete = threading.Event()
++        self._map_generation = 0
++
++    def reset_voxel_map(self, timeout_s: float = 5.0) -> bool:
++        """Discard the accumulated grid before the next lidar frame.
++
++        Returns True once the first frame after the reset has been ingested
++        (i.e. live mapping is confirmed to be running again).
++        """
++        self._reset_complete.clear()
++        self._reset_requested.set()
++        return self._reset_complete.wait(timeout=max(0.0, timeout_s))
+ 
+     def _make_obs(
+         self, grid: VoxelGrid, last_obs: Observation[PointCloud2], count: int
+@@ -222,25 +474,152 @@ class VoxelMapTransformer(Transformer[PointCloud2, PointCloud2]):
+     def __call__(
+         self, upstream: Iterator[Observation[PointCloud2]]
+     ) -> Iterator[Observation[PointCloud2]]:
+-        grid = VoxelGrid(**self._grid_kwargs)
++        grid = self._new_grid()
++        reset_marker = _reset_signal_marker(self._resolved_reset_signal_path())
+         try:
+             last_obs: Observation[PointCloud2] | None = None
++            last_ingest_ts: float | None = None
+             count = 0
+ 
+             for obs in upstream:
++                current_reset_marker = _reset_signal_marker(self._resolved_reset_signal_path())
++                rpc_reset = self._reset_requested.is_set()
++                if rpc_reset or (
++                    current_reset_marker is not None and current_reset_marker != reset_marker
++                ):
++                    logger.info(
++                        "Resetting live voxel map.",
++                        source="rpc" if rpc_reset else "signal_file",
++                        map_generation=self._map_generation + 1,
++                    )
++                    grid.dispose()
++                    grid = VoxelGrid(**self._grid_kwargs)
++                    reset_marker = current_reset_marker
++                    last_obs = None
++                    last_ingest_ts = None
++                    count = 0
++                    self._map_generation += 1
++                    if rpc_reset:
++                        self._reset_requested.clear()
++                        # Publish the explicit empty map so downstream consumers
++                        # (costmap, pixel-goal) observe the reset immediately.
++                        yield self._make_obs(grid, obs, count)
++
++                frame_ts = obs.data.ts if obs.data.ts is not None else obs.ts
++                if not _input_frame_due(frame_ts, last_ingest_ts, self.max_input_hz):
++                    continue
+                 grid.add_frame(obs.data)
++                last_ingest_ts = frame_ts
+                 last_obs = obs
+                 count += 1
+ 
+-                if self.emit_every > 0 and count % self.emit_every == 0:
++                if rpc_reset:
++                    # First frame ingested after an RPC reset: mapping is live again.
++                    self._reset_complete.set()
++                    yield self._make_obs(grid, last_obs, count)
++                elif self.emit_every > 0 and count % self.emit_every == 0:
+                     yield self._make_obs(grid, last_obs, count)
+ 
+             # Yield on exhaustion: always in batch mode, or if there are un-emitted frames
+             if last_obs is not None and (self.emit_every == 0 or count % self.emit_every != 0):
+                 yield self._make_obs(grid, last_obs, count)
+         finally:
++            self._save_grid_on_stop(grid)
+             grid.dispose()
+ 
++    def _new_grid(self) -> VoxelGrid:
++        load_path = self._resolved_load_path()
++        if load_path is not None:
++            try:
++                grid = VoxelGrid.load_snapshot(
++                    load_path,
++                    device=self._grid_kwargs.get("device"),
++                    show_startup_log=bool(self._grid_kwargs.get("show_startup_log", True)),
++                    input_downsample_voxel_size=self._grid_kwargs.get(
++                        "input_downsample_voxel_size"
++                    ),
++                    release_cache_every=self._grid_kwargs.get("release_cache_every"),
++                )
++                logger.info(
++                    "Loaded voxel map snapshot",
++                    path=str(load_path),
++                    voxel_count=grid.size(),
++                )
++                return grid
++            except Exception as exc:
++                logger.warning(
++                    "Failed to load voxel map snapshot; starting empty",
++                    path=str(load_path),
++                    error=f"{exc.__class__.__name__}: {exc}",
++                )
++        return VoxelGrid(**self._grid_kwargs)
++
++    def _resolved_load_path(self) -> Path | None:
++        mode = str(self.load_on_start or "none").strip().lower()
++        if mode in {"", "none", "off", "false", "0"}:
++            return None
++        if mode == "latest":
++            return latest_voxel_map_snapshot_path()
++        if mode == "path":
++            return Path(self.load_path) if self.load_path else None
++        logger.warning("Unknown voxel map load mode; starting empty", mode=mode)
++        return None
++
++    def _resolved_reset_signal_path(self) -> Path | None:
++        if self.reset_signal_path:
++            return Path(self.reset_signal_path)
++        return default_voxel_map_reset_signal_path()
++
++    def _save_grid_on_stop(self, grid: VoxelGrid) -> None:
++        if not self.save_on_stop:
++            return
++        try:
++            if grid.size() <= 0:
++                logger.info("Skipping empty voxel map snapshot save.")
++                return
++        except Exception as exc:
++            logger.warning(
++                "Failed to inspect voxel map before snapshot save",
++                error=f"{exc.__class__.__name__}: {exc}",
++            )
++            return
++
++        save_path = Path(self.save_snapshot_path) if self.save_snapshot_path else None
++        if save_path is None:
++            save_path = default_voxel_map_snapshot_path()
++        latest_path = (
++            Path(self.latest_snapshot_path)
++            if self.latest_snapshot_path
++            else latest_voxel_map_snapshot_path()
++        )
++
++        source_run_id = os.environ.get("DIMOS_RUN_ID")
++        try:
++            if save_path is not None:
++                saved_path = grid.save_snapshot(save_path, source_run_id=source_run_id)
++                if latest_path != saved_path:
++                    latest_path.parent.mkdir(parents=True, exist_ok=True)
++                    shutil.copy2(saved_path, latest_path)
++                logger.info(
++                    "Saved voxel map snapshot",
++                    path=str(saved_path),
++                    latest_path=str(latest_path),
++                    voxel_count=grid.size(),
++                )
++            else:
++                saved_path = grid.save_snapshot(latest_path, source_run_id=source_run_id)
++                logger.info(
++                    "Saved latest voxel map snapshot",
++                    path=str(saved_path),
++                    voxel_count=grid.size(),
++                )
++        except Exception as exc:
++            logger.error(
++                "Failed to save voxel map snapshot",
++                error=f"{exc.__class__.__name__}: {exc}",
++                exc_info=True,
++            )
++
+ 
+ class VoxelGridMapperConfig(ModuleConfig):
+     """Configuration for VoxelGridMapper."""
+@@ -251,6 +630,31 @@ class VoxelGridMapperConfig(ModuleConfig):
+     carve_columns: bool = True
+     frame_id: str = "world"
+     emit_every: int = 1
++    max_input_hz: float = Field(
++        default_factory=lambda: _env_float("DIMOS_VOXEL_MAX_INPUT_HZ", 2.0)
++    )
++    input_downsample_voxel_size: float = Field(
++        default_factory=lambda: _env_float("DIMOS_VOXEL_DOWNSAMPLE_VOXEL_SIZE", 0.05)
++    )
++    release_cache_every: int = Field(
++        default_factory=lambda: _env_int("DIMOS_VOXEL_RELEASE_EVERY", 30)
++    )
++    save_on_stop: bool = Field(
++        default_factory=lambda: _env_bool("DIMOS_VOXEL_MAP_SAVE_ON_STOP", True)
++    )
++    load_on_start: str = Field(
++        default_factory=lambda: _env_str("DIMOS_VOXEL_MAP_LOAD_ON_START", "none")
++    )
++    load_path: str = Field(default_factory=lambda: _env_str("DIMOS_VOXEL_MAP_LOAD_PATH", ""))
++    save_snapshot_path: str = Field(
++        default_factory=lambda: _env_str("DIMOS_VOXEL_MAP_SAVE_PATH", "")
++    )
++    latest_snapshot_path: str = Field(
++        default_factory=lambda: _env_str("DIMOS_VOXEL_MAP_LATEST_PATH", "")
++    )
++    reset_signal_path: str = Field(
++        default_factory=lambda: _env_str("DIMOS_VOXEL_MAP_RESET_SIGNAL_PATH", "")
++    )
+ 
+ 
+ class VoxelGridMapper(StreamModule[PointCloud2, PointCloud2]):
+@@ -258,11 +662,16 @@ class VoxelGridMapper(StreamModule[PointCloud2, PointCloud2]):
+ 
+     config: VoxelGridMapperConfig
+ 
++    def __init__(self, **kwargs: Any) -> None:
++        super().__init__(**kwargs)
++        self._transformer: VoxelMapTransformer | None = None
++
+     def pipeline(self, stream: Stream[PointCloud2]) -> Stream[PointCloud2]:
+         cfg = self.config.model_dump(
+             include=set(VoxelGridMapperConfig.model_fields) - set(ModuleConfig.model_fields)
+         )
+-        return stream.transform(VoxelMapTransformer(**cfg))
++        self._transformer = VoxelMapTransformer(**cfg)
++        return stream.transform(self._transformer)
+ 
+     lidar: In[PointCloud2]
+     global_map: Out[PointCloud2]
+@@ -275,6 +684,12 @@ class VoxelGridMapper(StreamModule[PointCloud2, PointCloud2]):
+     def stop(self) -> None:
+         super().stop()
+ 
++    @rpc
++    def reset_voxel_map(self, timeout_s: float = 5.0) -> bool:
++        if self._transformer is None:
++            return False
++        return self._transformer.reset_voxel_map(timeout_s=timeout_s)
++
+ 
+ def ensure_tensor_pcd(
+     pcd_any: o3d.t.geometry.PointCloud | o3d.geometry.PointCloud,
+diff --git a/dimos/navigation/replanning_a_star/controllers.py b/dimos/navigation/replanning_a_star/controllers.py
+index c9902e2..e90f271 100644
+--- a/dimos/navigation/replanning_a_star/controllers.py
++++ b/dimos/navigation/replanning_a_star/controllers.py
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ 
+ import math
++import os
+ from typing import Protocol
+ 
+ import numpy as np
+@@ -50,6 +51,9 @@ class PController:
+         self._global_config = global_config
+         self._speed = speed
+         self._control_frequency = control_frequency
++        self._min_angular_velocity = float(
++            os.environ.get("DIMOS_ASTAR_MIN_ANGULAR_RPS", self._min_angular_velocity)
++        )
+ 
+     def advance(self, lookahead_point: NDArray[np.float64], current_odom: PoseStamped) -> Twist:
+         current_pos = np.array([current_odom.position.x, current_odom.position.y])
+diff --git a/dimos/navigation/replanning_a_star/global_planner.py b/dimos/navigation/replanning_a_star/global_planner.py
+index 7cfca4b..3eaab8b 100644
+--- a/dimos/navigation/replanning_a_star/global_planner.py
++++ b/dimos/navigation/replanning_a_star/global_planner.py
+@@ -15,6 +15,7 @@
+ import math
+ from threading import Event, RLock, Thread, current_thread
+ import time
++from typing import Any
+ 
+ from dimos_lcm.std_msgs import Bool
+ from reactivex import Subject
+@@ -63,6 +64,13 @@ class GlobalPlanner(Resource):
+     _replan_reason: StopMessage | None
+     _lock: RLock
+     _safe_goal_clearance: float
++    _last_failure: str | None
++    _last_stop_reason: str | None
++    _last_stop_time: float | None
++    _latest_motion_result: dict[str, Any] | None
++    _latest_robot_status: dict[str, Any] | None
++    _goal_start_position: Vector3 | None
++    _max_progress_from_goal_start_m: float
+ 
+     _safe_goal_tolerance: float = 4.0
+     _goal_tolerance: float = 0.2
+@@ -70,8 +78,11 @@ class GlobalPlanner(Resource):
+     _replan_goal_tolerance: float = 0.5
+     _stuck_time_window: float = 8.0
+     _stuck_threshold: float = 0.4
++    _stuck_rotation_progress_threshold: float = math.radians(2.0)
+     _max_path_deviation: float = 0.9
+     _replanning_enabled: bool = True
++    _low_progress_breaker_distance_m: float = 0.25
++    _low_progress_breaker_min_replans: int = 1
+ 
+     def __init__(self, global_config: GlobalConfig) -> None:
+         self.path = Subject()
+@@ -95,6 +106,13 @@ class GlobalPlanner(Resource):
+         self._replan_event = Event()
+         self._replan_reason = None
+         self._lock = RLock()
++        self._last_failure = None
++        self._last_stop_reason = None
++        self._last_stop_time = None
++        self._latest_motion_result = None
++        self._latest_robot_status = None
++        self._goal_start_position = None
++        self._max_progress_from_goal_start_m = 0.0
+         self._reset_safe_goal_clearance()
+ 
+     def start(self) -> None:
+@@ -122,6 +140,12 @@ class GlobalPlanner(Resource):
+     def handle_odom(self, msg: PoseStamped) -> None:
+         with self._lock:
+             self._current_odom = msg
++            if self._goal_start_position is not None and self._current_goal is not None:
++                progress = msg.position.distance(self._goal_start_position)
++                self._max_progress_from_goal_start_m = max(
++                    self._max_progress_from_goal_start_m,
++                    progress,
++                )
+ 
+         self._local_planner.handle_odom(msg)
+         self._position_tracker.add_position(msg)
+@@ -135,6 +159,15 @@ class GlobalPlanner(Resource):
+         with self._lock:
+             self._current_goal = goal
+             self._goal_reached = False
++            self._last_failure = None
++            self._last_stop_reason = None
++            self._last_stop_time = None
++            self._goal_start_position = (
++                Vector3(self._current_odom.position)
++                if self._current_odom is not None
++                else None
++            )
++            self._max_progress_from_goal_start_m = 0.0
+         self._replan_limiter.reset()
+         self._plan_path()
+ 
+@@ -161,6 +194,12 @@ class GlobalPlanner(Resource):
+                 self._current_goal = None
+                 self._goal_reached = arrived
+                 self._replan_limiter.reset()
++                self._goal_start_position = None
++                self._max_progress_from_goal_start_m = 0.0
++                if arrived:
++                    self._last_failure = None
++                elif self._last_failure is None:
++                    self._last_failure = "CANCELLED"
+ 
+         self.path.on_next(Path())
+         self._local_planner.stop_planning()
+@@ -172,6 +211,14 @@ class GlobalPlanner(Resource):
+         with self._lock:
+             self._replanning_enabled = enabled
+ 
++    def reset_navigation_map(self) -> None:
++        self.cancel_goal()
++        self._navigation_map.reset()
++        self._navigation_map_near.reset()
++        self._position_tracker.reset_data()
++        self._replan_limiter.reset()
++        logger.info("Navigation map reset; waiting for a fresh global costmap")
++
+     def get_state(self) -> NavigationState:
+         return self._local_planner.get_state()
+ 
+@@ -179,6 +226,35 @@ class GlobalPlanner(Resource):
+         with self._lock:
+             return self._goal_reached
+ 
++    def get_last_failure(self) -> str | None:
++        with self._lock:
++            return self._last_failure
++
++    def get_motion_diagnostics(self) -> dict[str, Any]:
++        with self._lock:
++            motion_result = dict(self._latest_motion_result) if self._latest_motion_result else None
++            robot_status = dict(self._latest_robot_status) if self._latest_robot_status else None
++            last_failure = self._last_failure
++            last_stop_reason = self._last_stop_reason
++            last_stop_time = self._last_stop_time
++
++        return {
++            "navigation_state": self.get_state().value,
++            "last_failure": last_failure,
++            "last_stop_reason": last_stop_reason,
++            "last_stop_time": last_stop_time,
++            "measured_result": motion_result,
++            "robot_status": robot_status,
++        }
++
++    def record_motion_result(self, payload: dict[str, Any]) -> None:
++        with self._lock:
++            self._latest_motion_result = dict(payload)
++
++    def record_robot_status(self, payload: dict[str, Any]) -> None:
++        with self._lock:
++            self._latest_robot_status = dict(payload)
++
+     @property
+     def cmd_vel(self) -> Subject[Twist]:
+         return self._local_planner.cmd_vel
+@@ -192,6 +268,7 @@ class GlobalPlanner(Resource):
+ 
+         last_id = -1
+         last_stuck_check = time.perf_counter()
++        last_rotation_error: float | None = None
+ 
+         while not self._stop_planner.is_set():
+             # Wait for either timeout or replan signal from local planner.
+@@ -238,7 +315,7 @@ class GlobalPlanner(Resource):
+                     deviation=round(deviation, 2),
+                     threshold=self._max_path_deviation,
+                 )
+-                self._replan_path()
++                self._replan_path(reason="deviation")
+                 last_stuck_check = time.perf_counter()
+                 continue
+ 
+@@ -247,19 +324,32 @@ class GlobalPlanner(Resource):
+             if new_id != last_id:
+                 last_id = new_id
+                 last_stuck_check = time.perf_counter()
++                last_rotation_error = self._local_planner.get_rotation_error()
+                 continue
+ 
+-            if (
+-                time.perf_counter() - last_stuck_check > self._stuck_time_window
+-                and self._position_tracker.is_stuck()
+-            ):
++            if time.perf_counter() - last_stuck_check <= self._stuck_time_window:
++                continue
++
++            rotation_error = self._local_planner.get_rotation_error()
++            if last_rotation_error is not None and rotation_error is not None:
++                if last_rotation_error - rotation_error >= self._stuck_rotation_progress_threshold:
++                    last_rotation_error = rotation_error
++                    last_stuck_check = time.perf_counter()
++                    continue
++                is_stuck = True
++            else:
++                is_stuck = self._position_tracker.is_stuck()
++
++            if is_stuck:
+                 logger.info("Robot is stuck. Replanning.")
+-                self._replan_path()
++                self._replan_path(reason="stuck")
+                 last_stuck_check = time.perf_counter()
+ 
+     def _on_stopped_navigating(self, stop_message: StopMessage) -> None:
+         with self._lock:
+             self._replan_reason = stop_message
++            self._last_stop_reason = stop_message
++            self._last_stop_time = time.time()
+         # Signal the monitoring thread to do the replanning. This is so we don't have two
+         # threads which could be replanning at the same time.
+         self._replan_event.set()
+@@ -274,33 +364,54 @@ class GlobalPlanner(Resource):
+             self.cancel_goal(arrived=True)
+         elif stop_message == "obstacle_found":
+             logger.info("Replanning path due to obstacle found.")
+-            self._replan_path()
++            self._replan_path(reason=stop_message)
+         elif stop_message == "error":
+             logger.info("Failure in navigation.")
+-            self._replan_path()
++            self._replan_path(reason=stop_message)
+         else:
+             logger.error(f"No code to handle '{stop_message}'.")
++            self._record_failure("CANCELLED")
+             self.cancel_goal()
+ 
+-    def _replan_path(self) -> None:
++    def _replan_path(self, *, reason: str | None = None) -> None:
+         with self._lock:
+             current_odom = self._current_odom
+             current_goal = self._current_goal
+ 
+         logger.info("Replanning.", attempt=self._replan_limiter.get_attempt())
+ 
+-        assert current_odom is not None
+-        assert current_goal is not None
++        if current_goal is None:
++            logger.info("Ignoring replan request: no current goal.")
++            return
++
++        if current_odom is None:
++            logger.warning("Cannot replan path: missing odometry.")
++            self._record_failure("NO_ODOM")
++            self.cancel_goal()
++            return
+ 
+         if current_goal.position.distance(current_odom.position) < self._replan_goal_tolerance:
+             self.cancel_goal(arrived=True)
+             return
+ 
+         if not self._replanning_enabled:
++            self._record_failure("CANCELLED")
++            self.cancel_goal()
++            return
++
++        if self._should_abort_for_low_progress(reason=reason):
++            logger.warning(
++                "Stopping replanning after repeated low-progress attempts.",
++                reason=reason,
++                attempts=self._replan_limiter.get_attempt(),
++                max_progress_m=round(self._max_progress_from_goal_start_m, 3),
++            )
++            self._record_failure("RETRY_LIMIT_EXCEEDED")
+             self.cancel_goal()
+             return
+ 
+         if not self._replan_limiter.can_retry(current_odom.position):
++            self._record_failure("RETRY_LIMIT_EXCEEDED")
+             self.cancel_goal()
+             return
+ 
+@@ -315,10 +426,14 @@ class GlobalPlanner(Resource):
+             current_odom = self._current_odom
+             current_goal = self._current_goal
+ 
+-        assert current_goal is not None
++        if current_goal is None:
++            logger.info("Ignoring plan request: no current goal.")
++            return
+ 
+         if current_odom is None:
+             logger.warning("Cannot handle goal request: missing odometry.")
++            self._record_failure("NO_ODOM")
++            self.cancel_goal()
+             return
+ 
+         safe_goal = self._find_safe_goal(current_goal.position)
+@@ -327,6 +442,7 @@ class GlobalPlanner(Resource):
+             logger.warning(
+                 "No safe goal found.", x=round(current_goal.x, 3), y=round(current_goal.y, 3)
+             )
++            self._record_failure("NO_SAFE_GOAL")
+             self.cancel_goal()
+             return
+ 
+@@ -336,6 +452,7 @@ class GlobalPlanner(Resource):
+             logger.warning(
+                 "No path found to the goal.", x=round(safe_goal.x, 3), y=round(safe_goal.y, 3)
+             )
++            self._record_failure("NO_PATH")
+             self.cancel_goal()
+             return
+ 
+@@ -387,6 +504,27 @@ class GlobalPlanner(Resource):
+ 
+         return safe_goal
+ 
++    def _should_abort_for_low_progress(self, *, reason: str | None) -> bool:
++        if reason not in {"obstacle_found", "stuck"}:
++            return False
++
++        attempts = self._replan_limiter.get_attempt()
++        if attempts < self._low_progress_breaker_min_replans:
++            return False
++
++        with self._lock:
++            has_goal_start = self._goal_start_position is not None
++            max_progress = self._max_progress_from_goal_start_m
++
++        if not has_goal_start:
++            return False
++
++        return max_progress < self._low_progress_breaker_distance_m
++
++    def _record_failure(self, reason: str) -> None:
++        with self._lock:
++            self._last_failure = reason
++
+     def _reset_safe_goal_clearance(self) -> None:
+         with self._lock:
+             self._safe_goal_clearance = self._global_config.robot_rotation_diameter / 2
+diff --git a/dimos/navigation/replanning_a_star/local_planner.py b/dimos/navigation/replanning_a_star/local_planner.py
+index 4516304..9198e2e 100644
+--- a/dimos/navigation/replanning_a_star/local_planner.py
++++ b/dimos/navigation/replanning_a_star/local_planner.py
+@@ -144,6 +144,18 @@ class LocalPlanner(Resource):
+         with self._lock:
+             return (self._state, self._state_unique_id)
+ 
++    def get_rotation_error(self) -> float | None:
++        with self._lock:
++            if self._path is None or self._current_odom is None:
++                return None
++            if self._state == "initial_rotation":
++                target_yaw = self._path.poses[0].orientation.euler[2]
++            elif self._state == "final_rotation":
++                target_yaw = self._path.poses[-1].orientation.euler[2]
++            else:
++                return None
++            return abs(angle_diff(target_yaw, self._current_odom.orientation.euler[2]))
++
+     def _thread_entrypoint(self) -> None:
+         try:
+             self._loop()
+diff --git a/dimos/navigation/replanning_a_star/module.py b/dimos/navigation/replanning_a_star/module.py
+index cf3e0d4..554c224 100644
+--- a/dimos/navigation/replanning_a_star/module.py
++++ b/dimos/navigation/replanning_a_star/module.py
+@@ -123,6 +123,33 @@ class ReplanningAStarPlanner(Module, NavigationInterface):
+         self._planner.cancel_goal()
+         return True
+ 
++    @rpc
++    def complete_goal(self) -> bool:
++        """Stop the active planner and report a task-specific arrival."""
++        self._planner.cancel_goal(arrived=True)
++        return True
++
++    @rpc
++    def reset_navigation_map(self) -> bool:
++        self._planner.reset_navigation_map()
++        return True
++
++    @rpc
++    def get_last_failure(self) -> str | None:
++        return self._planner.get_last_failure()
++
++    @rpc
++    def get_motion_diagnostics(self) -> dict[str, Any]:
++        return self._planner.get_motion_diagnostics()
++
++    @rpc
++    def record_motion_result(self, payload: dict[str, Any]) -> None:
++        self._planner.record_motion_result(payload)
++
++    @rpc
++    def record_robot_status(self, payload: dict[str, Any]) -> None:
++        self._planner.record_robot_status(payload)
++
+     @rpc
+     def set_replanning_enabled(self, enabled: bool) -> None:
+         self._planner.set_replanning_enabled(enabled)
+diff --git a/dimos/navigation/replanning_a_star/module_spec.py b/dimos/navigation/replanning_a_star/module_spec.py
+index c9ec73d..0aa05f0 100644
+--- a/dimos/navigation/replanning_a_star/module_spec.py
++++ b/dimos/navigation/replanning_a_star/module_spec.py
+@@ -12,7 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-from typing import Protocol
++from typing import Any, Protocol
+ 
+ from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+ from dimos.navigation.base import NavigationState
+@@ -24,6 +24,9 @@ class ReplanningAStarPlannerSpec(Spec, Protocol):
+     def get_state(self) -> NavigationState: ...
+     def is_goal_reached(self) -> bool: ...
+     def cancel_goal(self) -> bool: ...
++    def complete_goal(self) -> bool: ...
++    def reset_navigation_map(self) -> bool: ...
++    def get_motion_diagnostics(self) -> dict[str, Any]: ...
+     def set_replanning_enabled(self, enabled: bool) -> None: ...
+     def set_safe_goal_clearance(self, clearance: float) -> None: ...
+     def reset_safe_goal_clearance(self) -> None: ...
+diff --git a/dimos/navigation/replanning_a_star/navigation_map.py b/dimos/navigation/replanning_a_star/navigation_map.py
+index fde75c0..b5f9529 100644
+--- a/dimos/navigation/replanning_a_star/navigation_map.py
++++ b/dimos/navigation/replanning_a_star/navigation_map.py
+@@ -35,6 +35,10 @@ class NavigationMap:
+         with self._lock:
+             self._binary = occupancy_grid
+ 
++    def reset(self) -> None:
++        with self._lock:
++            self._binary = None
++
+     @property
+     def binary_costmap(self) -> OccupancyGrid:
+         """
+diff --git a/dimos/navigation/replanning_a_star/position_tracker.py b/dimos/navigation/replanning_a_star/position_tracker.py
+index 7d8249b..868858c 100644
+--- a/dimos/navigation/replanning_a_star/position_tracker.py
++++ b/dimos/navigation/replanning_a_star/position_tracker.py
+@@ -29,7 +29,7 @@ class PositionTracker:
+     _time_window: float
+     _max_points: int
+     _threshold: float
+-    _timestamps: NDArray[np.float32]
++    _timestamps: NDArray[np.float64]
+     _positions: NDArray[np.float32]
+     _index: int
+     _size: int
+@@ -43,20 +43,20 @@ class PositionTracker:
+ 
+     def reset_data(self) -> None:
+         with self._lock:
+-            self._timestamps = np.zeros(self._max_points, dtype=np.float32)
++            self._timestamps = np.zeros(self._max_points, dtype=np.float64)
+             self._positions = np.zeros((self._max_points, 2), dtype=np.float32)
+             self._index = 0
+             self._size = 0
+ 
+     def add_position(self, pose: PoseStamped) -> None:
+         with self._lock:
+-            self._timestamps[self._index] = time.time()
++            self._timestamps[self._index] = time.monotonic()
+             self._positions[self._index] = (pose.position.x, pose.position.y)
+             self._index = (self._index + 1) % self._max_points
+             self._size = min(self._size + 1, self._max_points)
+ 
+     def _get_recent_positions(self) -> NDArray[np.float32]:
+-        cutoff = time.time() - self._time_window
++        cutoff = time.monotonic() - self._time_window
+ 
+         if self._size == 0:
+             return np.empty((0, 2), dtype=np.float32)

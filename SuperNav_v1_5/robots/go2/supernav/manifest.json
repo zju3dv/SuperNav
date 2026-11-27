@@ -1,0 +1,936 @@
+{
+  "schema_version": 1,
+  "implementation_source": {
+    "base_commit": "ae8160cc9c7ea0494b18a47395799e2698d6c891",
+    "audited_backports": [
+      "0994c45781c000fe00e4597e88f65105d53163a1",
+      "1cffa526fa1ed604fb8ef75c2c3891df9dd46295",
+      "c8351bd594a6490579813c5f69254755cf04e802"
+    ],
+    "excluded_supernav_2_commits": [
+      "8e33cea810b953c97e86bc33a76dec7bb7b424a6",
+      "cfcc5de0025864e0f5b8538567f8bf8255e4044c"
+    ],
+    "mapped_source_paths": [
+      {
+        "source": "dimos/robot/unitree/nomad/pixel_goal_map.py",
+        "release": "dimos/robot/unitree/pixelgoal/pixel_goal_map.py",
+        "adaptation": "path-only rename; implementation bytes are unchanged"
+      },
+      {
+        "source": "dimos/robot/unitree/nomad/pixel_goal_map_module.py",
+        "release": "dimos/robot/unitree/pixelgoal/pixel_goal_map_module.py",
+        "adaptation": "imports use the release-only support shim; private state paths are replaced"
+      },
+      {
+        "source": "dimos/robot/unitree/nomad/area_captioning.py",
+        "release": "dimos/robot/unitree/pixelgoal/area_captioning.py",
+        "adaptation": "private default caption endpoint removed; configure GO2_SLAM_AREA_CAPTION_URL"
+      },
+      {
+        "source": "dimos/robot/unitree/nomad/live_state.py",
+        "release": "dimos/robot/unitree/pixelgoal/live_state.py",
+        "adaptation": "release state-directory and environment-variable names; comments/docstrings only otherwise"
+      },
+      {
+        "source": "dimos/robot/unitree/nomad/contracts.py",
+        "release": "dimos/robot/unitree/pixelgoal/contracts.py",
+        "adaptation": "retain map-backend contracts verbatim; omit unused policy contracts"
+      },
+      {
+        "source": "dimos/robot/unitree/nomad/{nav_module,pixel_goal,pixel_goal_module}.py",
+        "release": "dimos/robot/unitree/pixelgoal/pixel_goal_support.py",
+        "adaptation": "extract support protocols and PixelGoalHopResult without implementation changes; docstrings may differ"
+      },
+      {
+        "source": "dimos/robot/unitree/go2/blueprints/nomad/unitree_go2_nomad_edge_mcp.py",
+        "release": "dimos/robot/unitree/go2/blueprints/pixelgoal/unitree_go2_pixelgoal.py",
+        "adaptation": "select the map backend and omit unused policy modules; preserve mapping, persistence, navigation, cameras, MCP, visualization, and worker configuration"
+      }
+    ],
+    "canonical_skill_assets": "skills/go2-{2d-slam,graph-memory-hierarchy,graph-slam-navigation}/; copied verbatim, including references",
+    "fidelity_audit": {
+      "checker": "supernav/audit_snapshot.py",
+      "behavior_probe": "supernav/snapshot_probe.py",
+      "scope": "all shared production Python/C++ modules, canonical skill assets, retained support definitions, and map-backend blueprint composition",
+      "result": "supernav/snapshot-audit.json",
+      "restored_dependency_contracts": [
+        "request-specific memory-navigation HTTP timeout",
+        "synchronous prepare_stop before module stop",
+        "safe-goal cost threshold 50",
+        "snapshot motion-tracker timestamps",
+        "snapshot map-save defaults in blueprint and launcher",
+        "canonical repo skills take precedence over embedded fallback text"
+      ]
+    }
+  },
+  "upstream_url": "https://github.com/dimensionalOS/dimos.git",
+  "upstream_commit": "79c9ed163ec6b1abd278a9161f0c74f4562f1231",
+  "overlay": [
+    {
+      "path": "dimos/agents/console/__init__.py",
+      "sha256": "21d9175cab4e30069688eb6ac71242e0d4437584f755744c382c0e27040f35a8",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/console/agent_runner.py",
+      "sha256": "5d845c53480898ab0c49f1b8e2bca17f89f8efbf1c7f4d2f5088bb058a964735",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/console/app.py",
+      "sha256": "37a235d21c6bfa825e1c5f703ec5e91dd6506c2fa59e01bef95c42a8a1d5fd7f",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/console/config.py",
+      "sha256": "3ab4c11bd9ab4f25629c3282a052c12096b9eaff3dbfa4e86877981ccccdc19d",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/console/controller.py",
+      "sha256": "c99ae73dcfcb5fa08756f8f6b9d247c0be3eb1978d8598208642d35e079fddd4",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/console/emergency_stop.py",
+      "sha256": "277d9a7badda7ae573803fb9747c079aa67b1f50bf4078e028da01cfc93e778a",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/console/log_stream.py",
+      "sha256": "cc37bbb21fbd877066916f279dee7c80bae53d18baad853f2a3c21ff40319123",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/console/manual_commands.py",
+      "sha256": "072d540d25b0c70b3628d39b3eec48a0975ed4f6d892d118a5129c04168b3a57",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/console/mcp_client.py",
+      "sha256": "9018f2369ae1e4ca5eb5d2b2cd2bb3147e47d90617460c4b333178f3b6064e3f",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/console/render.py",
+      "sha256": "ecb7b775c8a90962228949d3007d6e8f8518518178fb4ad825e0adeca13e8aa5",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/console/startup.py",
+      "sha256": "28a3326ab87661528daceefeed7b72b1d689d4bf41bac88520d24582b6967f77",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/console/state.py",
+      "sha256": "a84c894b64f62d1d5918edabc6444ae60b4d87440aeeeda5396da111edddcd8b",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/console/test_robot_status.py",
+      "sha256": "9ad2297df6259bc5bc45b25ebd5283590885c6cba7edf0bea34204f1dc1b3a81",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/__init__.py",
+      "sha256": "9d1d445026c21379950af94054606f8d786613042b1a6016ff7bbec19a6c485c",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/artifact_ledger.py",
+      "sha256": "f59e3380f79dde68c4ff52f5769fbecb2aaf374f7a999c2486a2e6f7bdfbc8ea",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/context_compaction_validation.py",
+      "sha256": "6e357e982819b21d33542ecea3cc44c685cd3c6fc58c634042bc572a1d59914f",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/context_manager.py",
+      "sha256": "962a3c019ee30282a66468eecedf58b621ca657cb291dc1b2e01e56fdcb81ff8",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/context_trace_validation.py",
+      "sha256": "28a82b8f0e7cd6f02becc52fbbdede138dee334f36093b5b7e19892cd286000d",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/display_content.py",
+      "sha256": "e6886eff8bcaedf84d132884183c703818e47ade6504c255b85a709758264323",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/failure_escalation_validation.py",
+      "sha256": "8a536fbd2d8b089926e6e9bde93673cd22c38f1be41732deec5f2d1d6e7687a6",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/go2_graph_memory.py",
+      "sha256": "d14f5607bdbcdd2b62d086750e96d7ee5f4baed7fd699664b46f49b83f14f152",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/go2_harness_gate.py",
+      "sha256": "cb08f5bdc7d9bb731c2514fbb23bdbdaa6d3e9a4214059eeae8e819598dda5b5",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/go2_harness_profiles.py",
+      "sha256": "9285a6dc9775e0f661686829305f93d07e6a3b02a848daff86d663d31b5599ab",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/go2_prior_run.py",
+      "sha256": "9317a229e51b85f2ec089062744ebf1845d5908bcc030c7cb9a6b6fd4153c6a5",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/human_input_dispatch.py",
+      "sha256": "921e232cc5b90c0f53f8b95b8017048e72a477be15cc6650406829c83a88b5cb",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/image_blocks.py",
+      "sha256": "3f74af030bfccd8f07bc9157199d072e8ecabe4bc36916f813f2a581f3d29b98",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/image_placement.py",
+      "sha256": "59fd02c5756a115e4e45132d8a6a0f2fc8a2f7bdc29c85fd12a5dcf78e1cb457",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/image_tokens.py",
+      "sha256": "a175358cbe8d6211860a8feac8c5f52cd06c13439bbe60800f41098f0c1589e7",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/live_validation.py",
+      "sha256": "9e0ee9868126231e48681ce4a640094a6de526d909290705aba2a7e34f444404",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/model_provider.py",
+      "sha256": "12bd6cc78971a2b778d094c69b3e9613fcbcd1105cc4c7c1c37bd7bc9035304d",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/movement_authority.py",
+      "sha256": "617194f4d5cbc2a9afc7afc97006699da1d3e5501208fc58ccf44d46271d551b",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/movement_intent.py",
+      "sha256": "ba56399775214d6361b7f58151edb8815255c464a4c1acb1c706b0123180eaca",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/movement_lease.py",
+      "sha256": "232794e9abea371e4b9d30d3fa77711ea77d3aa6122413d15ec3adc81db7fbce",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/movement_trace_validation.py",
+      "sha256": "ba85473f389a64485024970bf8820cc2b205094b24187dffa7da55dd451d096e",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_agent_io.py",
+      "sha256": "246299ace9d3c9fbeeeb4c3c68ef8cf1ef684a87e89af295d05e0951eab8fdcd",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_auto_followup.py",
+      "sha256": "3e162bf5302e595c7ea71b75f1bfa14a2c10da092795afb1fd777ebf259f913f",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_auto_followup_validation.py",
+      "sha256": "76f97093797cf9e349738f9c9410c3f464510af94db0fab2ad12451adfd25a64",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_continuation.py",
+      "sha256": "715acdf6abd0b8d6db6399105af0965948eeeebab5b44603e83171f071752cbc",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_input_history.py",
+      "sha256": "c7044745cdae1b2fbb6217938a90c03c588b6108b5a2c27faa6c09e57c345b1a",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_internal_message.py",
+      "sha256": "ce03533264e67ef5290cd27b8c7d3180b64e2bc2008012270b6de42f9fba0ab2",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_model_stream.py",
+      "sha256": "34715c381b5594c4757ff76c87286db87ac0699c2d6a973ecd10241636dea3fe",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_session_tracing.py",
+      "sha256": "c9305246bc29564ae487e3b602ea316a0e0a5f45bf150d488dbc17e638c9c73f",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_task_terminal.py",
+      "sha256": "e41b353a42c99c7c740e9b8936f750300343f1a5003d20f87272f2c9452f070a",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_tool_catalog.py",
+      "sha256": "600d3bff7436b850b41a79c9e4bede7b7c0146dfd712351a59d74f665a5d70fb",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_tool_dispatch.py",
+      "sha256": "f14d4165fd18943e278f757d292d3382a3ddcdf441b3689e7be4aa75de4f2b0d",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_tool_status_stream.py",
+      "sha256": "b362a14faa941794cb14413011f93108cf4e1a24e9c191a03428957eaec6488c",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_tool_wrapper.py",
+      "sha256": "fef30b586a3dea63d2c5a2cb446bc121e38b14cb8f0c2c9215947b54d8ba8fe0",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_turn_preparation.py",
+      "sha256": "7427aedc8c17e2e59cd8661985e2ecacfc0f8e8e913494188c7d6e83134b4a90",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_turn_processor.py",
+      "sha256": "55856b45f0bf6756e814c19e0e74b18d9ee4e9f901c7d6c47cfb5f10b86fda64",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_turn_responses.py",
+      "sha256": "1c81776ac34cb3c8f2dcc8fdc29a31552adcdc0fc0ee6c2d89e5c95d2ba754ad",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/native_turn_tracing.py",
+      "sha256": "d55eda28dc6f682d5a7f199081173130259a9dba5bdeb08896b1df4eb477b17a",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/navigation_status_guidance.py",
+      "sha256": "aab0d08649205724aba3857961b085450b683fa65bf312895c0e57c1dcdaafb1",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/navigation_trace_validation.py",
+      "sha256": "50ba879b7744cac34d6fc9abe972f95da74e7ebba5baf45ce9b1293347f5a077",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/policy_prompt.py",
+      "sha256": "85be69daf18ec641009a7b43588c3fbc078715ade8a157e9a59bcf3d52fb29c3",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/preemption_validation.py",
+      "sha256": "4171c4bca63c4f45fd9593e05fd958f47aa44af6bb02330d3bbed4909aa9d4c5",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/prepared_codex_runner.py",
+      "sha256": "d78903a21b41b42903321e5ca8b867f119a668534603ec7233c1f4b31a06c90d",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/request_assembly.py",
+      "sha256": "adda258aa3c6fb0d927ec11b79618faf0879777e33d9205ebb056f3ded690cff",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/request_contract_validation.py",
+      "sha256": "e2ca443132f191e208736a769680ca0368f5f0fcaac9bef23513e309f9f5c4bc",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/request_scope_validation.py",
+      "sha256": "3c13a887da5473b3b116aaed8b1ceff1c3892671bad29d58a1b04a230953fb42",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/runtime_status.py",
+      "sha256": "5ad57a837511466a139f0592323d0a87eacc9559a9fe0fdc7cebb839e0c25741",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/session_lifecycle_validation.py",
+      "sha256": "9e45d1126f7c074ab80f612fa6b362fbaf3f76e07fc891e2cc33ad14b22c9049",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/skill_timing.py",
+      "sha256": "7964e8229a49f06179e8ca60378b7335069ce41fab8b9729c9da4213f51df057",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/skill_trace.py",
+      "sha256": "1c072189caa391f546d7253a8b08e627a12251c9420f09b6857192443f713ef8",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/speech_policy.py",
+      "sha256": "a9e0ede9fbdede8db13fe3d977aa78034a1c47e265bd3eb838afdf86626a62bb",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/task_control.py",
+      "sha256": "7618221bcf80be47a00d33298514797522f7a0e3e9c159fd42d5eb8385632109",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/task_followup.py",
+      "sha256": "dd055f56b54a749ae8b6d3d6797b4c57b6bdf4998d25d9dfbffc7a766f7d7a1b",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/task_followup_validation.py",
+      "sha256": "c543cf79db200533260614e28e3e6e1b3be00af624e1d89bafc7bc49b67cd713",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/task_intent.py",
+      "sha256": "57210fd66c8e283f538084d3f71a72f0da70443ff713d61a39d62416627b71da",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/task_state.py",
+      "sha256": "e3155209d909fa6849e676beb0a23072180a3aa1580f0948aec63bc1eb0b0469",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/task_status_summary.py",
+      "sha256": "f38a3bb91a9e8ba7ce22fe0aff6cc67896f830d072fae6412643463ceb9fe5ea",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/task_tool_status.py",
+      "sha256": "ca32302cb956b5090dd994cc9748587f16fa8012b1dea68aa4d184be273157a5",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/task_trace_validation.py",
+      "sha256": "f7194002ac5257713975263c47bfa27bd691388348059ad0c8be2d9d7381d93e",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/test_go2_prior_run.py",
+      "sha256": "470a48fae39b9b9b5bc2ca37ccb1a8f8e68f1cab8bfd8ca4737a3a6d786eafc4",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/tool_call_context.py",
+      "sha256": "c9ee494acbe782e922b66a10115ebfe89414bb9e57095a861373e843a76590bf",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/tool_contracts.py",
+      "sha256": "216fbf7f360aa0c24339c535b9d3c3c0fcb7b4f4528dc7a663d4de9c038266e2",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/tool_execution_trace.py",
+      "sha256": "ec92df59f30b9df5a1f98e4bf9a2ad49b0a68a9ba81fb94850f388301a57aaaf",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/tool_execution_validation.py",
+      "sha256": "66b5ff836f0bea953aecb2696b1a3e5b9ea41c5e39f2ed3db2e8e3f67a039d98",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/tool_exposure.py",
+      "sha256": "3b1108e308c7088b7c2917193b17047085970400897e94286d41337ae2f0591e",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/tool_status.py",
+      "sha256": "79cd83f0ae164d18e92857bd62fb3f08243174a1cb617c04d6e7198397919f9d",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/tool_status_context.py",
+      "sha256": "c371a5227afbe7b52085dab147a62f7940b89f9231a08de35c07948352d6553e",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/tool_status_display.py",
+      "sha256": "e6debfce5bc10e0e1623d806ea9db577a5044e11a981fdce403638702c7c3ec8",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/tool_status_validation.py",
+      "sha256": "03f4dc0cde9409037926b0e004235cdd769caee9425d89561e7a3053621f2882",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/trace.py",
+      "sha256": "3b9896f34eaec3282ea57d4f31c6f314c6383ade1c3a004d4267815e760f06a5",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/trace_audit_profiles.py",
+      "sha256": "e5e423dded84f673002b895bacea798cbf17502b8f8fb2ec4748288ef31a2516",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/trace_log.py",
+      "sha256": "cbe5087a4f83cbb5fa2d4d44a539ca1b328471940229da9a1013a477918e4cbc",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/trace_payload_validation.py",
+      "sha256": "6c88c4b82fcbebb78e190d2f05e35f5a50dac2fd49f781a979fec3209be8a546",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/turn_lifecycle_validation.py",
+      "sha256": "3f998fa13a541631509fc4a1043f68fe23dbe1f7f69592c9e7dd5b877087ead5",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/user_stop.py",
+      "sha256": "538e3f78cec1cfb14254f873fd5994f6899138610515f17ee3bd2832f679e1c9",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/validation_types.py",
+      "sha256": "29b19a7f2848c139a36cae617a7672043035437a2708c91466a57e346ce5ac8e",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/harness/visual_roundtrip.py",
+      "sha256": "85eeffb25c2205f25267df5a1a201796365aa1083ca63314487e9ad9512efc2b",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/mcp/external_harness_authority.py",
+      "sha256": "3d0c7cd425c490f04a996e664735096e9dd9a5f4be43fb31a27f97ebc0a84bbc",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/mcp/external_harness_authority_proxy.py",
+      "sha256": "60c55422cf569327b7610b98331e172619f27ec5e4f76d7db10287846be17797",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/mcp/external_harness_codex.py",
+      "sha256": "718c9021d7a16200269090714476d9ffedb438cf7dac1bbaabcb233ed38c8368",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/mcp/external_harness_profiles.py",
+      "sha256": "fcb6456bd7540b306398cd3ab4bb4ad50f8ec7e544e7676bdaf5b0548b113f33",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/mcp/external_harness_scope_readiness.py",
+      "sha256": "5f52a2a07731eb2aeeb6ef06628bf7dfa59e3c6daf58b3b8f428479fbbe7f6ca",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/mcp/external_harness_types.py",
+      "sha256": "deeea028d1ca69ab47b6173d9b712a1040cc2f15847fbb64db0e3aead550562c",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/mcp/external_harness_validation.py",
+      "sha256": "7fe5dea5ad5b85be12d83619eee1d7dc1fb12d6a944e644a2da7674f98c27a54",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/mcp/mcp_adapter.py",
+      "sha256": "ce3f36cf79b915697e91ce438dc6d81c8154d982dc77cc2c1c7cb4ff229af7ca",
+      "executable": false,
+      "replace": true
+    },
+    {
+      "path": "dimos/agents/mcp/streamable_http.py",
+      "sha256": "cb19e1056e7233e9c9eb2214d223505a0db7728c1c8e1c8b802dc88ccc982b6d",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/mcp/test_external_harness_authority_proxy.py",
+      "sha256": "c5937b4cccb9353e405b289df46ea031e023bbe377614b73a5fb33bb5cd88d98",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/mcp/test_external_harness_codex.py",
+      "sha256": "45ede9bf051895ce3447d128c12c4d8e318290d2064af9f322d680408ec2f5c0",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/mcp/test_mcp_adapter.py",
+      "sha256": "b8a7a4b7c51ce01388e6a41b51d55d3602e041d35fb4540eb7530c825eb8def4",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/runtime_policy.py",
+      "sha256": "3387b79e0308916f31cb62265e02911f5728d747500e40cd7030a79c813af156",
+      "executable": false
+    },
+    {
+      "path": "dimos/agents/skills/test_unitree_skill_container.py",
+      "sha256": "58a5d44995983ff05ca2ae9a25752cdcfb913eb01b7e873f0b9b8ac3f8050e3a",
+      "executable": false,
+      "replace": true
+    },
+    {
+      "path": "dimos/core/coordination/module_coordinator.py",
+      "sha256": "7f53a35fb013e5b81850568792538df5c432266b86a65f78002b882508d8d65a",
+      "executable": false,
+      "replace": true
+    },
+    {
+      "path": "dimos/core/coordination/test_supernav_snapshot_stop.py",
+      "sha256": "53ea9d16abcf3cc13fd2dfe3204ab3587e3896d45dfa88bc75b3607f331e93e5",
+      "executable": false
+    },
+    {
+      "path": "dimos/mapping/occupancy/agent_map.py",
+      "sha256": "33b694631e5b859b767700eea2fbb71f3923d255a410fc2e5a39666cd9ad8641",
+      "executable": false
+    },
+    {
+      "path": "dimos/mapping/occupancy/floor_plan.py",
+      "sha256": "be917776c03212d633ed56e9b119f76e835b4aeff94ea201154078608e9d290b",
+      "executable": false
+    },
+    {
+      "path": "dimos/mapping/occupancy/habitat_area_segmentation.py",
+      "sha256": "99f0faa78fb9743ae196579c9f993dfaf0d8895d577a32bf345e578de9ca7c1c",
+      "executable": false
+    },
+    {
+      "path": "dimos/mapping/occupancy/room_segmentation.py",
+      "sha256": "8efcd452f3695258588df212e4b68c7258c5695d3f9c51d84f475e69fece4f0d",
+      "executable": false
+    },
+    {
+      "path": "dimos/mapping/occupancy/test_agent_map.py",
+      "sha256": "ea85d61e33866d0d6ed1d082b85b94c4f884fa4c5c204ea8d841463261067621",
+      "executable": false
+    },
+    {
+      "path": "dimos/mapping/occupancy/test_floor_plan.py",
+      "sha256": "8cc2ddaf4d94b9b37a12dc9523e0d9f15459c6b1b3c5f51725d200842bb0dbbf",
+      "executable": false
+    },
+    {
+      "path": "dimos/mapping/occupancy/test_habitat_area_segmentation.py",
+      "sha256": "53ae18d0f91426778c4acdd5fb593efc8443bf8adb3d45d53d76beb4f0c8b38c",
+      "executable": false
+    },
+    {
+      "path": "dimos/mapping/occupancy/test_room_segmentation.py",
+      "sha256": "45e37b696e4e46dceb829883d2d87a06f0ab86cb876c95139c1c598041e46732",
+      "executable": false
+    },
+    {
+      "path": "dimos/mapping/relocalization/module.py",
+      "sha256": "4da40b5d899714536afcdb110e3e0ab60f8f0bce49246814432b1f086b116c6d",
+      "executable": false,
+      "replace": true
+    },
+    {
+      "path": "dimos/mapping/relocalization/relocalize.py",
+      "sha256": "97cf12cf5127ed85f1a4fc54dbd5b5561820f80cb893276e281598f35a01f170",
+      "executable": false,
+      "replace": true
+    },
+    {
+      "path": "dimos/mapping/relocalization/test_module.py",
+      "sha256": "7797dd3915a098bfcc7822e7504e292126e1f9ed5543062cf7c99b9d29c02e66",
+      "executable": false
+    },
+    {
+      "path": "dimos/mapping/voxel_grid_mapper_spec.py",
+      "sha256": "e3bbacbbb9aa9f3f08470f9f4f8b615ad8665487832e358947e0f3e0debba3e3",
+      "executable": false
+    },
+    {
+      "path": "dimos/navigation/motion_diagnostics.py",
+      "sha256": "c21b9cf3eb2cb6e7bf022100c27e8357e645398de71341e83c2077650e32a7a0",
+      "executable": false
+    },
+    {
+      "path": "dimos/navigation/replanning_a_star/controllers.py",
+      "sha256": "b34e6b1fbc654fc99e0eff9dd54d742afaefa3004857f17cfb46cffbac4a8c4c",
+      "executable": false,
+      "replace": true
+    },
+    {
+      "path": "dimos/navigation/replanning_a_star/global_planner.py",
+      "sha256": "4abfd2ed52fa2ed2707cbffc1c33be69d3eca0f29b593ba0c32c0ef7c6cc0ca5",
+      "executable": false,
+      "replace": true
+    },
+    {
+      "path": "dimos/navigation/replanning_a_star/position_tracker.py",
+      "sha256": "58f29c02531cab3d19bd99707d87a28974c19e5d3e32a7ddfdea308546ffc6c2",
+      "executable": false,
+      "replace": true
+    },
+    {
+      "path": "dimos/navigation/replanning_a_star/test_controllers.py",
+      "sha256": "979bb4691ee917f3357be613629e6eb85d5e4664836f209fd90002c30540e05e",
+      "executable": false
+    },
+    {
+      "path": "dimos/navigation/replanning_a_star/test_global_planner.py",
+      "sha256": "813f158e31e60024d54b14f5931000947c2d2edeb3f4ead0ebd428cb1c9031fe",
+      "executable": false
+    },
+    {
+      "path": "dimos/navigation/replanning_a_star/test_position_tracker.py",
+      "sha256": "5e01c65414838584b681693121a119171aa5d9c1c12d57b878a1a345239f2db0",
+      "executable": false
+    },
+    {
+      "path": "dimos/navigation/skill_errors.py",
+      "sha256": "a3afbc9187511e994fc8816204360f8e645b6db6f40f1b1bf3cc0ce47f55d3bd",
+      "executable": false
+    },
+    {
+      "path": "dimos/navigation/skill_metadata.py",
+      "sha256": "abb4327281784b791ffcb7b4b4f6bd4bfc323e3c52df471f35cf7cf3060dd1ea",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/cli/dimos.py",
+      "sha256": "918be036a3b39d6cbb4f188bc94a7f3a92e3aac62ad1f5f14fa1c61e96a43630",
+      "executable": false,
+      "replace": true
+    },
+    {
+      "path": "dimos/robot/unitree/connection.py",
+      "sha256": "23cb862558acedf3980ebc9877c08fb29b3b3f5562414606ac8f384a8c6e8592",
+      "executable": false,
+      "replace": true
+    },
+    {
+      "path": "dimos/robot/unitree/go2/blueprints/pixelgoal/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/go2/blueprints/pixelgoal/unitree_go2_pixelgoal.py",
+      "sha256": "8ca4decd2be7c092cd277b04b5bffe477348f1ac3b0a028657c43015d15d52e4",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/go2/blueprints/smart/unitree_go2.py",
+      "sha256": "1365d7e7d152817e949dab8d00de4430cfbc609570a6e2f9f3529ef13807eea9",
+      "executable": false,
+      "replace": true
+    },
+    {
+      "path": "dimos/robot/unitree/go2/motion_recorder.py",
+      "sha256": "4f0603b82ffc3d319b912dc4a2ecd42e574eb19fe485a47fee0c4c196411c33a",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/go2/status.py",
+      "sha256": "b5eab2dfd169f6c45d7c7634e3ca78172e6cf790d6aaacebfd1e12d015f15dfe",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/go2/surround_camera.py",
+      "sha256": "396020453696f8192eeb8d6f0f4904e754eb853b7521120f0e90f931493abf54",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/go2/test_surround_camera.py",
+      "sha256": "0966790bef2ea76842aa7fe613cdefad9388c91f6b1179b623a4e6b2967f56b6",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/pixelgoal/__init__.py",
+      "sha256": "da75d35d709f382e5592b22dc94afc653f6a2ebe241a31a9529ea97440803597",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/pixelgoal/area_captioning.py",
+      "sha256": "de3a3193f8629273e6ab4f6ce8e735d5895b663049993651381f55084f2547cd",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/pixelgoal/contracts.py",
+      "sha256": "c8440d424151396253a25d516d55a52398ec230e58e00db633da66eb5da2cc4f",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/pixelgoal/goal.py",
+      "sha256": "c44525b47967825beb6e4cc777c374cbcad19776102043513d4b3247bbad3189",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/pixelgoal/live_state.py",
+      "sha256": "48fbfae73085c3bad84e47a04dff45ec78bba5ba1e6bfe57d433ad8de7d18bcf",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/pixelgoal/pixel_goal_map.py",
+      "sha256": "686f7658d58c4d5c22bed6b707a850da2fe357b89d1ff8c556f27d5063725e08",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/pixelgoal/pixel_goal_map_module.py",
+      "sha256": "4df30167fe984d94a45e2dda8722c315858c95380aaa3a5e2e12d4a38f43dd8b",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/pixelgoal/pixel_goal_support.py",
+      "sha256": "2c440f722449a7b6fd87600a475312d2ccf4867b8ea68ec07c5161b592f09e43",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/pixelgoal/test_area_captioning.py",
+      "sha256": "a1fd2715e9ee9a66858aa328f90bb88b6082d5aedcedc265cd96c4538cdf27e0",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/pixelgoal/test_pixel_goal_map.py",
+      "sha256": "69d72161f26c621320c4db447c3de2ff8641bc04110c5a3f656ab99e9086e544",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/pixelgoal/test_pixel_goal_map_module.py",
+      "sha256": "d79fc496cb3903f9bf2a0a91d626a8d0e9a6983932e46c36428756d095859416",
+      "executable": false
+    },
+    {
+      "path": "dimos/robot/unitree/test_connection.py",
+      "sha256": "dbfd78ca1468bb4301c943211408850352fe036af1656e7311ae90783a485500",
+      "executable": false,
+      "replace": true
+    },
+    {
+      "path": "dimos/robot/unitree/type/odometry.py",
+      "sha256": "dc9762d09d885ed92cbff5e4b5fb86289c3510b10fcadf44ac59a071b19c4ad8",
+      "executable": false,
+      "replace": true
+    },
+    {
+      "path": "dimos/robot/unitree/type/test_odometry.py",
+      "sha256": "0f4fc0339da31fc4af2e350d6000f25ef9091dc678b778b3a668e9e8831fbffd",
+      "executable": false,
+      "replace": true
+    },
+    {
+      "path": "dimos/robot/unitree/unitree_skill_container.py",
+      "sha256": "16b6a29b9a879dc2a9555e86d03b2b664993e139a839c1834dfac344ff2df132",
+      "executable": false,
+      "replace": true
+    },
+    {
+      "path": "dimos/utils/protobuf_compat.py",
+      "sha256": "80a00353510d2c51d10ce8d1ff72f6a9d9adf6aac8b6af3436a0bd717fe1d6bb",
+      "executable": false
+    },
+    {
+      "path": "dimos/utils/test_protobuf_compat.py",
+      "sha256": "23f535954856aa076d8e91fb1cb9cd0a4ae1e4b5eb1e9b502552bc610cbb7de0",
+      "executable": false
+    },
+    {
+      "path": "scripts/go2_gopro_bridge.sh",
+      "sha256": "d6e6f3cc95da7dabd2144e58308697be0a25dda1e59c6f83efc4153e3ce96123",
+      "executable": true
+    },
+    {
+      "path": "skills/go2-2d-slam/SKILL.md",
+      "sha256": "3b5b9efb97873c09788cfbb283da6bf57e5d2390f09c5d14cfc437f618e6fdfd",
+      "executable": false
+    },
+    {
+      "path": "skills/go2-graph-memory-hierarchy/SKILL.md",
+      "sha256": "dc07c3b31b56ccf7be95de257fa86506b1862fe9b4ce72bf077a6ec14b7141b9",
+      "executable": false
+    },
+    {
+      "path": "skills/go2-graph-memory-hierarchy/references/examples.md",
+      "sha256": "2a4925107d86b06a65678807edbb039039be11f6fcd69171c86949380efb1b9c",
+      "executable": false
+    },
+    {
+      "path": "skills/go2-graph-memory-hierarchy/references/node-schema.md",
+      "sha256": "e345c9f1938dd216c926a25c66a78bcc3df9e73b2d95feb1ae44d17e4fccf188",
+      "executable": false
+    },
+    {
+      "path": "skills/go2-graph-memory-hierarchy/references/tool-interface.md",
+      "sha256": "0972224aaeb124547ae2677bf241f4a7e9d8fe5e87fead628e8c2de77bbf62a6",
+      "executable": false
+    },
+    {
+      "path": "skills/go2-graph-memory-hierarchy/references/workflows.md",
+      "sha256": "e5e71bcfefbb7b6378d57c40953aa690019cb59c5d2138b4889deaa3efc3b2e8",
+      "executable": false
+    },
+    {
+      "path": "skills/go2-graph-slam-navigation/SKILL.md",
+      "sha256": "54c78ae9d14a64255a2ddeac3ee27a8c9fed8a201e6b8d7ba2d25d831367d122",
+      "executable": false
+    },
+    {
+      "path": "skills/go2-graph-slam-navigation/references/route-fusion.md",
+      "sha256": "de99f3120ea15d7537785fa6426000d16cb2722de6a76ea1853569e59d6c55f4",
+      "executable": false
+    }
+  ],
+  "patches": [
+    {
+      "path": "patches/01-runtime-compatibility.patch",
+      "sha256": "84ce7aa2571916622b4c4f8f8c18c81a011111db918b90cbe68f8195199ece7d"
+    },
+    {
+      "path": "patches/02-agent-and-operator.patch",
+      "sha256": "58445dff2e3bd9b3d7b009f4b530cafb9c04274e493cf71c077376d476a1d93d"
+    },
+    {
+      "path": "patches/03-go2-and-cameras.patch",
+      "sha256": "7eda0bc40cc60e0018e91994963416a8b74690732bf8c001f781b0c30a16c6d5"
+    },
+    {
+      "path": "patches/04-mapping-and-navigation.patch",
+      "sha256": "21a4321b8fc7948051a00cd8090872131a3d24ae00d9601ce8b1339619550b41"
+    },
+    {
+      "path": "patches/05-visualization.patch",
+      "sha256": "a6c4f4bb14b465eb38613db5217ef5a855309ba807bd70a33ff0021932418954"
+    },
+    {
+      "path": "patches/06-dependencies.patch",
+      "sha256": "bf170e6cf7ddbee4702a1f30b1e1b31945595e312212fb745e5d70fea49c8fcb"
+    },
+    {
+      "path": "patches/07-skill-assets.patch",
+      "sha256": "e87a4bf0f570391bbbf56c61067e383ff4e32871fadd72aa476a55ace6aa8a6c"
+    }
+  ],
+  "generated_files": [
+    "dimos/robot/all_blueprints.py"
+  ],
+  "profile": {
+    "blueprint": "unitree-go2-pixelgoal",
+    "stack": "mapping",
+    "control": "local-planner",
+    "rerun": false,
+    "policy_service": false
+  }
+}

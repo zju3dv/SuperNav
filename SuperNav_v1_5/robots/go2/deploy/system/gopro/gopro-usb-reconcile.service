@@ -1,0 +1,7 @@
+[Unit]
+Description=Configure attached GoPro Connect USB network interfaces
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/gopro-usb-reconcile
