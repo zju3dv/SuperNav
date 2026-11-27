@@ -285,11 +285,19 @@ def test_mcp_oracle_local_navigate_keeps_movement_frames_for_replay(
         movement.append(path)
     colors = _make_panorama_images(tmp_path)
     calls: list[tuple[str, Any]] = []
+    audit_requests: list[tuple[Any, dict[str, Any]]] = []
 
     def fake_call(
         action: str, payload: Any = None, **kwargs: Any
     ) -> dict[str, Any]:
         calls.append((action, payload))
+        if action == "get_audit_metrics":
+            audit_requests.append((payload, kwargs))
+            return {
+                "agent_state": {"position": [1234.5, 6.75, 9876.5]},
+                "trajectory_points": [[1234.5, 6.75, 9876.5]],
+                "step_count": 2,
+            }
         if action == "navigate_oracle_local":
             assert payload["output_dir"] == str(tmp_path)
             return {
@@ -331,6 +339,8 @@ def test_mcp_oracle_local_navigate_keeps_movement_frames_for_replay(
     payload_text = json.dumps(payload, ensure_ascii=False)
     assert "_debug" not in payload_text
     assert "object_position" not in payload_text
+    for private in ("trajectory_points", "trajectory_log", "1234.5", "9876.5"):
+        assert private not in payload_text
     assert _caption_texts(content) == [
         "Front view",
         "Right view",
@@ -341,6 +351,10 @@ def test_mcp_oracle_local_navigate_keeps_movement_frames_for_replay(
     assert [action for action, _ in calls] == [
         "navigate_oracle_local",
         "get_panorama",
+        "get_audit_metrics",
+    ]
+    assert audit_requests == [
+        ({"include_trajectory": True}, {"timeout": 3, "audit_internal": True})
     ]
     assert calls[0][1]["target_ref"] == "obj-chair-1"
     assert "target_label" not in calls[0][1]
@@ -355,11 +369,19 @@ def test_mcp_visual_point_preview_does_not_capture_panorama(
     overlay = tmp_path / "visual_point_overlay.png"
     _tiny_png(overlay, marker=b"OVERLAY")
     calls: list[tuple[str, Any]] = []
+    audit_requests: list[tuple[Any, dict[str, Any]]] = []
 
     def fake_call(
         action: str, payload: Any = None, **kwargs: Any
     ) -> dict[str, Any]:
         calls.append((action, payload))
+        if action == "get_audit_metrics":
+            audit_requests.append((payload, kwargs))
+            return {
+                "agent_state": {"position": [1234.5, 6.75, 9876.5]},
+                "trajectory_points": [[1234.5, 6.75, 9876.5]],
+                "step_count": 0,
+            }
         assert action == "navigate_visual_point"
         return {
             "ok": True,
@@ -387,7 +409,16 @@ def test_mcp_visual_point_preview_does_not_capture_panorama(
     payload = _text_payload(content)
     images = _image_blocks(content)
 
-    assert [action for action, _ in calls] == ["navigate_visual_point"]
+    assert [action for action, _ in calls] == [
+        "navigate_visual_point",
+        "get_audit_metrics",
+    ]
+    assert audit_requests == [
+        ({"include_trajectory": True}, {"timeout": 3, "audit_internal": True})
+    ]
+    payload_text = json.dumps(payload, ensure_ascii=False)
+    for private in ("trajectory_points", "trajectory_log", "1234.5", "9876.5"):
+        assert private not in payload_text
     assert payload["status"] == "preview_ready"
     assert payload["confirm_token"] == "confirm-1"
     assert payload["pre_move_self_check"]["required"] is True

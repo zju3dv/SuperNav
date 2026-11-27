@@ -1,10 +1,23 @@
 """Asset lookup uses explicit paths and workspace precedence."""
 from pathlib import Path
+import tomllib
 
 import pytest
 
 from supernav.paths import resolve_asset_path
 from supernav.runtime.config import resolve_path
+
+
+def test_spatial_memory_prompt_templates_are_declared_for_installation():
+    root = Path(__file__).resolve().parents[1]
+    manifest = tomllib.loads((root / 'pyproject.toml').read_text())
+    target = 'share/supernav/configs/benchmarks/spatial_memory/prompts'
+    declared = manifest['tool']['setuptools']['data-files'][target]
+    source = 'configs/benchmarks/spatial_memory/prompts'
+    assert set(declared) == {
+        f'{source}/common.md', f'{source}/end.md', f'{source}/movement_spatial_memory.md',
+    }
+    assert all((root / name).is_file() for name in declared)
 
 
 @pytest.mark.parametrize('old,current', [

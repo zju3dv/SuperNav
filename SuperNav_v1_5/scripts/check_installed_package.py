@@ -141,7 +141,7 @@ def _worker() -> None:
     guides = {
         "README.md", "configuration.md", "assets-and-skills.md", "habitat.md", "ai2thor.md",
         "web-viewer.md", "architecture.md", "layout.md", "tool-authoring-guide.md", "hm3d-and-ovon.md",
-        "habitatgs-benchmark.md",
+        "habitatgs-benchmark.md", "spatial-memory.md",
         "go2.md", "go2-usage.md", "go2-maintenance.md", "go2-testing.md",
     }
     for language in ("en", "zh"):
@@ -152,6 +152,9 @@ def _worker() -> None:
         _check((assets / resource).is_file(), f"Release documentation resource is missing: {resource}")
     _check(not list((assets / "docs").glob("*.md")), "Unclassified documentation entered the distribution")
     print("Bilingual release documentation and SVG assets; no development handoffs: OK")
+    for name in ("common.md", "end.md", "movement_spatial_memory.md"):
+        _check((assets / "configs/benchmarks/spatial_memory/prompts" / name).is_file(),
+               f"Spatial-memory prompt is missing: {name}")
     for name in ("common_visual_point.md", "movement_visual_point.md", "common_localnav.md", "movement_localnav.md"):
         _check((assets / "configs/benchmarks/multi_global_task/prompts" / name).is_file(),
                f"Multi-goal prompt is missing: {name}")
@@ -170,7 +173,7 @@ def _worker() -> None:
     fixture_data = [path for path in (assets / "tests/fixtures/test_suite").rglob("*")
                     if path.suffix in {".json", ".jsonl", ".gz", ".png"}]
     _check(not fixture_data, "Real test-suite data entered the wheel")
-    print("Canonical imports, three recipes and configuration assets; no bundled benchmark tasks: OK")
+    print("Canonical imports, five recipes and configuration assets; no bundled benchmark tasks: OK")
     for arguments in (("run", "--dry-run"), ("run-one", "--dry-run"), ("config", "show", "--experiment", "missing-example"), ("config", "show", "--experiment", "unsupported-example")):
         result = subprocess.run([sys.executable, "-I", "-m", "supernav", *arguments], capture_output=True, text=True, timeout=15)
         _check(result.returncode == 2 and "Traceback" not in result.stderr, f"Unsupported invocation accepted: {arguments}")
@@ -233,8 +236,13 @@ def _worker() -> None:
 
     for name in habitat_recipes:
         config = load_experiment_config(resolve_experiment(name))
-        configure_multi_goal_arms(config)
-        config["prompts_dir"] = str(assets / "configs/benchmarks/multi_global_task/prompts")
+        # Geo/learned executors use multi-goal wrapper skills. Spatial memory
+        # retains its own prompt and skills; task metadata binds the goal
+        # ledger in HabitatBackend.prepare_task for all three methods.
+        uses_spatial_memory = config["arms"]["default"]["movement"] == "spatial_memory"
+        if not uses_spatial_memory:
+            configure_multi_goal_arms(config)
+            config["prompts_dir"] = str(assets / "configs/benchmarks/multi_global_task/prompts")
         path = Path.cwd() / f"multi-{name}.json"
         path.write_text(json.dumps(config))
         result = json.loads(cli(
@@ -248,8 +256,14 @@ def _worker() -> None:
         ))
         prompt = (Path(result["run_dir"]) / "prompt.txt").read_text()
         _check("ORDERED GOALS (2 total)" in prompt, f"Multi-goal instruction missing: {name}")
-        _check("start_position" not in prompt and "start_rotation" not in prompt,
-               f"Private spawn entered the multi-goal prompt: {name}")
+        if uses_spatial_memory:
+            # The snapshot-faithful spatial-memory prompt explicitly supplies
+            # initialization pose, unlike the mapless Geo/learned prompts.
+            _check("start_position=[12, 0, -34]" in prompt,
+                   f"Spatial-memory initialization prompt is missing: {name}")
+        else:
+            _check("start_position" not in prompt and "start_rotation" not in prompt,
+                   f"Private spawn entered the multi-goal prompt: {name}")
         project = Path(result["project_dir"]) / ".codex_home"
         server = tomllib.loads((project / "config.toml").read_text())["mcp_servers"]["habitat-gs"]
         _check("hab_nav_goals" in server["env"]["HAB_MCP_TOOL_WHITELIST"].split(","),
@@ -257,9 +271,9 @@ def _worker() -> None:
         _check("HAB_MCP_NAV_GOALS_JSON" in server["env_vars"], f"Multi-goal binding missing: {name}")
         for skill in config["arms"]["default"]["skill_names"]:
             _check((project / "skills" / skill / "SKILL.md").is_file(), f"Multi-goal skill missing: {skill}")
-    print("Installed multi-goal Geo and learned dry-runs, private prompts, ledger and skill dependencies: OK")
+    print("Installed multi-goal dry-runs, method-specific prompts, goal ledger and skill dependencies: OK")
     _check(not simulator_imports, f"Simulator imports were attempted: {simulator_imports}")
-    print("Synthetic external task dry-runs across two Habitat recipes, prompts and native skills: OK")
+    print("Synthetic external task dry-runs across four Habitat recipes, prompts and native skills: OK")
     print("No simulator SDKs installed or imported: OK")
 
 
